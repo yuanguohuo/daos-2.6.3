@@ -68,6 +68,8 @@ vos_meta_rwv(struct umem_store *store, struct umem_store_iod *iod, d_sg_list_t *
 		return 0;
 	}
 
+    //Yuanguo: iod 描述spdk blob上的一块或多块区间！
+    // 下面把iod转换成bsgl，还是描述spdk blob上的一块或多块区间！
 	if (iod->io_nr == 1) {
 		bsgl.bs_iovs = &local_biov;
 		bsgl.bs_nr = 1;
@@ -127,11 +129,13 @@ vos_meta_load_fn(void *arg)
 	struct meta_load_control *mlc = mla->mla_control;
 
 	D_ASSERT(mla != NULL);
+    //Yuanguo: iod 描述spdk blob上的一块或多块区间！
 	iod.io_nr             = 1;
 	iod.io_regions        = &iod.io_region;
 	iod.io_region.sr_addr = mla->mla_off;
 	iod.io_region.sr_size = mla->mla_read_size;
 
+    //Yuanguo: sgl 描述内存(mmap映射的)上的一块或多块区间！
 	sgl.sg_iovs   = &iov;
 	sgl.sg_nr     = 1;
 	sgl.sg_nr_out = 0;
@@ -149,13 +153,67 @@ vos_meta_load_fn(void *arg)
 		ABT_cond_signal(mlc->mlc_cond);
 }
 
+//Yuanguo:
+//  1. 对于MD-on-SSD场景
+//           /mnt/daos0/c090c2fc-8d83-45de-babe-104bad165593/vos-0
+//                                (mmaped in memory)
+//  start = hdl->do_base  +---------------------------------+ 0
+//                        |                                 |
+//                        |         struct dav_phdr         |
+//                        |              (4k)               |
+//                        |                                 |
+//              heap_base +---------------------------------+ 4k  ---
+//                        | +-----------------------------+ |      |
+//                        | | struct heap_header (1k)     | |      |
+//                        | +-----------------------------+ |      |
+//                        | | struct zone_header (64B)    | |      |
+//                        | | struct chunk_header(8B)     | |      |
+//                        | | struct chunk_header(8B)     | |      |
+//                        | | ...... 65528个,不一定都用   | |      |
+//                        | | struct chunk_header(8B)     | |      |
+//                        | | chunk (256k)                | |      |
+//                        | | chunk (256k)                | |      |
+//                        | | ...... 最多65528个          | |      |
+//                        | | chunk (256k)                | |      |
+//                        | +-----------------------------+ |      |
+//                        | | struct zone_header (64B)    | |      |
+//                        | | struct chunk_header(8B)     | |      |
+//                        | | struct chunk_header(8B)     | |  heap_size = path文件大小 - blob-header-size(4k) - sizeof(struct dav_phdr)(4k)
+//                        | | ...... 65528个,不一定都用   | |      |                       (什么是blob-header?)
+//                        | | struct chunk_header(8B)     | |      |
+//                        | | chunk (256k)                | |      |
+//                        | | chunk (256k)                | |      |
+//                        | | ...... 最多65528个          | |      |
+//                        | | chunk (256k)                | |      |
+//                        | +-----------------------------+ |      |
+//                        | |                             | |      |
+//                        | |     ... more zones ...      | |      |
+//                        | |                             | |      |
+//                        | |  除了最后一个，前面的zone   | |      |
+//                        | |  都是65528个chunk,接近16G   | |      |
+//                        | |                             | |      |
+//                        | +-----------------------------+ |      |
+//                        +---------------------------------+     ---
+//
+//    问：daos_engine进程重启的时候，tmpfs是新建的吗？
+//        若不是新建的，/mnt/daos0/c090c2fc-8d83-45de-babe-104bad165593/vos-0中还保留着原来的内容。
+//        否则，若是新建的，文件就是空的（虽然内存空间分配了）
+//
+//    应该是后者，文件(内存)是空的，就要从spdk blob (nvme盘)读取，就是本函数的工作！
 static inline int
 vos_meta_load(struct umem_store *store, char *start)
 {
 	uint64_t		 read_size;
+    //Yuanguo:
+    //  对于MD-on-SSD场景
+    //     store->stor_size是文件大小 - blob-header-size(4k) (注意不是struct dav_phdr的4k)
+    //     就是说，store->stor_size包含struct dav_phdr的4k空间；
+    //     那个blob header在哪呢？
 	uint64_t		 remain_size = store->stor_size;
 	daos_off_t		 off = 0;
 	int			 rc = 0;
+    //Yuanguo: 下面的逻辑，用golang的思想去理解，就是启动多个routine，每个routine load一块数据；
+    //         meta_load_control和meta_load_arg用来控制routine的并发，以及传递参数给routine。
 	struct meta_load_arg	*mla;
 	struct meta_load_control mlc;
 
@@ -177,6 +235,7 @@ vos_meta_load(struct umem_store *store, char *start)
 	}
 
 	while (remain_size) {
+        //Yuanguo: 一个routine读取1MiB的数据；
 		read_size =
 		    (remain_size > META_READ_BATCH_SIZE) ? META_READ_BATCH_SIZE : remain_size;
 
@@ -185,6 +244,10 @@ vos_meta_load(struct umem_store *store, char *start)
 			rc = -DER_NOMEM;
 			break;
 		}
+        //Yuanguo:
+        //    mla_off       : spdk blob内source的偏移；
+        //    mla_start     : mmap空间内destination的地址；
+        //    mla_read_size : 数据长度；
 		mla->mla_off = off;
 		mla->mla_read_size = read_size;
 		mla->mla_start = start;
@@ -192,6 +255,7 @@ vos_meta_load(struct umem_store *store, char *start)
 		mla->mla_control = &mlc;
 
 		mlc.mlc_inflights++;
+        //Yuanguo: 类比golang可以理解为 go vos_meta_load_fn(mal);
 		rc = vos_exec(vos_meta_load_fn, (void *)mla);
 		if (rc || mlc.mlc_rc) {
 			if (rc) {
@@ -246,12 +310,54 @@ vos_meta_flush_prep(struct umem_store *store, struct umem_store_iod *iod, daos_h
 		return -DER_NOMEM;
 
 	bsgl = bio_iod_sgl(biod, 0);
+    //Yuanguo:
+    // - iod->io_regions是一个列表，有iod->io_nr项，每一项描述meta blob上的一个region；
+    //   对于flush来说，它们是IO的destinations;
+    // - struct umem_checkpoint_data的cd_sg_list也是一个列表，和iod->io_regions一一对应，
+    //   它们描述的是heap区域；对于flush来说，这些heap区域是IO的sources;
+    //   (这里还用不到它们，到vos_meta_flush_copy的时候，cd_sg_list作为参数传给它)
+    //
+    // struct bio_desc对象是bio的核心，它的bd_sgls是一个"列表的数组"，我们只考虑单个列表的情况，
+    // 即`bd_sgls[0]`是一个列表，也就是这里的bsgl变量指向的列表；
+    //
+    // 上面的sources和destinations要转换成`bd_sgls[0]/bsgl`;
+    //
+    // `bd_sgls[0]/bsgl`包含destinations和DMA regions；它也是一个列表，项数和
+    // iod->io_regions/umem_checkpoint_data的cd_sg_list一样，每一项描述一个destination和
+    // 它的DMA region；
+    //
+    //  struct umem_checkpoint_data的cd_sg_list                              iod->io_regions
+    //              (heap regions)                (DMA regions)               (nvme meta blob)
+    //
+    //         +---------------------+      +---------------------+       +---------------------+
+    //         |      region0        |      |                     |       |                     |
+    //         +---------------------+      +---------------------+       +---------------------+
+    //
+    //         +---------------------+      +---------------------+       +---------------------+
+    //         |                     |      |                     |       |                     |
+    //         |      region1        |      |                     |       |                     |
+    //         |                     |      |                     |       |                     |
+    //         +---------------------+      +---------------------+       +---------------------+
+    //
+    //         +---------------------+      +---------------------+       +---------------------+
+    //         |      region2        |      |                     |       |                     |
+    //         +---------------------+      +---------------------+       +---------------------+
+    //
+    // `bd_sgls[0]/bsgl`里的元素是struct bio_iov对象。一个struct bio_iov对象描述一个region的IO:
+    //      void*        bi_buf        ---> 指向DMA region；
+    //      bio_addr_t	 bi_addr       ---> 指向nvme blob内的区间；
+	//      size_t       bi_data_len
+    //
+    // 这里初始化`bd_sgls[0]/bsgl`，即分配一个struct bio_iov对象数组，个数是iod->io_nr；
 	rc = bio_sgl_init(bsgl, iod->io_nr);
 	if (rc)
 		goto free;
 
+    //Yuanguo: 把destinations地址(meta blob上的region地址)转换成bio_iov对象需要的形式；
 	vos_iod2bsgl(store, iod, bsgl);
 
+    //Yuanguo: 准备DMA region，设置到bio_iov对象的bi_buf；
+    //  (sources数据(heap中的regions) 在vos_meta_flush_copy中才用的上)
 	rc = bio_iod_try_prep(biod, BIO_CHK_TYPE_LOCAL, NULL, 0);
 	if (rc) {
 		DL_CDEBUG(rc == -DER_AGAIN, DB_TRACE, DLOG_ERR, rc, "Failed to prepare DMA buffer");
@@ -265,12 +371,26 @@ free:
 	return rc;
 }
 
+//Yuanguo:
+//  - 参数fh->cookie是指向struct bio_desc对象的指针，见vos_meta_flush_prep()函数；
+//  - 参数sgl指向heap中的source数据；
+//
+// struct bio_desc对象是bio的核心，它的核心数据成员是bd_sgls；注意，它是一个"列表的数组"，我们只考虑
+// 单个列表的情况，即`bd_sgls[0]`是一个列表；列表的每一个元素是一个struct bio_iov对象；
+//
+// vos_meta_flush_prep()函数为每个struct bio_iov对象
+//   - 填好了destination，即bi_addr/bi_data_len字段，指向nvme blob中的区域；
+//   - 准备好了DMA内存region，即bi_buf字段；
+//
+//  本函数把数据拷贝到DMA regions；(vos_meta_flush_post函数开始发起DMA操作)
 static int
 vos_meta_flush_copy(daos_handle_t fh, d_sg_list_t *sgl)
 {
 	struct bio_desc	*biod = (struct bio_desc *)fh.cookie;
 
 	D_ASSERT(sgl->sg_nr > 0);
+    //Yuanguo: 参数'1'表示只有1个列表；
+    //  但列表有多个项，每个项是一个struct bio_iov对象，表示一个region的IO(source到destination的flush);
 	return bio_iod_copy(biod, sgl, 1);
 }
 
@@ -670,6 +790,29 @@ vos2mc_flags(unsigned int vos_flags)
 	return mc_flags;
 }
 
+//Yuanguo:
+//  MD-on-SSD情况下，创建pool:
+//
+//     dmg pool create --scm-size=200G --nvme-size=3000G --properties rd_fac:2 ensblock
+//
+//     上述200G,3000G都是单个engine的配置；
+//     假设单engine的target数是18
+//     假设pool的uuid是c090c2fc-8d83-45de-babe-104bad165593 (可以通过dmg pool list -v查看)
+//
+//     - vos_db pool
+//         - path = "/var/daos/config/daos_control/engine0/daos_sys/sys_db"   (NOT on tmpfs)
+//
+//     - 数据pool
+//         - path = "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0"  (on tmpfs)
+//                  ...
+//                  这些文件已经被创建(可能是dao_server创建的)
+//                  它们的size都是20G/18
+//
+//         - pool_id = c090c2fc-8d83-45de-babe-104bad165593
+//         - layout = "vos_pool_layout"
+//         - scm_sz = 0     注意不是200G/18 (可以获取path文件的size)
+//         - nvme_sz = 3000G/18
+//         - wal_sz = 0
 static int
 vos_pmemobj_create(const char *path, uuid_t pool_id, const char *layout,
 		   size_t scm_sz, size_t nvme_sz, size_t wal_sz, unsigned int flags,
@@ -685,6 +828,7 @@ vos_pmemobj_create(const char *path, uuid_t pool_id, const char *layout,
 
 	*ph = NULL;
 	/* always use PMEM mode for SMD */
+    //Yuanguo: 对于MD-on-SSD，store.store_type = DAOS_MD_BMEM
 	store.store_type = umempobj_get_backend_type();
 	if (flags & VOS_POF_SYSDB) {
 		store.store_type = DAOS_MD_PMEM;
@@ -695,6 +839,7 @@ vos_pmemobj_create(const char *path, uuid_t pool_id, const char *layout,
 	if (!bio_nvme_configured(SMD_DEV_TYPE_MAX) || xs_ctxt == NULL)
 		goto umem_create;
 
+    //Yuanguo: 通过stat(path)文件，获取scm_sz
 	if (!scm_sz) {
 		struct stat lstat;
 
@@ -708,6 +853,7 @@ vos_pmemobj_create(const char *path, uuid_t pool_id, const char *layout,
 		"meta_sz: %zu, nvme_sz: %zu wal_sz:%zu\n",
 		xs_ctxt, DP_UUID(pool_id), meta_sz, nvme_sz, wal_sz);
 
+    //Yuanguo: 创建data/meta/wal spdk-blob
 	rc = bio_mc_create(xs_ctxt, pool_id, meta_sz, wal_sz, nvme_sz, mc_flags);
 	if (rc != 0) {
 		D_ERROR("Failed to create BIO meta context for xs:%p pool:"DF_UUID". "DF_RC"\n",
@@ -727,6 +873,13 @@ vos_pmemobj_create(const char *path, uuid_t pool_id, const char *layout,
 		return rc;
 	}
 
+    //Yuanguo:
+    //  - 对于MD-on-SSD
+    //       scm_sz               : 0
+    //       meta_sz              : 文件/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0的size；
+    //       store.stor_size      : meta_sz - 4k. 即meta_sz扣除header-size(默认是1个block,4k)；
+    //       store.stor_blk_size  : 默认4k. 见bio_mc_create() --> meta_format()
+    //       store.stor_hdr_blks  : 默认1. 见bio_mc_create() --> meta_format()
 	bio_meta_get_attr(mc, &store.stor_size, &store.stor_blk_size, &store.stor_hdr_blks);
 	store.stor_priv = mc;
 	store.stor_ops = &vos_store_ops;
@@ -1015,6 +1168,31 @@ vos_blob_unmap_cb(d_sg_list_t *unmap_sgl, uint32_t blk_sz, void *data)
 static int pool_open(void *ph, struct vos_pool_df *pool_df,
 		     unsigned int flags, void *metrics, daos_handle_t *poh);
 
+//Yuanguo:
+//  MD-on-SSD情况下，创建pool:
+//
+//     dmg pool create --scm-size=200G --nvme-size=3000G --properties rd_fac:2 ensblock
+//
+//     上述200G,3000G都是单个engine的配置；
+//     假设单engine的target数是18
+//     假设pool的uuid是c090c2fc-8d83-45de-babe-104bad165593 (可以通过dmg pool list -v查看)
+//
+//     - vos_db pool
+//         - path = "/var/daos/config/daos_control/engine0/daos_sys/sys_db"   (NOT on tmpfs)
+//
+//     - 数据pool
+//         - path = "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0"  (on tmpfs)
+//                  "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-1"  (on tmpfs)
+//                  ...
+//                  "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-17" (on tmpfs)
+//
+//                  这些文件已经被创建(可能是dao_server创建的)
+//                  它们的size都是20G/18
+//
+//         - uuid = "c090c2fc"
+//         - scm_sz = 0     注意不是200G/18 (可以获取path文件的size)
+//         - nvme_sz = 3000G/18
+//         - wal_sz = 0
 int
 vos_pool_create_ex(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_t nvme_sz,
 		   daos_size_t wal_sz, unsigned int flags, uint32_t version, daos_handle_t *poh)
@@ -1174,6 +1352,30 @@ close:
 	return rc;
 }
 
+//Yuanguo:
+//  MD-on-SSD情况下，创建pool:
+//
+//     dmg pool create --scm-size=200G --nvme-size=3000G --properties rd_fac:2 ensblock
+//
+//     上述200G,3000G都是单个engine的配置；
+//     假设单engine的target数是18
+//     假设pool的uuid是c090c2fc-8d83-45de-babe-104bad165593 (可以通过dmg pool list -v查看)
+//
+//     - vos_db pool
+//         - path = "/var/daos/config/daos_control/engine0/daos_sys/sys_db"   (NOT on tmpfs)
+//
+//     - 数据pool
+//         - path = "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0"  (on tmpfs)
+//                  "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-1"  (on tmpfs)
+//                  ...
+//                  "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-17" (on tmpfs)
+//
+//                  这些文件已经被创建(可能是dao_server创建的)
+//                  它们的size都是20G/18
+//
+//         - uuid = "c090c2fc"
+//         - scm_sz = 0     注意不是200G/18 (可以获取path文件的size)
+//         - nvme_sz = 3000G/18
 int
 vos_pool_create(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_t nvme_sz,
 		unsigned int flags, uint32_t version, daos_handle_t *poh)

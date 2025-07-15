@@ -456,12 +456,14 @@ lw_tx_begin(dav_obj_t *pop)
 	int			 rc;
 	uint64_t		 wal_id;
 
+    //Yuanguo: 预留一个transaction id
 	rc = dav_wal_tx_reserve(pop, &wal_id);
 	if (rc) {
 		D_ERROR("so_wal_reserv failed, "DF_RC"\n", DP_RC(rc));
 		return rc;
 	}
 	if (pop->do_utx == NULL) {
+        //Yuanguo: 初始化transaction
 		utx = dav_umem_wtx_new(pop);
 		if (utx == NULL) {
 			D_ERROR("dav_umem_wtx_new failed\n");

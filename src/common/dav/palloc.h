@@ -19,16 +19,60 @@
 
 #define PALLOC_CTL_DEBUG_NO_PATTERN (-1)
 
+//Yuanguo:
+//                           memory             path /mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0
+//
+//        base -> +---------------------------------+    +---------------------------------+ 0
+//                |                                 |    |                                 |
+//                |         struct dav_phdr         |    |                                 |
+//                |              (4k)               |    |                                 |
+//                |                                 |    |                                 |
+//      layout -> +---------------------------------+    +---------------------------------+ 4k  ---
+//                | +-----------------------------+ |    |                                 |      |
+//                | | struct heap_header (1k)     | |    |                                 |      |
+//                | +-----------------------------+ |    |                                 |      |
+//                | | struct zone_header (64B)    | |    |                                 |      |
+//                | | struct chunk_header(8B)     | |    |                                 |      |
+//                | | struct chunk_header(8B)     | |    |                                 |      |
+//                | | ...... 65528个,不一定都用   | |    |                                 |      |
+//                | | struct chunk_header(8B)     | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | | ...... 最多65528个          | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | +-----------------------------+ |    |                                 |      |
+//                | | struct zone_header (64B)    | |    |                                 |      |
+//                | | struct chunk_header(8B)     | |    |                                 |      |
+//                | | struct chunk_header(8B)     | |    |                                 |  heap_size = path文件大小 - blob-header-size(4k) - sizeof(struct dav_phdr)(4k)
+//                | | ...... 65528个,不一定都用   | |    |                                 |      |                       (什么是blob-header?)
+//                | | struct chunk_header(8B)     | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | | ...... 最多65528个          | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | +-----------------------------+ |    |                                 |      |
+//                | |                             | |    |                                 |      |
+//                | |     ... more zones ...      | |    |                                 |      |
+//                | |                             | |    |                                 |      |
+//                | |  除了最后一个，前面的zone   | |    |                                 |      |
+//                | |  都是65528个chunk,接近16G   | |    |                                 |      |
+//                | |                             | |    |                                 |      |
+//                | +-----------------------------+ |    |                                 |      |
+//                +---------------------------------+    +---------------------------------+     ---
 struct palloc_heap {
 	struct mo_ops p_ops;
+    //Yuanguo: layout：上图中的layout
 	struct heap_layout *layout;
 	struct heap_rt *rt;
+    //Yuanguo: sizep指向上图中struct heap_header中的dp_heap_size
 	uint64_t *sizep;
 	uint64_t growsize;
 
+    //Yuanguo: stats.persistent指向上图中struct dav_phdr中的dp_stats_persistent
 	struct stats *stats;
 	struct pool_set *set;
 
+    //Yuanguo: base即上图中base
 	void *base;
 
 	int alloc_pattern;

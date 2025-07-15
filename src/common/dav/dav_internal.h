@@ -42,25 +42,47 @@ struct dav_phdr {
 	uint64_t		dp_heap_size;
 	uint64_t		dp_root_offset;
 	uint64_t		dp_root_size;
+    //Yuanguo: dp_stats_persistent.heap_curr_allocated 可以通过:
+    //       xxd -s 40 -l 8  /mnt/daos0/c090c2fc-8d83-45de-babe-104bad165593/vos-0
+    // 查看(40表示跳过前面5个uint64_t)
+    // 注意：这可能是实际使用的空间!!! 从客户端发起写操作时，这个值在变化!!!
 	struct stats_persistent dp_stats_persistent;
 	char	 dp_unused[DAV_PHDR_SIZE - sizeof(uint64_t)*5 -
 			sizeof(struct stats_persistent)];
 };
 
+//Yuanguo: 代表一个memory pool，等价于PMEM模式的 PMEMobjpool (struct pmemobjpool)
 /* DAV object handle */
 typedef struct dav_obj {
+    //Yuanguo: do_path: "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0" (on tmpfs)
 	char				*do_path;
+    //Yuanguo: do_size: do_path文件大小 - blob-header-size(默认1*4k) (注意不是struct dav_phdr)
 	uint64_t			 do_size;
+    //Yuanguo: do_path文件通过mmap映射到内存，do_base是mmap返回的内存地址，对应do_path文件的起始位置；
 	void				*do_base;
+    //Yuanguo: 把do_path文件的内存映射组织成header + zone-list layout；do_heap指向这个layout；
 	struct palloc_heap		*do_heap;
+    //Yuanguo: do_phdr: 指向mmap映射空间中的struct dav_phdr (实际上，就在mmap空间的起始处，即等于do_base，对应do_path文件的起始)
 	struct dav_phdr			*do_phdr;
 	struct operation_context	*external;
 	struct operation_context	*undo;
 	struct mo_ops			 p_ops;	/* REVISIT */
+    //Yuanguo: do_stats->stats_persistent指向do_phdr->dp_stats_persistent; 见dav_obj_open_internal()->stats_new()
 	struct stats			*do_stats;
+    //Yuanguo: do_fd: do_path文件的描述符；
 	int				 do_fd;
 	int				 nested_tx;
+    //Yuanguo: transaction的内存表示；
+    //  对于MD-on-SSD: do_utx->utx_private是一个指向struct dav_tx对象的指针；对象中包含一个struct umem_action的链表；
+    //                 do_utx->utx_id是transaction id;
 	struct umem_wal_tx		*do_utx;
+    //Yuanguo:  *do_store = {
+    //                        .stor_blk_size=4k
+    //                        .stor_hdr_blks=1
+    //                        .stor_size = do_path文件的大小 - blob-header-size(1*4k) (注意不是struct dav_phdr)
+    //                        .store_type = DAOS_MD_BMEM
+    //                        .stor_priv: 指向struct bio_meta_context对象，里面是meta/wal blob的spdk blob id等；
+    //                      }
 	struct umem_store               *do_store;
 
 	struct dav_clogs		 clogs __attribute__ ((__aligned__(CACHELINE_SIZE)));

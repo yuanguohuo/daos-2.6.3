@@ -165,6 +165,7 @@ dav_wal_tx_submit(struct dav_obj *dav_hdl, struct umem_wal_tx *utx, void *data)
 	}
 	DAV_DBG("tx_id:%lu submitting to WAL: %u bytes in %u actions",
 		id, tx->wt_redo_payload_len, tx->wt_redo_cnt);
+    //Yuanguo: for vos_pool, so_wal_submit = vos_wal_commit;
 	rc = store->stor_ops->so_wal_submit(store, utx, data);
 	return rc;
 }

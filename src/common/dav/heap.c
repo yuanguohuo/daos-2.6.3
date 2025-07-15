@@ -523,6 +523,8 @@ heap_max_zone(size_t size)
 
 	size -= sizeof(struct heap_header);
 
+    //Yuanguo: ZONE_MAX_SIZE = 65528个256k，大约16G
+    //  ZONE_MIN_SIZE <= size < ZONE_MAX_SIZE，只有1个zone
 	while (size >= ZONE_MIN_SIZE) {
 		max_zone++;
 		size -= size <= ZONE_MAX_SIZE ? size : ZONE_MAX_SIZE;
@@ -1669,6 +1671,8 @@ heap_init(void *heap_start, uint64_t heap_size, uint64_t *sizep,
 	struct heap_layout *layout = heap_start;
 
 	heap_write_header(&layout->header);
+    //Yuanguo: 上面改了heap header处的内存状态，要把这个modification (redo log)写入wal.
+    //(注: 这里只是在transaction中记录redo log，还没有flush transaction到nvme spdk blob)
 	mo_wal_persist(p_ops, &layout->header, sizeof(struct heap_header));
 
 	unsigned zones = heap_max_zone(heap_size);
@@ -1686,6 +1690,7 @@ heap_init(void *heap_start, uint64_t heap_size, uint64_t *sizep,
 			sizeof(struct chunk_header));
 	}
 	*sizep = heap_size;
+    //Yuanguo: 同上，修改了hdl->do_phdr->dp_heap_size，记redo log
 	mo_wal_persist(p_ops, sizep, sizeof(*sizep));
 
 	return 0;

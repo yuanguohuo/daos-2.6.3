@@ -455,6 +455,11 @@ int bio_mc_destroy(struct bio_xs_context *xs_ctxt, uuid_t pool_id, enum bio_mc_f
 	return 0;
 }
 
+//Yuanguo: 异步创建一个blob {size=blob_sz, type(data,meta,wal)=st}，等待完成
+//  - uuid: pool的id(形如c090c2fc-8d83-45de-babe-104bad165593)
+//  - xs_ctxt: xstream(如taget-0) 的 spdk-blobstore 信息；
+//  - blob_sz: blob的大小
+//  - st: blob type (data, meta, wal)
 static int
 bio_blob_create(uuid_t uuid, struct bio_xs_context *xs_ctxt, uint64_t blob_sz,
 		enum smd_dev_type st, enum bio_mc_flags flags, spdk_blob_id *blob_id)
@@ -480,6 +485,7 @@ bio_blob_create(uuid_t uuid, struct bio_xs_context *xs_ctxt, uint64_t blob_sz,
 		return -DER_NO_HDL;
 	}
 
+    //Yuanguo: 一个blob至少包含一个spdk blob cluster
 	if (blob_sz < cluster_sz) {
 		/* Blob needs to be at least 1 cluster */
 		D_ERROR("Blob size is less than the size of a cluster "DF_U64""
@@ -488,18 +494,22 @@ bio_blob_create(uuid_t uuid, struct bio_xs_context *xs_ctxt, uint64_t blob_sz,
 	}
 
 	spdk_blob_opts_init(&bma.bma_opts, sizeof(bma.bma_opts));
+    //Yuanguo: 整数个spdk blob cluster (向上取整)
 	bma.bma_opts.num_clusters = (blob_sz + cluster_sz - 1) / cluster_sz;
 
 	/**
 	 * Query per-server metadata to make sure the blob for this pool:target
 	 * hasn't been created yet.
 	 */
+    //Yuanguo: 查询smd (per-Server MetaData)，确保要创建的blob不存在！
 	if (bio_nvme_configured(SMD_DEV_TYPE_META)) {
+        //Yuanguo: bio_nvme_configured(SMD_DEV_TYPE_META)成立，表明是MD-on-SSD场景
 		if (flags & BIO_MC_FL_RDB)
 			rc = smd_rdb_get_blob(uuid, xs_ctxt->bxc_tgt_id, st, &blob_id1);
 		else
 			rc = smd_pool_get_blob(uuid, xs_ctxt->bxc_tgt_id, st, &blob_id1);
 	} else {
+        //Yuanguo: 非MD-on-SSD场景
 		rc = smd_pool_get_blob(uuid, xs_ctxt->bxc_tgt_id, st, &blob_id1);
 	}
 
@@ -535,7 +545,11 @@ bio_blob_create(uuid_t uuid, struct bio_xs_context *xs_ctxt, uint64_t blob_sz,
 			"%p pool:"DF_UUID" blob size:"DF_U64" clusters\n",
 			ba->bca_id, xs_ctxt, DP_UUID(uuid),
 			bma.bma_opts.num_clusters);
+        //Yuanguo: 把新创建的blob
+        //       { size=blob_sz, type(data,meta,wal)=st }
+        //添加到smd (per-Server MetaData)
 		if (bio_nvme_configured(SMD_DEV_TYPE_META)) {
+            //Yuanguo: bio_nvme_configured(SMD_DEV_TYPE_META)成立表明是MD-on-SSD场景
 			if (flags & BIO_MC_FL_RDB)
 				rc = smd_rdb_add_tgt(uuid, xs_ctxt->bxc_tgt_id, ba->bca_id, st,
 						     blob_sz, flags & BIO_MC_FL_RECREATE);
@@ -543,6 +557,7 @@ bio_blob_create(uuid_t uuid, struct bio_xs_context *xs_ctxt, uint64_t blob_sz,
 				rc = smd_pool_add_tgt(uuid, xs_ctxt->bxc_tgt_id, ba->bca_id, st,
 						      blob_sz, flags & BIO_MC_FL_RECREATE);
 		} else {
+            //Yuanguo: 非MD-on-SSD场景
 			rc = smd_pool_add_tgt(uuid, xs_ctxt->bxc_tgt_id, ba->bca_id, st, blob_sz,
 					      flags & BIO_MC_FL_RECREATE);
 		}
@@ -569,6 +584,8 @@ bio_blob_create(uuid_t uuid, struct bio_xs_context *xs_ctxt, uint64_t blob_sz,
 	return rc;
 }
 
+//Yuanguo: 一个struct bio_io_context对象表示对一个blob的一个open (类比fd)
+//  read/write操作需要它做参数(代表目标blob)， 类比文件read/write需要fd参数(代表目标文件)
 static int
 __bio_ioctxt_open(struct bio_io_context **pctxt, struct bio_xs_context *xs_ctxt,
 		  uuid_t uuid, enum bio_mc_flags flags, enum smd_dev_type st,
@@ -628,6 +645,19 @@ default_wal_sz(uint64_t meta_sz)
 	return wal_sz;
 }
 
+//Yuanguo:
+//  MD-on-SSD情况下，创建pool:
+//
+//     dmg pool create --scm-size=200G --nvme-size=3000G --properties rd_fac:2 ensblock
+//
+//     上述200G,3000G都是单个engine的配置；
+//     假设单engine的target数是18
+//     假设pool的uuid是c090c2fc-8d83-45de-babe-104bad165593 (可以通过dmg pool list -v查看)
+//
+//  pool_id = c090c2fc-8d83-45de-babe-104bad165593
+//  meta_sz = 200G/18，即/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0文件的大小
+//  wal_sz  = 0  本函数根据meta_sz计算一个大小
+//  data_sz = 3000G/18
 int bio_mc_create(struct bio_xs_context *xs_ctxt, uuid_t pool_id, uint64_t meta_sz,
 		  uint64_t wal_sz, uint64_t data_sz, enum bio_mc_flags flags)
 {
@@ -648,6 +678,7 @@ int bio_mc_create(struct bio_xs_context *xs_ctxt, uuid_t pool_id, uint64_t meta_
 			return rc;
 	}
 
+    //Yuanguo: 若非MD-on-SSD，直接返回；
 	if (!bio_nvme_configured(SMD_DEV_TYPE_META))
 		return 0;
 
@@ -719,16 +750,19 @@ int bio_mc_create(struct bio_xs_context *xs_ctxt, uuid_t pool_id, uint64_t meta_
 	fi->fi_data_size = data_sz;
 	fi->fi_vos_id = xs_ctxt->bxc_tgt_id;
 
+    //Yuanguo: 在meta blob，wal blob的offset=0处，分别写meta header和wal header;
 	rc = meta_format(mc, fi, true);
 	if (rc)
 		D_ERROR("Unable to format newly created blob for xs:%p pool:"DF_UUID"\n",
 			xs_ctxt, DP_UUID(pool_id));
 
+    //Yuanguo: 写完，close wal blob
 	rc1 = bio_ioctxt_close(mc->mc_wal);
 	if (rc == 0)
 		rc = rc1;
 
 close_meta:
+    //Yuanguo: 写完，close meta blob
 	rc1 = bio_ioctxt_close(mc->mc_meta);
 	if (rc == 0)
 		rc = rc1;
@@ -884,6 +918,7 @@ int bio_mc_open(struct bio_xs_context *xs_ctxt, uuid_t pool_id,
 
 	*mc = NULL;
 	if (!bio_nvme_configured(SMD_DEV_TYPE_META)) {
+        //Yuanguo: 非MD-on-SSD场景
 		/* No data blob for RDB */
 		if (flags & BIO_MC_FL_RDB)
 			return 0;
@@ -912,22 +947,29 @@ int bio_mc_open(struct bio_xs_context *xs_ctxt, uuid_t pool_id,
 			return rc;
 		}
 		*mc = bio_mc;
+        //Yuanguo: 非MD-on-SSD场景，直接返回，无需meta blob, wal blob的open
 		return 0;
 	}
 
+    //Yuanguo: MD-on-SSD场景
 	D_ALLOC_PTR(bio_mc);
 	if (bio_mc == NULL)
 		return -DER_NOMEM;
 
+    //Yuanguo: 在读meta blob之前，我们根本不知道meta blob的id，所以最后一个参数是SPDK_BLOBID_INVALID，
+    //  这样就会去per-Server MetaData (SMD)查询meta blob的id；
 	rc = __bio_ioctxt_open(&bio_mc->mc_meta, xs_ctxt, pool_id, flags, SMD_DEV_TYPE_META,
 			       SPDK_BLOBID_INVALID);
 	if (rc)
 		goto free_mem;
 
+    //Yuanguo: meta blob已经打开，现在load meta header；
 	rc = meta_open(bio_mc);
 	if (rc)
 		goto close_meta_ioctxt;
 
+    //Yuanguo: meta header已经load，那么wal blob和data blob的id就知道了，所以后面调用__bio_ioctxt_open
+    //  就可以给定最后一个参数了；
 
 	D_ASSERT(bio_mc->mc_meta_hdr.mh_wal_blobid != SPDK_BLOBID_INVALID);
 	rc = __bio_ioctxt_open(&bio_mc->mc_wal, xs_ctxt, pool_id, flags, SMD_DEV_TYPE_WAL,
@@ -935,11 +977,13 @@ int bio_mc_open(struct bio_xs_context *xs_ctxt, uuid_t pool_id,
 	if (rc)
 		goto close_meta;
 
+    //Yuanguo: wal blob已打开，load wal header；
 	rc = wal_open(bio_mc);
 	if (rc)
 		goto close_wal_ioctxt;
 
 	data_blobid = bio_mc->mc_meta_hdr.mh_data_blobid;
+    //Yuanguo: 允许没有data blob，例如纯SCM场景；
 	if (data_blobid != SPDK_BLOBID_INVALID) {
 		D_ASSERT(!(flags & BIO_MC_FL_RDB));
 		rc = __bio_ioctxt_open(&bio_mc->mc_data, xs_ctxt, pool_id, flags,
@@ -1082,6 +1126,10 @@ int bio_mc_close(struct bio_meta_context *bio_mc)
 	return rc;
 }
 
+//Yuanguo: 类似于SATA里的TRIM命令，在NVMe中叫Deallocate，SPDK采用unmap叫法；
+//  ATA:  TRIM
+//  SCSI: UNMAP
+//  NVMe: Deallocate
 int
 bio_blob_unmap(struct bio_io_context *ioctxt, uint64_t off, uint64_t len)
 {

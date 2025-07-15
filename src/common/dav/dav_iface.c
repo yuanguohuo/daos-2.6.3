@@ -50,6 +50,9 @@ setup_dav_phdr(dav_obj_t *hdl)
 	hptr->dp_root_offset = 0;
 	hptr->dp_root_size = 0;
 	hptr->dp_heap_offset = sizeof(struct dav_phdr);
+    //Yuanguo: 感觉有bug
+    //   hdl->do_size: 已经减去了某个header的大小(4k)，那个是什么header ?
+    //   这里又减sizeof(struct dav_phdr)=4k!
 	hptr->dp_heap_size = hdl->do_size - sizeof(struct dav_phdr);
 	hptr->dp_stats_persistent.heap_curr_allocated = 0;
 	hdl->do_phdr = hptr;
@@ -61,6 +64,30 @@ persist_dav_phdr(dav_obj_t *hdl)
 	mo_wal_persist(&hdl->p_ops, hdl->do_phdr, offsetof(struct dav_phdr, dp_unused));
 }
 
+//Yuanguo:
+//  MD-on-SSD情况下，创建pool:
+//
+//     dmg pool create --scm-size=200G --nvme-size=3000G --properties rd_fac:2 ensblock
+//
+//     上述200G,3000G都是单个engine的配置；
+//     假设单engine的target数是18
+//     假设pool的uuid是c090c2fc-8d83-45de-babe-104bad165593 (可以通过dmg pool list -v查看)
+//
+//     - fd    = path文件的描述符
+//     - flags = DAV_HEAP_INIT
+//     - sz    = path文件的大小 - blob-header-size(默认1*4k) (注意不是struct dav_phdr)
+//     - path = "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0"  (on tmpfs)
+//                  ...
+//                  这些文件已经被创建(可能是dao_server创建的)
+//                  它们的size都是20G/18
+//
+//     - *store      = {
+//                        .stor_blk_size=4k
+//                        .stor_hdr_blks=1
+//                        .stor_size = path文件的大小 - blob-header-size(1*4k) (注意不是struct dav_phdr)
+//                        .store_type = DAOS_MD_BMEM
+//                        .stor_priv: 指向struct bio_meta_context对象，里面是meta/wal blob的spdk blob id等；
+//                     }
 static dav_obj_t *
 dav_obj_open_internal(int fd, int flags, size_t sz, const char *path, struct umem_store *store)
 {
@@ -73,6 +100,11 @@ dav_obj_open_internal(int fd, int flags, size_t sz, const char *path, struct ume
 	int        err         = 0;
 	int        rc;
 
+    //Yuanguo: path(fd)是一个tmpfs中的文件; 它已经在内存中；mmap不会再拷贝一次！
+    //   为什么mmap的sz不是path(fd)文件的总大小，而是扣除了blob-header-size?
+    //   struct umem_store里面注释：
+    //      Size of the umem storage, excluding blob header which isn't visible to allocator.
+    //   可是，这会从path文件的开头开始映射，留下的blob-header-4k在文件末尾??
 	base = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
 	if (base == MAP_FAILED) {
 		return NULL;
@@ -94,6 +126,30 @@ dav_obj_open_internal(int fd, int flags, size_t sz, const char *path, struct ume
 	if (hdl->do_store->stor_priv == NULL) {
 		D_ERROR("meta context not defined. WAL commit disabled for %s\n", path);
 	} else {
+        //Yuanguo: 为storage->cache分配空间：
+        //   +---------------------------------+
+        //   |                                 |
+        //   |                                 |
+        //   |        struct umem_cache        |
+        //   |                                 |
+        //   |                                 |
+        //   +---------------------------------+
+        //   |        struct umem_page         | ca_pages[0]
+        //   +---------------------------------+
+        //   |        struct umem_page         | ca_pages[1]
+        //   +---------------------------------+
+        //   |        ......                   | ...
+        //   +---------------------------------+
+        //   |        struct umem_page         | ca_pages[num_pages-1]
+        //   +---------------------------------+
+        //   |        struct umem_page_info    | pinfo[0]
+        //   +---------------------------------+
+        //   |        struct umem_page_info    | pinfo[1]
+        //   +---------------------------------+
+        //   |        ......                   | ...
+        //   +---------------------------------+
+        //   |        struct umem_page_info    | pinfo[num_pages-1]
+        //   +---------------------------------+
 		rc = umem_cache_alloc(store, 0);
 		if (rc != 0) {
 			D_ERROR("Could not allocate page cache: rc=" DF_RC "\n", DP_RC(rc));
@@ -113,7 +169,52 @@ dav_obj_open_internal(int fd, int flags, size_t sz, const char *path, struct ume
 	}
 
 	if (flags & DAV_HEAP_INIT) {
+        //Yuanguo:
+        //                           memory             path /mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0
+        //
+        // hdl->do_base   +---------------------------------+    +---------------------------------+ 0
+        //                |                                 |    |                                 |
+        //                |         struct dav_phdr         |    |                                 |
+        //                |              (4k)               |    |                                 |
+        //                |                                 |    |                                 |
+        //      heap_base +---------------------------------+    +---------------------------------+ 4k  ---
+        //                | +-----------------------------+ |    |                                 |      |
+        //                | | struct heap_header (1k)     | |    |                                 |      |
+        //                | +-----------------------------+ |    |                                 |      |
+        //                | | struct zone_header (64B)    | |    |                                 |      |
+        //                | | struct chunk_header(8B)     | |    |                                 |      |
+        //                | | struct chunk_header(8B)     | |    |                                 |      |
+        //                | | ...... 65528个,不一定都用   | |    |                                 |      |
+        //                | | struct chunk_header(8B)     | |    |                                 |      |
+        //                | | chunk (256k)                | |    |                                 |      |
+        //                | | chunk (256k)                | |    |                                 |      |
+        //                | | ...... 最多65528个          | |    |                                 |      |
+        //                | | chunk (256k)                | |    |                                 |      |
+        //                | +-----------------------------+ |    |                                 |      |
+        //                | | struct zone_header (64B)    | |    |                                 |      |
+        //                | | struct chunk_header(8B)     | |    |                                 |      |
+        //                | | struct chunk_header(8B)     | |    |                                 |  heap_size = path文件大小 - blob-header-size(4k) - sizeof(struct dav_phdr)(4k)
+        //                | | ...... 65528个,不一定都用   | |    |                                 |      |                       (什么是blob-header?)
+        //                | | struct chunk_header(8B)     | |    |                                 |      |
+        //                | | chunk (256k)                | |    |                                 |      |
+        //                | | chunk (256k)                | |    |                                 |      |
+        //                | | ...... 最多65528个          | |    |                                 |      |
+        //                | | chunk (256k)                | |    |                                 |      |
+        //                | +-----------------------------+ |    |                                 |      |
+        //                | |                             | |    |                                 |      |
+        //                | |     ... more zones ...      | |    |                                 |      |
+        //                | |                             | |    |                                 |      |
+        //                | |  除了最后一个，前面的zone   | |    |                                 |      |
+        //                | |  都是65528个chunk,接近16G   | |    |                                 |      |
+        //                | |                             | |    |                                 |      |
+        //                | +-----------------------------+ |    |                                 |      |
+        //                +---------------------------------+    +---------------------------------+     ---
+
+        //Yuanguo: 初始化struct dav_phdr 为什么没有放到transaction中呢？
+        //  答：需要持久话的字段，会放到transaction，例如dp_heap_size(hdl->do_phdr->dp_heap_size)的redo log
+        //      在heap_init()函数中记录。
 		setup_dav_phdr(hdl);
+
 		heap_base = (char *)hdl->do_base + hdl->do_phdr->dp_heap_offset;
 		heap_size = hdl->do_phdr->dp_heap_size;
 
@@ -135,12 +236,16 @@ dav_obj_open_internal(int fd, int flags, size_t sz, const char *path, struct ume
 
 		D_ASSERT(store != NULL);
 
+        //Yuanguo:
+        //  对于vos_pool: so_load = vos_meta_load.  从spdk meta blob (nvme盘)读取meta的快照。
 		rc = store->stor_ops->so_load(store, hdl->do_base);
 		if (rc) {
 			D_ERROR("Failed to read blob to vos file %s, rc = %d\n", path, rc);
 			goto out2;
 		}
 
+        //Yuanguo:
+        //  对于vos_pool: so_wal_replay = vos_wal_replay. 从spdk wal blob (nvme盘) 读取meta的redo-log，并apply到快照。
 		rc = hdl->do_store->stor_ops->so_wal_replay(hdl->do_store, dav_wal_replay_cb, hdl);
 		if (rc) {
 			err = daos_der2errno(rc);
@@ -230,6 +335,29 @@ out0:
 
 }
 
+//Yuanguo:
+//  MD-on-SSD情况下，创建pool:
+//
+//     dmg pool create --scm-size=200G --nvme-size=3000G --properties rd_fac:2 ensblock
+//
+//     上述200G,3000G都是单个engine的配置；
+//     假设单engine的target数是18
+//     假设pool的uuid是c090c2fc-8d83-45de-babe-104bad165593 (可以通过dmg pool list -v查看)
+//
+//     - path = "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0"  (on tmpfs)
+//                  ...
+//                  这些文件已经被创建(可能是dao_server创建的)
+//                  它们的size都是20G/18
+//
+//     - flags       = 0
+//     - sz          = 0
+//     - mode        = 0600
+//     - *store      = {
+//                        .stor_blk_size=4k
+//                        .stor_hdr_blks=1
+//                        .stor_size = path文件的大小 - blob-header-size(1*4k) (注意不是struct dav_phdr)
+//                        .store_type = DAOS_MD_BMEM
+//                     }
 dav_obj_t *
 dav_obj_create(const char *path, int flags, size_t sz, mode_t mode, struct umem_store *store)
 {
@@ -262,6 +390,8 @@ dav_obj_create(const char *path, int flags, size_t sz, mode_t mode, struct umem_
 		}
 	}
 
+    //Yuanguo: sz是path文件大小；
+    //         store->stor_size是path文件大小 - blob-header-size (1*4k) (注意不是struct dav_phdr)
 	if (!store->stor_size || (sz < store->stor_size)) {
 		ERR("Invalid umem_store size");
 		errno = EINVAL;
@@ -409,10 +539,19 @@ dav_class_register(dav_obj_t *pop, struct dav_alloc_class_desc *p)
 		}
 	}
 
+    //Yuanguo: register_slabs() -> set_slab_desc() -> dav_class_register()
+    //  p->alignment = 0
+    //  p->units_per_block = 1000
+    //  p->unit_size = 32, 64, 96, 128, 160, 192, 224, 256, 288, 352, 384, 416, 512, 576, 672, 768
+    //  所以，runsize_bytes =
+    //               CHUNK_ALIGN_UP(1000*32 + 16)  = CHUNK_ALIGN_UP(32016) = 256k          (1个chunk)
+    //               ...
+    //               CHUNK_ALIGN_UP(1000*768 + 16) = CHUNK_ALIGN_UP(768016) = 3 * 256k     (3个chunk)
 	size_t runsize_bytes =
 		CHUNK_ALIGN_UP((p->units_per_block * p->unit_size) +
 		RUN_BASE_METADATA_SIZE);
 
+    //Yuanguo: 若p->alignment != 0, runsize_bytes就不是chunk size (256k) 的整数倍
 	/* aligning the buffer might require up-to to 'alignment' bytes */
 	if (p->alignment != 0)
 		runsize_bytes += p->alignment;

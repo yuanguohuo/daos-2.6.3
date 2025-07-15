@@ -14,6 +14,32 @@ enum meta_hdr_flags {
 };
 
 /* Meta blob header */
+//  MD-on-SSD情况下，创建pool:
+//
+//     dmg pool create --scm-size=200G --nvme-size=3000G --properties rd_fac:2 ensblock
+//
+//     上述200G,3000G都是单个engine的配置；
+//     假设单engine的target数是18
+//     假设pool的uuid是c090c2fc-8d83-45de-babe-104bad165593 (可以通过dmg pool list -v查看)
+//
+//     bio_mc_create() --> meta_format()函数初始化...
+//
+//         mh_magic : BIO_META_MAGIC
+//
+//         mh_meta_devid : meta spdk-blobstore 或其所在的nvme ssd的id
+//         mh_wal_devid  : wal spdk-blobstore 或其所在的nvme ssd的id
+//         mh_data_devid : data spdk-blobstore 或其所在的nvme ssd的id
+//
+//         mh_meta_blobid :   spdk blobstore中meta blob的id (真实类型是spdk_blob_id)
+//         mh_wal_blobid  :   spdk blobstore中wal blob的id (真实类型是spdk_blob_id)
+//         mh_data_blobid :   spdk blobstore中data blob的id (真实类型是spdk_blob_id)
+//
+//         mh_blk_bytes : 4096
+//         mh_hdr_blks  : 1
+//         mh_tot_blks  : 200G/18/mh_blk_bytes - mh_hdr_blks 即总blocks - header-blocks
+//
+//         mh_vos_id: target_id；例如单个engine有18个target，这个数就是[0,17]中的一个；
+//                               每个pool在每个target上有一个vos；
 struct meta_header {
 	uint32_t	mh_magic;
 	uint32_t	mh_version;
@@ -92,6 +118,31 @@ struct wal_super_info {
 	uint64_t		si_commit_id;	/* Last committed ID */
 	uint32_t		si_ckp_blks;	/* Blocks used by last check-pointed ID */
 	uint32_t		si_commit_blks;	/* Blocks used by last committed ID */
+    //Yuanguo: tx_id分配器。
+    // 注意1：tx_id并不是连续递增的，因为si_unused_id不是一个计数器。具体是这样的：
+    //   - si_unused_id分为2个32-bits；
+    //       - 高32-bits(WAL_ID_SEQ_BITS)叫做seq(sequence-no)；
+    //       - 低32-bits(WAL_ID_OFF_BITS)叫做off(offset);
+    //   - off表示一个transaction在wal中所处的block号；
+    //   - seq每当wal写满回绕时递增1；
+    // 见wal_next_id()函数;
+    //
+    // 假如：
+    //   - wal的block总数是1024 (即si_header.wh_tot_blks=1024)
+    //   - si_unused_id = 3 << 32 | 1000;  即seq=3, off=1000;
+    // 那么：
+    //   - T1: txA reserve id: 3 << 32 | 1000；假设txA的size是20个block；si_unused_id更新为：3 << 32 | 1020
+    //   - T2: txB reserve id: 3 << 32 | 1020；假设txB的size是10个block；si_unused_id更新为：4 << 32 | 6
+    //   - T3: txC reserve id: 4 << 32 | 6 ...
+    //
+    // 注意2：允许seq溢出，程序能过识别出这种情况，见wal_id_cmp()函数；
+    //
+    // 可以把wal看作一个无限长的序列(回绕以及seq溢出情况已被妥善处理)，一个transaction或一个checkpoint都对应唯一一个点
+    //
+    //                               si_ckp_id
+    //    txA        txB               txC     si_ckp_blks        txD            txE      si_unused_id
+    //     |  txA-sz  |      txB-sz     |        txC-sz            |    txD-sz    |  txE-sz  |
+    //  ------------------------------------------------------------------------------------------>
 	uint64_t                si_unused_id;   /* Next unused ID */
 	d_list_t		si_pending_list;/* Pending transactions */
 	ABT_cond		si_rsrv_wq;	/* FIFO waitqueue for WAL ID reserving */

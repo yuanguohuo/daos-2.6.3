@@ -100,6 +100,46 @@ bio_spdk_conf_read(struct spdk_env_opts *opts)
 	int			roles = 0;
 	int                     rc;
 
+    //Yuanguo:
+    //  # cat /var/daos/config/daos_control/engine0/daos_nvme.conf
+    //  {
+    //    "daos_data": {
+    //      "config": []
+    //    },
+    //    "subsystems": [
+    //      {
+    //        "subsystem": "bdev",
+    //        "config": [
+    //          ...
+    //          {
+    //            "params": {
+    //              "trtype": "PCIe",
+    //              "name": "Nvme_enss219546408046.cn5820_0_1_7",
+    //              "traddr": "0000:65:00.0"
+    //            },
+    //            "method": "bdev_nvme_attach_controller"
+    //          },
+    //          {
+    //            "params": {
+    //              "trtype": "PCIe",
+    //              "name": "Nvme_enss219546408046.cn5820_1_1_7",
+    //              "traddr": "0000:66:00.0"
+    //            },
+    //            "method": "bdev_nvme_attach_controller"
+    //          },
+    //        ]
+    //      }
+    //    ]
+    //  }
+    //
+    //  其中 "Nvme_enss219546408046.cn5820_1_1_7" 最后那个7 就是role，代表二进制111b，也就是
+    //  此NVME同时用作DATA, META, WAL
+    //
+    //       #define NVME_ROLE_DATA	(1 << 0)
+    //       #define NVME_ROLE_META	(1 << 1)
+    //       #define NVME_ROLE_WAL		(1 << 2)
+    //
+    //  这里的roles就是所有NVME的role的bit-or;
 	rc = bio_add_allowed_alloc(nvme_glb.bd_nvme_conf, opts, &roles, &vmd_enabled);
 	if (rc != 0) {
 		DL_ERROR(rc, "Failed to add allowed devices to SPDK env");
@@ -264,6 +304,18 @@ bio_nvme_init(const char *nvme_conf, int numa_node, unsigned int mem_size,
 	d_getenv_uint("DAOS_MAX_ASYNC_SZ", &bio_max_async_sz);
 	D_INFO("Max async data size is set to %u bytes\n", bio_max_async_sz);
 
+    //Yuanguo: mem_size就是当前numa node分配的hugepage内存；一个真实的例子：
+    //  # cat /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+    //  9730
+    //
+    //  即9730个大页(2M)，共19460 MiB
+    //  daos_engine配置18个target (tgt_nr=18)
+    //  所以，每个target的最大DMA内存是
+    //      - 19460/18 = 1081MiB
+    //      - 即135个chucnk (每个chunk是8M)
+    //
+    //  下面打印日志：Set per-xstream DMA buffer upper bound to 135 8MB chunks
+
 	/* Hugepages disabled */
 	if (mem_size == 0) {
 		D_INFO("Set per-xstream DMA buffer upper bound to %u %uMB chunks\n",
@@ -309,6 +361,7 @@ bio_nvme_init(const char *nvme_conf, int numa_node, unsigned int mem_size,
 		bio_numa_node = SPDK_ENV_SOCKET_ID_ANY;
 	}
 
+    //Yuanguo: 当前numa node分配的hugepage内存
 	nvme_glb.bd_mem_size = mem_size;
 	if (nvme_conf) {
 		D_STRNDUP(nvme_glb.bd_nvme_conf, nvme_conf, strlen(nvme_conf));
@@ -333,6 +386,7 @@ bio_nvme_init(const char *nvme_conf, int numa_node, unsigned int mem_size,
 	if (!bio_nvme_configured(SMD_DEV_TYPE_META))
 		nvme_glb.bd_bs_opts.cluster_sz = (1UL << 30);	/* 1GB */
 
+    //Yuanguo: 假如有任意NVME盘承担META role，那么一定是metadata-on-ssd
 	D_INFO("MD on SSD is %s\n",
 	       bio_nvme_configured(SMD_DEV_TYPE_META) ? "enabled" : "disabled");
 
@@ -1152,6 +1206,20 @@ is_role_match(unsigned int roles, unsigned int req_role)
 bool
 bio_nvme_configured(enum smd_dev_type type)
 {
+    //Yuanguo:
+    //    #cat /var/daos/config/daos_control/engine0/daos_nvme.conf
+    //    ...
+    //    "name": "Nvme_enss219546408046.cn5820_0_1_7",
+    //    ...
+    //
+    //    其中“Nvme_enss219546408046.cn5820_0_1_7”末尾的7，就是role，代表二进制111b:
+    //    表示此NVME同时用作DATA, META, WAL
+    //
+    //        #define NVME_ROLE_DATA	(1 << 0)
+    //        #define NVME_ROLE_META	(1 << 1)
+    //        #define NVME_ROLE_WAL		(1 << 2)
+    //
+    //    nvme_glb.bd_nvme_roles 就是所有NVME的role的bit-or;
 	if (nvme_glb.bd_nvme_conf == NULL)
 		return false;
 
@@ -1552,6 +1620,9 @@ bio_xsctxt_alloc(struct bio_xs_context **pctxt, int tgt_id, bool self_polling)
 	if (ctxt == NULL)
 		return -DER_NOMEM;
 
+    //Yuanguo:
+    //  - target xstream 的 tgt_id是0, 1, ..., 11 (比如daos_server.yml中配置targets:12)
+    //  - first sys xstream 的tgt_id是BIO_SYS_TGT_ID(1024)，其它sys xstream不访问NVME ，
 	ctxt->bxc_tgt_id = tgt_id;
 	ctxt->bxc_self_polling = self_polling;
 
@@ -1586,6 +1657,8 @@ bio_xsctxt_alloc(struct bio_xs_context **pctxt, int tgt_id, bool self_polling)
 		rc = -DER_NOMEM;
 		goto out;
 	}
+
+    //Yuanguo: Force the current system thread to act as if executing the given SPDK thread.
 	spdk_set_thread(ctxt->bxc_thread);
 
 	/*
@@ -1619,6 +1692,8 @@ bio_xsctxt_alloc(struct bio_xs_context **pctxt, int tgt_id, bool self_polling)
 		D_DEBUG(DB_MGMT, "SPDK bdev initialized, tgt_id:%d", tgt_id);
 
 		nvme_glb.bd_init_thread = ctxt->bxc_thread;
+
+        //Yuanguo: Create bio_bdevs from SPDK bdev, and create blobstore (if not exist)
 		rc = init_bio_bdevs(ctxt);
 		if (rc != 0) {
 			D_ERROR("failed to init bio_bdevs, "DF_RC"\n",
@@ -1645,16 +1720,48 @@ bio_xsctxt_alloc(struct bio_xs_context **pctxt, int tgt_id, bool self_polling)
 		}
 	}
 
+    //Yuanguo:
+    //   - MD-On-SSD：一定有nvme-ssd定义了meta角色；所以bio_nvme_configured(SMD_DEV_TYPE_META)一定返回true；
+    //   - MD-On-SCM：没有角色一说，所以一定没有nvme-ssd定义了meta角色；bio_nvme_configured(SMD_DEV_TYPE_META)一定返回false;
+    //
+    //Yuanguo: 常见的3中情况
+    //   - MD-On-SCM:
+    //       - 若current xstream是sys xstream：下面的for什么也没做，st=DATA时continue；st=META时break；
+    //         也就是说，不用初始化任何blobstore (sys xtream只使用SCM)
+    //       - 若current xstream是target xstream (也叫main xstream)：st=DATA时init_xs_blobstore_ctxt，st=META时break；
+    //         也就是说，每个main xstream只初始化data blobstore (其它都存储于SCM)
+    //
+    //    - MD-On-SSD且所有nvme-ssd都承担DATA,META,WAL角色(角色对等)：
+    //       - 若current xstream是sys xstream：st=DATA时continue; st=META时init_xs_blobstore_ctxt；st=WAL时continue然后结束；
+    //         也就是说，初始化meta blobstore，但wal blobstore复用它(sys xstream使用这个blobstore存储meta和wal)
+    //       - 若current xstream是target xstream (也叫main xstream)：st=DATA时init_xs_blobstore_ctxt; st=META/WAL时continue;
+    //         也就是说，初始化data blobstore, 但meta blobstore, wal blobstore复用它(target使用这个blobstore存储data,meta,wal)；
+    //
+    //    - MD-On-SSD且nvme-ssd-A作WAL, nvme-ssd-B作META, nvme-ssd-C作DATA：
+    //       - 若current xstream是sys xstream：st=DATA时continue; st=META时init_xs_blobstore_ctxt; st=WAL时init_xs_blobstore_ctxt;
+    //         也就是说，分别初始化meta blobstore和wal blobstore (sys xstream使用2个blobstore分别存储meta和wal)
+    //       - 若current xstream是target xstream (也叫main xstream)：st=DATA/META/WAL都init_xs_blobstore_ctxt
+    //         也就是说，分别初始化data blobstore, meta blobstore和wal blobstore (target使用3个blobstore分别存储data,meta,wal)
+
 	d_bdev = NULL;
 	/* Initialize per-xstream blobstore context */
 	for (st = SMD_DEV_TYPE_DATA; st < SMD_DEV_TYPE_MAX; st++) {
 		/* No Data blobstore for sys xstream */
+        //Yuanguo: tgt_id == BIO_SYS_TGT_ID 说明是 sys xstream;
 		if (st == SMD_DEV_TYPE_DATA && tgt_id == BIO_SYS_TGT_ID)
 			continue;
+
 		/* Share the same device/blobstore used by previous type */
+        //Yuanguo: 比如现在st=META, 前一轮for循环(st=DATA)为current target xtream初始化了data blobstore, 它在d_bdev上；
+        //  d_bdev也能承担META角色(is_role_match成立)，那么就不为current target xtream初始化meta blobstore了，复用data blobstore;
 		if (d_bdev && is_role_match(d_bdev->bb_roles, smd_dev_type2role(st)))
 			continue;
+
 		/* No Meta/WAL blobstore if Metadata on SSD is not configured */
+        //Yuanguo:
+        //    - MD-On-SCM: st=WAL/META时，这里立即break，因为bio_nvme_configured(SMD_DEV_TYPE_META)=false;
+        //                 也就是，只对target初始化data blobstore (其它存储于SCM)
+        //    - MD-On-SSD: 不成立，要对target初始化meta blobstore和wal blobstore (meta,wal存储于SSD);
 		if (st != SMD_DEV_TYPE_DATA && !bio_nvme_configured(SMD_DEV_TYPE_META))
 			break;
 

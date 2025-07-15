@@ -140,8 +140,10 @@ struct run_bitmap {
 struct run_descriptor {
 	uint16_t flags; /* chunk flags for the run */
 	size_t unit_size; /* the size of a single unit in a run */
+    //Yuanguo: size_idx表示一个run包含多少个chunk (256k)
 	uint32_t size_idx; /* size index of a single run instance */
 	size_t alignment; /* required alignment of objects */
+    //Yuanguo: nallocs: 一个run最多能分出多少个unit
 	unsigned nallocs; /* number of allocs per run */
 	struct run_bitmap bitmap;
 };
@@ -229,6 +231,10 @@ struct memory_block_ops {
 	unsigned (*fill_pct)(const struct memory_block *m);
 };
 
+//Yuanguo: 以下待确认
+//  - huge : zone中的block，由一个或多个chunk(256k)构成
+//  - run  : run中的block，由一个或多个run unit (32B, 64B, ..., 768B)构成
+//  block存在于bucket中，用于服务分配请求；
 struct memory_block {
 	uint32_t chunk_id; /* index of the memory block in its zone */
 	uint32_t zone_id; /* index of this block zone in the heap */
@@ -238,6 +244,9 @@ struct memory_block {
 	 * CHUNKSIZE in the case of a huge chunk or in multiple of a run
 	 * block size.
 	 */
+    //Yuanguo:
+    //  - huge : 多少个连续的chunk(256k)
+    //  - run  : 多少个连续的unit；注释中的run block应该就是run unit (待确认)
 	uint32_t size_idx;
 
 	/*
@@ -245,6 +254,9 @@ struct memory_block {
 	 * Number of preceding blocks in the chunk. In other words, the
 	 * position of this memory block in run bitmap.
 	 */
+    //Yuanguo:
+    //  - huge : 无用，前面的chunk_id足矣
+    //  - run  : 在run中，从这个位置(unit)开始
 	uint32_t block_off;
 
 	/*

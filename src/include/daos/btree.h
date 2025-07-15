@@ -21,6 +21,32 @@
  *
  * NB: could be PM data structure.
  */
+//Yuanguo:  实际上是B+Tree
+//
+//                          struct btr_node
+//
+//        tn_child    tn_recs[...]数组
+//        +-------+---------+---------+---------+---------+---------+
+//        |       |   500   |         |         |         |         | key (union, e.g. rec_ukey )
+//        |       +---------+---------+---------+---------+---------+
+//        |       |         |         |         |         |         | val (rec_off)
+//        +-------+---------+---------+---------+---------+---------+
+//            |         |
+//            |         |
+// +----------+         +----------------------------------------+
+// |                                                             |
+// V                                                             | rec指向right node的first key
+// off_left (原root)                                             V
+//  +---------+---------+---------+---------+---------+          +---------+---------+---------+---------+---------+
+//  |   200   |   240   |   300   |   400   |         | key      |   500   |   600   |         |         |         | key (union)
+//  +---------+---------+---------+---------+---------+          +---------+---------+---------+---------+---------+
+//  |         |         |         |         |         | val      |         |         |         |         |         | val (rec_off)
+//  +---------+---------+---------+---------+---------+          +---------+---------+---------+---------+---------+
+//      |          |       ...
+//      V          V
+//     value      value    ...
+//Yuanguo:
+//   对于一颗btree，sizeof(struct btr_record)是固定的：
 struct btr_record {
 	/**
 	 * It could either be memory ID for the child node, or body of this
@@ -30,6 +56,14 @@ struct btr_record {
 	 * - a structure includes both the variable-length key and value.
 	 * - a complex data structure under this record, e.g. a sub-tree.
 	 */
+    //Yuanguo: 两种情况
+    //  - 指向child的指针：
+    //  - 指向value的指针: 对应key的3种情况，value不同
+    //      - 若是variable-length/large key: 指向key-val-pair；这种情况下，类似于hashmap,
+    //        btree中排序的key是hash值(hashed key or hkey)，指向的是key-val-pair；
+    //        hash conflict如何处理？
+    //      - 若是uint64_t key: 指向value本身；
+    //      - 若是direct key (fixed-size-small-bytearray): 指向value本身；
 	umem_off_t		rec_off;
 	/**
 	 * Fix-size key can be stored in if it is small enough (DAOS_HKEY_MAX),
@@ -42,6 +76,12 @@ struct btr_record {
 	 * When BTR_FEAT_DIRECT_KEY is used, we store the umem offset of the
 	 * relevant leaf node for direct key comparison
 	 */
+    //Yuanguo: record的key，在btree中有序(即使hash key，也是有序的)，有3种情况：
+    //  - 用户key是variable-length/large key: 这里存它的hash值(算法不同hash值的长度也不相同，但对于一颗btree是固定的)，key-val-pair由rec_off指向；
+    //  - 用户key是uint64_t: 这里就是uint64_t key
+    //  - 用户key是fixed-size-small-bytearray (direct key)，bytearray直接用于比较，决定顺序；
+    //      - leaf node：存储bytearray本身  (待确认)
+    //      - non-leaf-node: 存储指向leaf node的指针，避免冗余  (待确认)
 	union {
 		char			rec_hkey[0]; /* hashed key */
 		uint64_t		rec_ukey[0]; /* uint key */
@@ -54,10 +94,34 @@ struct btr_record {
  *
  * NB: could be PM data structure.
  */
+//Yuanguo: 内存布局
+//  +----------------------+
+//  |                      |
+//  |  struct btr_node     |
+//  |                      |
+//  +----------------------+
+//  |  struct btr_record   | tn_recs[0]
+//  +----------------------+
+//  |  struct btr_record   | tn_recs[1]
+//  +----------------------+
+//  |  struct btr_record   | tn_recs[2]
+//  +----------------------+
+//  |  ......              |
+//  +----------------------+
+//  |  struct btr_record   | tn_recs[btr_root::tr_node_size-1]
+//  +----------------------+
+//
+//  数组tn_recs预留的空间个数是btr_root::tr_node_size, 见:
+//      btr_node_split_and_insert() -->
+//      btr_node_alloc() -->
+//      btr_node_size()
+//
+//  里面真实存的元素个数是tn_keyn
 struct btr_node {
 	/** leaf, root etc */
 	uint16_t			tn_flags;
 	/** number of keys stored in this node */
+    //Yuanguo: 不算tn_child指向的那个(第一个)
 	uint16_t			tn_keyn;
 	/** padding bytes */
 	uint32_t			tn_pad_32;
@@ -88,6 +152,8 @@ struct btr_root {
 	/** configured btree order */
 	uint8_t				tr_order;
 	/** depth of the tree */
+    //Yuanguo: 只有一个root node时，tr_depth=1，它的level是0
+    //    假如tr_depth=20, leaf node的level=19
 	uint16_t			tr_depth;
 	/**
 	 * ID to find a registered tree class, which provides customized
@@ -489,6 +555,11 @@ enum btr_feats {
 	BTR_FEAT_DYNAMIC_ROOT = (1 << 2),
 	/** Skip rebalance leaf when delete some record from the leaf. */
 	BTR_FEAT_SKIP_LEAF_REBAL = (1 << 3),
+
+    //Yuanguo: 区别
+    //  BTR_FEAT_EMBED_FIRST : 是否支持embedded root;
+    //  BTR_FEAT_EMBEDDED    : 是否真的使用了embedded root特性(已知支持embedded root的情况下);
+
 	/** Tree supports embedded root. */
 	BTR_FEAT_EMBED_FIRST = (1 << 4),
 	/** Marks that the current root is an embedded value */

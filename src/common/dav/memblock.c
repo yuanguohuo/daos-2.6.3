@@ -415,6 +415,16 @@ memblock_run_default_nallocs(uint32_t *size_idx, uint16_t flags,
 /*
  * memblock_run_bitmap -- calculate bitmap parameters for given arguments
  */
+//Yuanguo:
+//  - 一个或多个chunk(256k)组成1个run;
+//  - 一个run内有多个unit
+//Yuanguo: 对于调用路径register_slabs() -> set_slab_desc() -> dav_class_register()
+//  - *size_idx = 1, ..., 3
+//  - flags = CHUNK_FLAG_HEADER_NONE | ALLOC_CLASS_DEFAULT_FLAGS(CHUNK_FLAG_FLEX_BITMAP)
+//  - unit_size = 32, ..., 768
+//  - alignment = 0
+//  - content = NULL
+//以 *size_idx=3 (3个chunk,即3*256k), unit_size=768为例
 void
 memblock_run_bitmap(uint32_t *size_idx, uint16_t flags,
 	uint64_t unit_size, uint64_t alignment, void *content,
@@ -440,8 +450,15 @@ memblock_run_bitmap(uint32_t *size_idx, uint16_t flags,
 		 * First calculate the number of values without accounting for
 		 * the bitmap size.
 		 */
+        //Yuanguo: 以*size_idx=3 (3个chunk,即3*256k), unit_size=768为例
+        //  content_size = CHUNKSIZE(256k) - RUN_BASE_METADATA_SIZE(16B) + 2 * CHUNKSIZE(256k)
+        //  即3个chunk减去一个RUN_BASE_METADATA_SIZE(16B)
 		size_t content_size = RUN_CONTENT_SIZE_BYTES(*size_idx);
 
+        //Yuanguo:
+        //   b->nbits:   3个chunk，减去RUN_BASE_METADATA_SIZE(16B)，剩下的空间可以分成多少unit? 即
+        //               需要多少bit表示这些unit.
+        //   b->nvalues: 这些bit是多少个uint64_t? 肯定要向上取整，例如1bit也需要1个uint64_t;
 		b->nbits = (unsigned)(content_size / unit_size);
 		b->nvalues = util_div_ceil(b->nbits, RUN_BITS_PER_VALUE);
 
@@ -449,6 +466,26 @@ memblock_run_bitmap(uint32_t *size_idx, uint16_t flags,
 		 * Then, align the number of values up, so that the cacheline
 		 * alignment is preserved.
 		 */
+        //Yuanguo: 猜测
+        //           +---------------------------------+ <-- chunk start
+        //           |                                 |
+        //           |     struct chunk_run_header     |
+        //           |                                 |
+        //  -------  +---------------------------------+
+        //     |     |bitmap                           |
+        //     |     |                                 |
+        //     |     |                                 |
+        //     |     |                                 |
+        // b->size   |                                 |
+        // (字节)    |                                 |
+        //     |     |                                 |
+        //     |     |\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\|
+        //     |     |\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\| padding
+        //     |     |\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\|
+        //  -------  +---------------------------------+ <-- 从chunk start到此是CACHELINE_SIZE的整数倍
+        //           |                                 |
+        //           |                                 |
+        //           +---------------------------------+
 		b->nvalues = ALIGN_UP(b->nvalues + RUN_BASE_METADATA_VALUES,
 			(unsigned)(CACHELINE_SIZE / sizeof(*b->values)))
 			- RUN_BASE_METADATA_VALUES;
@@ -463,6 +500,10 @@ memblock_run_bitmap(uint32_t *size_idx, uint16_t flags,
 		 * Calculate the number of allocations again, but this time
 		 * accounting for the bitmap/padding.
 		 */
+        //Yuanguo: content_size是3个chunk减去sizeof(struct chunk_run_header)
+        //         这里再减去b->size，即bitmap及padding，剩下的是真正存unit的空间；
+        //         看能存多少个unit，就需要多少bit;
+        //         若unit需要对齐，就再减1个unit (第一个unit对齐，后面的unit自然对齐了，所以减1个即可)
 		b->nbits = (unsigned)((content_size - b->size) / unit_size)
 			- (alignment ? 1U : 0U);
 

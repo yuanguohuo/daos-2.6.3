@@ -377,6 +377,21 @@ struct bio_xs_blobstore {
 	bool			 bxb_ready;
 };
 
+//Yuanguo: xstream(如taget-0)的spdk-blobstore信息.
+// MD-on-SSD场景：
+//     - 若data,meta,wal在同一个NVMe设备：
+//       bxc_xs_blobstores[SMD_DEV_TYPE_DATA]指向bio_xs_blobstore
+//       bxc_xs_blobstores[SMD_DEV_TYPE_META] = NULL //表示fallthrough到data blobstore
+//       bxc_xs_blobstores[SMD_DEV_TYPE_WAL]  = NULL //表示fallthrough到meta blobstore
+//
+//     - 若data,meta,wal在不同NVMe设备：
+//       各自指向自己的bio_xs_blobstore；
+//
+// 非MD-on-SSD场景：
+//       bxc_xs_blobstores[SMD_DEV_TYPE_DATA]指向bio_xs_blobstore
+//       bxc_xs_blobstores[SMD_DEV_TYPE_META] = NULL  //无需
+//       bxc_xs_blobstores[SMD_DEV_TYPE_WAL]  = NULL  //无需
+//
 /* Per-xstream NVMe context */
 struct bio_xs_context {
 	int			 bxc_tgt_id;
@@ -386,6 +401,8 @@ struct bio_xs_context {
 	unsigned int		 bxc_self_polling:1;	/* for standalone VOS */
 };
 
+//Yuanguo: 一个struct bio_io_context对象表示对一个blob的一个open (类比fd)
+//  read/write操作需要它做参数(代表目标blob)， 类比文件read/write需要fd参数(代表目标文件)
 /* Per VOS instance I/O context */
 struct bio_io_context {
 	d_list_t		 bic_link; /* link to bxb_io_ctxts */
@@ -595,6 +612,10 @@ static inline void
 dma_biov2pg(struct bio_iov *biov, uint64_t *off, uint64_t *end,
 	    unsigned int *pg_cnt, unsigned int *pg_off)
 {
+    //Yuanguo:
+    //  - NVMe blob:
+    //      *off: 起始地址在blob中的偏移；
+    //      *end: 结束地址在blob中的偏移；
 	*off = bio_iov2raw_off(biov);
 	*end = bio_iov2raw_off(biov) + bio_iov2raw_len(biov);
 
@@ -603,6 +624,24 @@ dma_biov2pg(struct bio_iov *biov, uint64_t *off, uint64_t *end,
 				BIO_DMA_PAGE_SHIFT;
 		*pg_off = 0;
 	} else {
+        //Yuanguo:
+        //  - NVMe blob:
+        //
+        //        page X  +------+ <-- pageXOffsetInBlob
+        //                |      |
+        //                |      | <-- *off
+        //                |      |
+        //                +------+
+        //                  ...
+        //        page Y  +------+
+        //                |      |
+        //                |      | <-- *end
+        //                |      |
+        //        page Z  +------+
+        //                  ...
+        //
+        //  *pg_cnt = Z - X，就是有多少个page
+        //  *pg_off = *off - pageXOffsetInBlob，就是*off在pageX内的偏移
 		*pg_cnt = ((*end + BIO_DMA_PAGE_SZ - 1) >> BIO_DMA_PAGE_SHIFT) -
 				(*off >> BIO_DMA_PAGE_SHIFT);
 		*pg_off = *off & ((uint64_t)BIO_DMA_PAGE_SZ - 1);

@@ -160,6 +160,24 @@ struct btr_context {
 	/** trace for the tree root */
 	struct btr_trace_info            tc_trace;
 	/** trace buffer */
+    //Yuanguo:
+    //
+    //    low addr |  ......              |
+    //             +----------------------+ <-- tc_trace.ti_trace
+    //       |     |  struct btr_trace    |
+    //       |     +----------------------+
+    //       |     |  struct btr_trace    |
+    //       V     +----------------------+
+    //             |  struct btr_trace    |
+    //   high addr +----------------------+ <-- current op的trace
+    //             |  struct btr_trace    |
+    //             +----------------------+
+    //             |  ......              |
+    //
+    //  - tc_traces存的是各层(从root到当前操作的层)内的位置；就是lookup过程走的路径；
+    //  - tc_trace.ti_trace指向root；
+    //  - 所以 current op的trace >= tc_trace.ti_trace；指针直接比较，比较地址高低；见btr_node_split_and_insert()
+    //  - 所以，当前操作的层 level = current op的trace - tc_trace.ti_trace；指针直接相减，结果是间隔的元素的个数；见btr_node_split_and_insert()
 	struct btr_trace		 tc_traces[BTR_TRACE_MAX];
 };
 
@@ -331,6 +349,10 @@ btr_ops(struct btr_context *tcx)
  * \param priv		Private information from user
  * \param tcxp		Returned context.
  */
+//Yuanguo: 创建一个btree context (btr_context)，其中包含的btree instance (tc_tins成员):
+//  - 可能是空的，即tc_tins.ti_root为NULL；
+//  - 也可能是loaded from root_off；
+//视root_off和root而定 (若它俩都不为null，则两者该是匹配的: 一个是内存表示，一个是PMem pool内的偏移);
 static int
 btr_context_create(umem_off_t root_off, struct btr_root *root,
 		   unsigned int tree_class, uint64_t tree_feats,
@@ -779,6 +801,22 @@ static struct btr_record *
 btr_node_rec_at(struct btr_context *tcx, umem_off_t nd_off,
 		unsigned int at)
 {
+    //Yuanguo: 内存布局
+    //  +----------------------+  <-- nd
+    //  |                      |
+    //  |  struct btr_node     |
+    //  |                      |
+    //  +----------------------+
+    //  |  struct btr_record   | tn_recs[0]  <----- nd[1] = addr，就是tn_recs数组的起始地址
+    //  +----------------------+
+    //  |  struct btr_record   | tn_recs[1]
+    //  +----------------------+
+    //  |  struct btr_record   | tn_recs[2]
+    //  +----------------------+
+    //  |  ......              |
+    //  +----------------------+
+    //  |  struct btr_record   | tn_recs[btr_root::tr_node_size-1]
+    //  +----------------------+
 	struct btr_node *nd = btr_off2ptr(tcx, nd_off);
 	char		*addr = (char *)&nd[1];
 
@@ -1121,6 +1159,30 @@ btr_root_grow(struct btr_context *tcx, umem_off_t off_left,
 	int			 at;
 	int			 rc;
 
+    //Yuanguo:  实际上是B+Tree
+    //                        new root (struct btr_node)
+    //
+    //        tn_child    tn_recs[...]数组
+    //        +-------+---------+---------+---------+---------+---------+
+    //        |       |   500   |         |         |         |         | key (union, e.g. rec_ukey )
+    //        |       +---------+---------+---------+---------+---------+
+    //        |       |         |         |         |         |         | val (rec_off)
+    //        +-------+---------+---------+---------+---------+---------+
+    //            |         |
+    //            |         |
+    // +----------+         +----------------------------------------+
+    // |                                                             |
+    // V                                                             | rec指向right node的first key
+    // off_left (原root)                                             V
+    //  +---------+---------+---------+---------+---------+          +---------+---------+---------+---------+---------+
+    //  |   200   |   240   |   300   |   400   |         | key      |   500   |   600   |         |         |         | key (union)
+    //  +---------+---------+---------+---------+---------+          +---------+---------+---------+---------+---------+
+    //  |         |         |         |         |         | val      |         |         |         |         |         | val (rec_off)
+    //  +---------+---------+---------+---------+---------+          +---------+---------+---------+---------+---------+
+    //      |          |       ...
+    //      V          V
+    //     value      value    ...
+    //
 	root = tcx->tc_tins.ti_root;
 	D_ASSERT(root->tr_depth != 0);
 
@@ -1133,11 +1195,15 @@ btr_root_grow(struct btr_context *tcx, umem_off_t off_left,
 	}
 
 	/* the left child is the old root */
+    //Yuanguo: 原root节点分裂成2个，left节点复用原root；
+    //         所以此时，left节点还有BTR_NODE_ROOT标记；
 	D_ASSERT(btr_node_is_root(tcx, off_left));
 	btr_node_unset(tcx, off_left, BTR_NODE_ROOT);
 
+    //Yuanguo: 新分配的节点是new root，设置BTR_NODE_ROOT标记；
 	btr_node_set(tcx, nd_off, BTR_NODE_ROOT);
 	rec_dst = btr_node_rec_at(tcx, nd_off, 0);
+    //Yuanguo: 指向right node的first key
 	btr_rec_copy(tcx, rec_dst, rec, 1);
 
 	nd = btr_off2ptr(tcx, nd_off);
@@ -1260,6 +1326,11 @@ btr_node_insert_rec_only(struct btr_context *tcx, struct btr_trace *trace,
 	if (nd->tn_keyn > 0) {
 		struct btr_check_alb	alb;
 
+        //Yuanguo: 看看能不能复用record;
+        //  - trace->tr_at != nd->tn_keyn:
+        //          目标位置指向中间某个record，那就测这个record可不可以复用；
+        //  - 否则trace->tr_at == nd->tn_keyn：
+        //          目标位置不指向某个record，而是指向last-record之后的空白位置，那就测能否复用last-record;
 		if (trace->tr_at != nd->tn_keyn)
 			alb.at = trace->tr_at;
 		else
@@ -1284,17 +1355,32 @@ btr_node_insert_rec_only(struct btr_context *tcx, struct btr_trace *trace,
 		if (rc)
 			return rc;
 	} else {
+        //Yuanguo: 插在中间，不是末尾
 		if (trace->tr_at != nd->tn_keyn) {
 			struct btr_record *rec_b;
 
 			rec_b = btr_node_rec_at(tcx, trace->tr_node,
 						trace->tr_at + 1);
+            //Yuanguo: 向后平移一个record；
+            //
+            //     0   1   2   3   4   5   6   7   8
+            //   +---+---+---+---+---+---+---+---+---+---+
+            //   |   |   |   |   |   |   |   |   |   |   |
+            //   +---+---+---+---+---+---+---+---+---+---+
+            //                 ^   ^
+            //                 |   |
+            //              rec_a  rec_b           tn_keyn=9
+            //
+            //   memmove(rec_b, rec_a, (9-3) * btr_rec_size(tcx));
+            //   即 [3,8] ==> [4,9]
+            //   留出rec_a空白；下面的btr_rec_copy将入参*rec拷贝过去；
 			btr_rec_move(tcx, rec_b, rec_a,
 				     nd->tn_keyn - trace->tr_at);
 		}
 		nd->tn_keyn++;
 	}
 
+    //Yuanguo: 拷贝到（留出的）空白位置；
 	btr_rec_copy(tcx, rec_a, rec, 1);
 	return 0;
 }
@@ -1315,11 +1401,20 @@ btr_split_at(struct btr_context *tcx, int level,
 	split_at = order / 2;
 
 	left = (trace->tr_at < split_at);
+    //Yuanguo: 若non-leaf，且目insert标位置在左子节点，则split_at -= 1，即向左移动一个位置。
+    //         leaf则不移，为什么？
+    //         因为non-leaf节点有一个额外的child (struct btr_node::tn_child指向的)，所以多
+    //         给右节点一个record; (应该只是优化，不影响正确性)
 	if (!btr_node_is_leaf(tcx, off_left))
 		split_at -= left;
 
 	btr_trace_debug(tcx, trace, "split_at %d, insert to the %s node\n",
 			split_at, left ? "left" : "right");
+    //Yuanguo:
+    //  当前tcx中trace的是第level层的、未分裂的nodeX；
+    //  分裂之后，nodeX变成nodeX.Left和nodeX.Right两个node；它们还在第level层；
+    //  那么trace路径指向哪个呢？当然，视tr_at而定，看它落在左边还是右边。
+    //  下面修改第level层的trace，让它指向nodeX.Left或者nodeX.Right；
 	if (left)
 		btr_trace_set(tcx, level, off_left, trace->tr_at, BTR_EMBEDDED_NONE);
 	else
@@ -1348,10 +1443,30 @@ btr_node_split_and_insert(struct btr_context *tcx, struct btr_trace *trace,
 	bool			 leaf;
 	bool			 right;
 
+    //Yuanguo: 假设
+    //  - 待插入rec的key=240
+    //  - order=6, 即5个record时，full
+    //  - trace指向目标位置(已由btr_probe设置好)：
+    //      - trace->tr_node :  如下node
+    //      - trace->tr_at   :  1
+    //
+    //           trace
+    //             |
+    //  +----------+----+
+    //  | tr_node       | tr_at=1 (240的目标插入位置)
+    //  V               V
+    //  +---------+---------+---------+---------+---------+
+    //  |   200   |   300   |   400   |   500   |   600   |
+    //  +---------+---------+---------+---------+---------+
+    //                                ^
+    //                                |
+    //                              split_at (order/2=3)
+
 	D_ASSERT(trace >= tcx->tc_trace.ti_trace);
 	level    = trace - tcx->tc_trace.ti_trace;
 	off_left = trace->tr_node;
 
+    //Yuanguo: 分配一个新node；
 	rc = btr_node_alloc(tcx, &off_right);
 	if (rc != 0)
 		return rc;
@@ -1360,6 +1475,19 @@ btr_node_split_and_insert(struct btr_context *tcx, struct btr_trace *trace,
 	if (leaf)
 		btr_node_set(tcx, off_right, BTR_NODE_LEAF);
 
+    //Yuanguo: 分裂之后
+    //           trace
+    //             |
+    //  +----------+----+
+    //  | tr_node       | tr_at=1 (240的目标插入位置)
+    //  V               V
+    //  +---------+---------+---------+---------+---------+          +---------+---------+---------+---------+---------+
+    //  |   200   |   300   |   400   |   500   |   600   |          |   500   |   600   |         |         |         |
+    //  +---------+---------+---------+---------+---------+          +---------+---------+---------+---------+---------+
+    //                                ^                              ^
+    //                                |                              |
+    //                              rec_src    --- copy-to --->    rec_dst
+    //
 	split_at = btr_split_at(tcx, level, off_left, off_right);
 
 	rec_src = btr_node_rec_at(tcx, off_left, split_at);
@@ -1368,13 +1496,19 @@ btr_node_split_and_insert(struct btr_context *tcx, struct btr_trace *trace,
 	nd_left	 = btr_off2ptr(tcx, off_left);
 	nd_right = btr_off2ptr(tcx, off_right);
 
+    //Yuanguo: nd_right->tn_keyn = 5-3 = 2
+    //         nd_left->tn_keyn  = 3
 	nd_right->tn_keyn = nd_left->tn_keyn - split_at;
 	nd_left->tn_keyn  = split_at;
 
 	if (leaf) {
 		D_DEBUG(DB_TRACE, "Splitting leaf node\n");
 
+        //Yuanguo: 把[500,600] 拷贝到右子节点；
 		btr_rec_copy(tcx, rec_dst, rec_src, nd_right->tn_keyn);
+        //Yuanguo:
+        //  前面分裂完成了，并且trace也指向了record(*rec)要插入的目标位置(本例是左节点tr_at=1处);
+        //  下面调用btr_node_insert_rec_only，把record(*rec)插入trace处；
 		rc = btr_node_insert_rec_only(tcx, trace, rec);
 		if (rc)
 			return rc;
@@ -1382,6 +1516,16 @@ btr_node_split_and_insert(struct btr_context *tcx, struct btr_trace *trace,
 		/* insert the right node and the first key of the right
 		 * node to its parent
 		 */
+
+        //Yuanguo:
+        // - record(*rec)已成功插入到目标位置；注意：插入时是把*rec拷贝到目标位置，所以现在*rec记录可以随意更改!!!
+        // - 现在，需要把右节点的first key 500插入到它的parent；(注意：左节点的first key 200在parent中的位置没变)
+        //     - if-else：修改*rec记录的key (可能是direct key，也可能是hash key, uint64_t key)
+        //         - direct key: 为什么不拷贝key(bytearray)本身呢？只拷贝到右节点的指针，避免冗余 (待确认)
+        //               通过指针指向leaf node的first key，那里可以找到bytearray；
+        //         - hash key: btr_rec_copy_hkey拷贝
+        //         - uint64_t key: btr_rec_copy_hkey拷贝
+        //     - goto bubble_up：递归插入parent;
 		if (btr_is_direct_key(tcx))
 			rec->rec_node[0] = off_right;
 		else
@@ -1392,15 +1536,40 @@ btr_node_split_and_insert(struct btr_context *tcx, struct btr_trace *trace,
 
 	right = btr_node_is_equal(tcx, trace->tr_node, off_right);
 	if (trace->tr_at == 0 && right) {
+        //Yuanguo: 待插record刚好是右节点的first；
+        //         注意：对于non-leaf节点，first child由struct btr_node::tn_child保存
+        //
+        //         假如待insert key=350 (注意btr_split_at会把split_at划到2)
+        //
+        //                     +-----+-----+
+        //                 ... | 100 | 350 | ...
+        //                     +-----+-----+
+        //                        |     |
+        //  +---------------------+     +---------------+
+        //  |                                           |
+        //  V                                           V
+        // off_left                                    off_right
+        //  +--------+----+----+----+----+----+         +--------+----+----+----+----+----+
+        //  |tn_child|200 |300 |    |    |    |         |tn_child|400 |500 |600 |    |    |
+        //  +--------+----+----+----+----+----+         +--------+----+----+----+----+----+
+        //     |100     |    |                             |350   |    ...   |
+        //     V        V    V                             V      V          V
+        //  +-----+ +-----+ +-----+                    +-----+ +-----+     +-----+
+        //  |child| |child| |child|                    |child| |child| ... |child|
+        //  +-----+ +-----+ +-----+                    +-----+ +-----+     +-----+
+        //
 		/* the new record is the first one on the right node */
 		D_DEBUG(DB_TRACE, "Bubble up the new key\n");
 		nd_right->tn_child = rec->rec_off;
 		btr_rec_copy(tcx, rec_dst, rec_src, nd_right->tn_keyn);
+        //Yuanguo: 此时，*rec的key=350也是对的，所以，直接递归向上；
 		goto bubble_up;
 	}
 
 	D_DEBUG(DB_TRACE, "Bubble up the 1st key of the right node\n");
 
+    //Yuanguo: rec_src本该拷贝到 右节点rec_dst(右节点数组tn_recs[0]处)，但
+    //    non-leaf节点多一个child，即最小child，要放在tn_child上；
 	nd_right->tn_child = rec_src->rec_off;
 	/* btr_split_at should ensure the right node has more than one record,
 	 * because the first record of the right node will bubble up.
@@ -1416,6 +1585,8 @@ btr_node_split_and_insert(struct btr_context *tcx, struct btr_trace *trace,
 	/* Copy from @rec_src[1] because @rec_src[0] will bubble up.
 	 * NB: call btr_rec_at instead of using array index, see btr_record.
 	 */
+    //Yuanguo: 前面rec_src处的record已被拷贝到右节点的tn_child，
+    //  btr_rec_at(tcx, rec_src, 1)是找它后面的那个record；
 	btr_rec_copy(tcx, rec_dst, btr_rec_at(tcx, rec_src, 1),
 		     nd_right->tn_keyn);
 
@@ -1424,17 +1595,38 @@ btr_node_split_and_insert(struct btr_context *tcx, struct btr_trace *trace,
 	 */
 	btr_hkey_copy(tcx, &hkey_buf[0], &rec_src->rec_hkey[0]);
 
+    //Yuanguo: 现在已经分裂完成，insert *rec记录；
+    //   可能insert在左节点，也可能在右节点；前面btr_split_at函数已经设置好了trace指向；
 	rc = btr_node_insert_rec_only(tcx, trace, rec);
 	if (rc)
 		return rc;
 
 	btr_hkey_copy(tcx, &rec->rec_hkey[0], &hkey_buf[0]);
 
+    //递归向上
+
  bubble_up:
 	D_DEBUG(DB_TRACE, "left keyn %d, right keyn %d\n",
 		nd_left->tn_keyn, nd_right->tn_keyn);
 
+    //Yuanguo: 指向child
 	rec->rec_off = off_right;
+
+    //Yuanguo: trace-1 代表什么？
+    //  在tcx (struct btr_context) 中，tc_traces数组维护了一个路径，从root到当前操作的节点
+    //
+    //    low addr |  ......              |
+    //             +----------------------+ <-- tc_trace.ti_trace
+    //       |     |  struct btr_trace    |
+    //       |     +----------------------+
+    //       |     |  struct btr_trace    | <-- trace-1 上一层节点(即父节点)的指针(tr_node)，以及右节点的insert目标位置(tr_at)
+    //       V     +----------------------+             看btr_probe过程，
+    //             |  struct btr_trace    |
+    //   high addr +----------------------+ <-- trace
+    //             |  struct btr_trace    |
+    //             +----------------------+
+    //             |  ......              |
+
 	if (level == 0)
 		rc = btr_root_grow(tcx, off_left, rec);
 	else
@@ -1744,6 +1936,49 @@ btr_probe(struct btr_context *tcx, dbtree_probe_opc_t probe_opc,
 			rc = PROBE_RC_ERR;
 			goto out;
 		}
+
+        //Yuanguo:
+        //  BTR_CMP_LT:  at指向的record < key
+        //  BTR_CMP_GT:  at指向的record > key
+        //
+        //                       struct btr_node
+        //
+        //          tn_child         tn_recs[...]数组
+        //          +-------+-------+-------+-------+-------+-------+
+        //          |       |  200  |  300  |  400  |  500  |  600  |
+        //          +-------+-------+-------+-------+-------+-------+
+        //                     0       1       2       3       4
+        //
+        //  probe_opc=BTR_PROBE_EQ, 查找key=240:
+        //     start=0, end=4, at=2, cmp=BTR_CMP_GT   --> end   = at - 1 = 1
+        //     start=0, end=1, at=0, cmp=BTR_CMP_LT   --> start = at + 1 = 1
+        //     start=1, end=1, at=1, cmp=BTR_CMP_GT   --> start < end 不成立，所以：
+        //                                                  - 若为leaf: at=1, break，后面at + !(cmp & BTR_CMP_GT)，还是1，表示应该插在[1]
+        //                                                  - 若非leaf: at=1，进入下一层。
+        //                                                         注意：要插入key 240的话，不应该从[0]处进入下一层吗？
+        //                                                         是的，魔法在于，非leaf节点的first child在struct btr_node::tn_child中，不在tn_recs数组中；
+        //                                                         也就是多一个child，见btr_node_child_at()函数，确实从[0]进入下一层；
+        //
+        //                                                         本质：- 确实要从 <=key 的那个record进入下一层；
+        //                                                               - 但at指向 >key 的最小record，表示key应该插在那个位置。虽然key不会直接插在本层，
+        //                                                                 但若下一层分裂，就会导致在那插入一个record；看insert的bubble_up过程；
+        //                                                               - 这样，leaf与non-leaf节点就统一了：at表示目标插入位置。
+        //
+        //  probe_opc=BTR_PROBE_EQ, 查找key=350:
+        //     start=0, end=4, at=2, cmp=BTR_CMP_GT   --> end   = at - 1 = 1
+        //     start=0, end=1, at=0, cmp=BTR_CMP_LT   --> start = at + 1 = 1
+        //     start=1, end=1, at=1, cmp=BTR_CMP_LT   --> start < end 不成立，所以：
+        //                                                  - 若为leaf: at=1, break, 后面at + !(cmp & BTR_CMP_GT)，得到2，表示应该插在[2]
+        //                                                  - 若非leaf: at=1，at += !(cmp & BTR_CMP_GT), 即at=2, 进入下一层
+        //                                                         注意：要插入key 350的话，不应该从[1]处进入下一层吗？原因同上
+        //  probe_opc=BTR_PROBE_EQ, 查找key=150:
+        //     start=0, end=4, at=2, cmp=BTR_CMP_GT   --> end   = at - 1 = 1
+        //     start=0, end=1, at=0, cmp=BTR_CMP_GT   --> end   = at - 1 = -1   --> start < end 不成立
+        //                                                  - 若为leaf: at=0, break, 后面at + !(cmp & BTR_CMP_GT)，还是0，表示应该插在[0]
+        //                                                  - 若非leaf: at=0，at += !(cmp & BTR_CMP_GT), at=0, 进入下一层。
+        //                                                  注意:
+        //                                                      - 是从tn_child进入下一层，见btr_node_child_at()
+        //                                                      - at=0表示在本层的insert位置；若下一层分裂，会在at=0 (即200)处insert一个 <200 的record；
 
 		if (cmp != BTR_CMP_EQ && start < end) {
 			/* continue the binary search in current level */
@@ -2522,6 +2757,9 @@ dbtree_feats_set(struct btr_root *root, struct umem_instance *umm, uint64_t feat
  * \return		0	success
  *			-ve	error code
  */
+//Yuanguo: 对于dbtree_upsert来说，opc必须为 BTR_PROBE_EQ 或 BTR_PROBE_BYPASS
+//  可以全局搜索对本函数的调用来确认；
+//  实际上不用确认，因为update或insert必定是针对一个特定的key；
 int
 dbtree_upsert(daos_handle_t toh, dbtree_probe_opc_t opc, uint32_t intent,
 	      d_iov_t *key, d_iov_t *val, d_iov_t *val_out)
@@ -3601,11 +3839,15 @@ dbtree_create(unsigned int tree_class, uint64_t tree_feats,
 		return -DER_INVAL;
 	}
 
+    //Yuanguo: 创建一个btree context (btr_context)，其中包含的btree instance (tc_tins成员)也初始化了，
+    // 但是tc_tins.ti_root为NULL；即btree的根节点还没创建；
 	rc = btr_context_create(BTR_ROOT_NULL, NULL, tree_class, tree_feats,
 				tree_order, uma, DAOS_HDL_INVAL, NULL, &tcx);
 	if (rc != 0)
 		return rc;
 
+    //Yuanguo: 创建根节点，并设置到tcx->tc_tins.ti_root，同时也初始化tcx->tc_tins.ti_root_off;
+    // 这两者都是指向根节点的指针，一个是内存表示，一个是PMem pool内的偏移；
 	rc = btr_tx_tree_alloc(tcx);
 
 	if (rc != 0)
@@ -4435,6 +4677,9 @@ static struct btr_class btr_class_registered[BTR_TYPE_MAX];
 /**
  * Initialize a tree instance from a registered tree class.
  */
+//Yuanguo: 以C++的角度看，
+//  - 本函数构造(不包括分配内存)struct btr_instance对象*tins；
+//  - btr_class_registered[tree_class]是class实例，其中包含成员函数列表；
 static int
 btr_class_init(umem_off_t root_off, struct btr_root *root,
 	       unsigned int tree_class, uint64_t *tree_feats,

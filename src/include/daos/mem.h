@@ -132,6 +132,9 @@ struct umem_store_ops {
 typedef uint64_t umem_off_t;
 
 struct umem_store {
+    //Yuanguo: MD-on-SSD场景下
+    //    path = "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0"  (on tmpfs)
+    //    stor_size = path文件的大小 - blob-header-size(1*4k) (注意不是struct dav_phdr)
 	/**
 	 * Size of the umem storage, excluding blob header which isn't visible to allocator.
 	 */
@@ -139,6 +142,8 @@ struct umem_store {
 	uint32_t		 stor_blk_size;
 	uint32_t		 stor_hdr_blks;
 	/** private data passing between layers */
+    //Yuanguo: MD-on-SSD场景下，stor_priv 指向 struct bio_meta_context 对象，里面是用于访问
+    //  meta/wal blob的context (spdk blob id等)；
 	void			*stor_priv;
 	void			*stor_stats;
 	void                    *vos_priv;
@@ -163,6 +168,9 @@ struct umem_slab_desc {
 };
 
 struct umem_pool {
+    //Yuanguo:
+    //  - MD-on-PMEM: up_priv指向pmemobj_create返回的memory pool (transactional object store)；
+    //  - MD-on-SSD:  up_priv指向一个struct dav_obj实例；
 	void			*up_priv;
 	struct umem_store	 up_store;
 	/** Slabs of the umem pool */
@@ -863,6 +871,9 @@ struct umem_action {
 #define UMEM_CACHE_CHUNK_SZ       (1 << UMEM_CACHE_CHUNK_SZ_SHIFT)
 #define UMEM_CACHE_CHUNK_SZ_MASK  (UMEM_CACHE_CHUNK_SZ - 1)
 
+//Yuanguo: bitmap包含多少个uint64_t?
+//   1 << (24-12-6) = 64
+// 64个uint64_t，共4096个bit；每个bit代表一个cache-chunk(4k)，构成一个page(16M)
 #define UMEM_CACHE_BMAP_SZ        (1 << (UMEM_CACHE_PAGE_SZ_SHIFT - UMEM_CACHE_CHUNK_SZ_SHIFT - 6))
 
 struct umem_page_info;
@@ -923,6 +934,52 @@ umem_cache_size_round(uint64_t len)
 	return (len + UMEM_CACHE_PAGE_SZ_MASK) & ~UMEM_CACHE_PAGE_SZ_MASK;
 }
 
+//Yuanguo:
+//  1. MD-on-SSD场景：tmpfs file path = /mnt/daos0/c090c2fc-8d83-45de-babe-104bad165593/vos-0被mmap到内存空间；
+//
+//     /mnt/daos0/c090c2fc-8d83-45de-babe-104bad165593/vos-0
+//                           (memory)
+//
+//           base +---------------------------------+
+//                |                                 |
+//                |         struct dav_phdr         |
+//                |              (4k)               |
+//                |                                 |
+//      heap_base +---------------------------------+
+//                | +-----------------------------+ |
+//                | | struct heap_header (1k)     | |
+//                | +-----------------------------+ |
+//                | | struct zone_header (64B)    | |
+//                | | struct chunk_header(8B)     | |
+//                | | struct chunk_header(8B)     | |
+//                | | ...... 65528个,不一定都用   | |
+//                | | struct chunk_header(8B)     | |
+//                | | chunk (256k)                | |
+//                | | chunk (256k)                | |
+//                | | ...... 最多65528个          | |
+//                | | chunk (256k)                | |
+//                | +-----------------------------+ |
+//                | | struct zone_header (64B)    | |
+//                | | struct chunk_header(8B)     | |
+//                | | struct chunk_header(8B)     | |
+//                | | ...... 65528个,不一定都用   | |
+//                | | struct chunk_header(8B)     | |
+//                | | chunk (256k)                | |
+//                | | chunk (256k)                | |
+//                | | ...... 最多65528个          | |
+//                | | chunk (256k)                | |
+//                | +-----------------------------+ |
+//                | |                             | |
+//                | |     ... more zones ...      | |
+//                | |                             | |
+//                | |  除了最后一个，前面的zone   | |
+//                | |  都是65528个chunk,接近16G   | |
+//                | |                             | |
+//                | +-----------------------------+ |
+//                +---------------------------------+
+//
+//     offset: 相对于base的偏移；
+//     输出: 这个偏移对应的cache page;
 static inline struct umem_page *
 umem_cache_off2page(struct umem_cache *cache, umem_off_t offset)
 {

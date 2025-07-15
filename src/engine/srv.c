@@ -487,6 +487,9 @@ dss_srv_handler(void *arg)
 		goto crt_destroy;
 	}
 
+    //Yuanguo: 若当前xstream需要访问NVME(例如，target/main xtream, 第一个sys xstream)
+    //  则初始化NVME context (blobstore，dma内存buffer等)，启动dss_nvme_poll_ult，即
+    //  nvme poll user level thread
 	if (dss_xstream_has_nvme(dx)) {
 		ABT_thread_attr attr;
 
@@ -524,6 +527,10 @@ dss_srv_handler(void *arg)
 		}
 	}
 
+    //Yuanguo:
+    //  通常情况下，target/main xstream没有chore queue；只有helper xstream才有chore queue；
+    //  注意：若没有配置任何helper xstream (daos_server.yml中nr_xs_helpers:0)，
+    //        则target/main xstream承担helper的功能，所以这种情况下也有chore queue;
 	if (with_chore_queue) {
 		rc = dss_chore_queue_start(dx);
 		if (rc != 0) {
@@ -757,6 +764,11 @@ dss_start_one_xstream(hwloc_cpuset_t cpus, int tag, int xs_id)
 	 * The 2nd offload XS(if exists) does not need RPC communication
 	 * as it is only for EC/checksum/compress offloading.
 	 */
+    //Yuanguo:
+    //  - 如果helper数(配置项nr_xs_helpers)刚好是target数(配置项targets)的整数倍，那么
+    //    就把helper平均分给target；每个target有独占的helper，不共享，也就是非"池化"；
+    //    dss_helper_pool = false；
+    //  - 否则，所有helper形成一个pool，target共享这个pool，所以dss_helper_pool=true;
 	if (dss_helper_pool) {
 		comm =  (xs_id == 0) || /* DSS_XS_SYS */
 			(xs_id == 1) || /* DSS_XS_SWIM */
@@ -998,6 +1010,7 @@ dss_start_xs_id(int tag, int xs_id)
 	D_DEBUG(DB_TRACE, "start xs_id called for %d.\n", xs_id);
 	/* if we are NUMA aware, use the NUMA information */
 	if (dss_numa) {
+        //Yuanguo: 正常情况下，daos_server启动daos_engine时，通过-p选项指定了dss_numa_node
 		if (dss_numa_node == -1) {
 			tgt = dss_xs2tgt(xs_id);
 			if (xs_id == 1) {
@@ -1025,6 +1038,12 @@ dss_start_xs_id(int tag, int xs_id)
 				clear = true;
 		}
 
+        // Yuanguo: 正常情况下，daos_server启动daos_engine时，通过-p选项指定了dss_numa_node，并且在
+        //   server_init() -->
+        //   dss_topo_init()
+        // 中已经初始化了各个numa node (CPU socket)的core map；例如：
+        //   numa node 0 (ninfo->ni_idx = 0)有core 0, 1, 2, ..., 23
+        //   numa node 1 (ninfo->ni_idx = 1)有core 24, 25, 26, ..., 47
 		idx = hwloc_bitmap_first(ninfo->ni_coremap);
 		if (idx == -1) {
 			D_ERROR("No core available for XS: %d\n", xs_id);
@@ -1054,12 +1073,14 @@ dss_start_xs_id(int tag, int xs_id)
 		idx = (xs_core_offset + dss_core_offset) % dss_core_nr;
 	}
 
+    //Yuanguo: 为本target选择了CPU core `idx`，通过hwloc库获取这个CPU core的信息
 	obj = hwloc_get_obj_by_depth(dss_topo, dss_core_depth, idx);
 	if (obj == NULL) {
 		D_PRINT("Null core returned by hwloc\n");
 		return -DER_INVAL;
 	}
 
+    //Yuanguo: cpuset应该是这个物理CPU core上的逻辑CPU (CPU线程)，一个物理CPU core通常有2个逻辑CPU；
 	if (D_LOG_ENABLED(DB_TRACE)) {
 		hwloc_bitmap_asprintf(&cpuset, obj->cpuset);
 		D_DEBUG(DB_TRACE, "Using CPU set %s for XS %d\n", cpuset, xs_id);
@@ -1150,6 +1171,7 @@ dss_xstreams_init(void)
 	}
 
 	/* start main IO service XS */
+    //Yuanguo: main IO service XS就是target XStream;
 	for (i = 0; i < dss_tgt_nr; i++) {
 		xs_id = DSS_MAIN_XS_ID(i);
 		rc    = dss_start_xs_id(DAOS_SERVER_TAG, xs_id);
@@ -1470,6 +1492,8 @@ dss_srv_init(void)
 	}
 	xstream_data.xd_init_step = XD_INIT_TLS_INIT;
 
+    //Yuanguo: MD-on-SSD情况下，sys_db在/var/daos/config/daos_control/engine1/daos_sys/
+    // 否则，在SCM中；
 	rc = dss_sys_db_init();
 	if (rc != 0) {
 		D_ERROR("Failed to initialize local DB: "DF_RC"\n", DP_RC(rc));
@@ -1493,6 +1517,9 @@ dss_srv_init(void)
 	D_ASSERT(rc == 0);
 
 	/* start up drpc listener */
+    //Yuanguo: 主线程(非xstream，daos_server启动的daos_engine)，完成上述初始化，
+    // 现在监听 /var/run/daos_server/daos_engine_{主线程id}.sock；
+    // 这个unix socket用于和daos_server进程通信，用于management；
 	rc = drpc_listener_init();
 	if (rc != 0) {
 		D_ERROR("Failed to start dRPC listener: "DF_RC"\n", DP_RC(rc));

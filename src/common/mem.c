@@ -54,6 +54,52 @@ umempobj_settings_init(bool md_on_ssd)
 		daos_md_backend = DAOS_MD_PMEM;
 		atype = POBJ_ARENAS_ASSIGNMENT_GLOBAL;
 
+        //Yuanguo: 在control (CTL) namespace中设置heap.arenas_assignment_type = POBJ_ARENAS_ASSIGNMENT_GLOBAL;
+        // control namespace中定义了一些entry，例如：
+        //     - prefault.at_create: If set, every page of the pool will be touched and written to when the pool is created,
+        //             in order to trigger page allocation and minimize the performance impact of pagefaults. Affects only
+        //             the pmemobj_create() function.
+        //     - prefault.at_open: 类似于prefault.at_create，但affects only the pmemobj_open() function.
+        //     - sds.at_create: If set, force-enables or force-disables SDS feature during pool creation. Affects only the
+        //             pmemobj_create() function. See pmempool_feature_query() for information about SDS (SHUTDOWN_STATE) feature.
+        //
+        //     arena: 一个memory pool分为多个arena；arena是pool内的并发管理单元。一个arena独占一部分heap；通常情况下，arena数量等于系统CPU数，
+        //            一个thread关联一个arena: allowing associated threads to allocate without contention.
+        //
+        //            PMDK heap allocator会自动创建一些arena，即heap.narenas.automatic；
+        //            程序员也可以通过heap.arena.create创建arena；
+        //
+        //            有很多关于arean的CTL namespace entry;
+        //
+        //     - heap.narenas.automatic: [read-only entry] Reads the number of arenas used in automatic scheduling of memory operations for
+        //             threads. By default, this value is equal to the number of available processors.
+        //     - heap.narenas.total: [read-only entry] Reads the number of all created arenas. It includes automatic arenas created by default
+        //             and arenas created using heap.arena.create CTL.
+        //     - heap.arena.[arena_id].size: [read-only entry] Reads the total amount of memory in bytes which is currently exclusively owned by the arena.
+        //     - heap.thread.arena_id: [read-write entry] Reads the index of the arena assigned to the current thread, or assigns arena with specific id to
+        //             the current thread. The arena id cannot be 0.
+        //     - heap.arena.create: [executable entry] Creates and initializes one new arena in the heap. Newly created arenas by this CTL are inactive, which
+        //             means that the arena will not be used in the automatic scheduling of memory requests.
+        //             To activate the new arena, use heap.arena.[arena_id].automatic CTL.
+        //     - heap.arena.[arena_id].automatic: [read-write entry] Reads or modifies the state of the arena.
+        //             - If set, the arena is used in automatic scheduling of memory operations for threads.
+        //             - This should be set to false if the application wants to manually manage allocator scalability through explicitly assigning arenas to
+        //               threads by using heap.thread.arena_id.
+        //
+        //     - heap.arenas_assignment_type: [read-write entry, enum value] Reads or modifies the behavior of arenas assignment for threads.
+        //
+        //             - POBJ_ARENAS_ASSIGNMENT_THREAD_KEY, string value: thread. Default, threads use individually assigned arenas.
+        //             - POBJ_ARENAS_ASSIGNMENT_GLOBAL, string value: global. Threads use one global arena.
+        //
+        //
+        //             默认是POBJ_ARENAS_ASSIGNMENT_THREAD_KEY，就是前面讲的automatic模式: each thread is assigned its own arena from the pool of automatic arenas.
+        //             问题：This consumes one TLS key from the OS for every open pool. 即一个线程/一个pool，消耗一个TLS key，假如有18个线程，10个pool，将消耗180个；
+        //                   Linux 默认限制1024 TLS Keys/进程，超限将崩溃.
+        //
+        //             这种情况下，设置POBJ_ARENAS_ASSIGNMENT_GLOBAL，并显式管理Arena (若不显示管理，多个线程使用一个全局arena，高频分配时锁竞争成为性能瓶颈)；
+        //
+        //             另外：Changing this value has no impact on already open pools. It should typically be set at the beginning of
+        //             the application, before any pools are opened or created.
 		rc = pmemobj_ctl_set(NULL, "heap.arenas_assignment_type", &atype);
 		if (rc != 0)
 			D_ERROR("Could not configure PMDK for global arena: %s\n",
@@ -63,6 +109,7 @@ umempobj_settings_init(bool md_on_ssd)
 
 	d_getenv_uint("DAOS_MD_ON_SSD_MODE", &md_mode);
 
+    //Yuanguo: 对于MD-on-SSD情况，除了设置daos_md_backend，nothing to do;
 	switch (md_mode) {
 	case DAOS_MD_BMEM:
 		D_INFO("UMEM will use Blob Backed Memory as the metadata backend interface\n");
@@ -147,11 +194,34 @@ set_slab_desc(struct umem_pool *ph_p, struct umem_slab_desc *slab)
 		pmemslab.units_per_block = 1000;
 		pmemslab.header_type = POBJ_HEADER_NONE;
 		pmemslab.class_id = slab->class_id;
+        //Yuanguo: allocation class (alloc_class)
+        //
+        //  摘自文档：
+        //  Creating custom allocation classes can be beneficial for both raw allocation throughput, scalability and, most importantly, fragmentation.
+        //  By carefully constructing allocation classes that match the application workload, one can entirely eliminate external and internal fragmentation.
+        //  For example, it is possible to easily construct a slab-like allocation mechanism for any data structure. 这里(DAOS)就是定义slab机制；
+        //
+        //      struct pobj_alloc_class_desc {
+        //          size_t unit_size;                     //一个unit大小，for most workloads, 8B - 2MiB
+        //          size_t alignment;                     //若非0，必须是2的N次方，且 unit_size/alignment整除！
+        //          unsigned units_per_block;             //一个block(内部叫run)内最少有多少个unit
+        //          enum pobj_header_type header_type;
+        //          unsigned class_id;                    //取值[0,254]，PMDK预留[0,127]，所以[0,127]是read-only的；
+        //      };
+        //
+        //  注意: allocation class (alloc_class)是runtime state (不是持久化的)，所以重启时要重新设置；所以It is highly recommended to use the configuration
+        //  file to store the classes (但class_id除外；只对每次重启有效)
+        //
+        //  - heap.alloc_class.[class_id].desc: create or view allocation class;
+        //  - heap.alloc_class.new.desc: Same as heap.alloc_class.[class_id].desc, but instead of requiring the user to provide the class_id, it automatically
+        //          creates the allocation class with the first available identifier. 不需要程序员提供class_id; 这里提供了，但可能被PMDK lib改掉!
 		rc = pmemobj_ctl_set(pop, "heap.alloc_class.new.desc", &pmemslab);
 		/* update with the new slab id */
+        //Yuanguo: 提供的class_id可能被PMDK lib改掉!
 		slab->class_id = pmemslab.class_id;
 		break;
 	case DAOS_MD_BMEM:
+        //Yuanguo: slab->unit_size = 32, 64, 96, 128, 160, 192, 224, 256, 288, 352, 384, 416, 512, 576, 672, 768
 		davslab.unit_size = slab->unit_size;
 		davslab.alignment = 0;
 		davslab.units_per_block = 1000;
@@ -238,9 +308,24 @@ register_slabs(struct umem_pool *ph_p)
 		if (slab_map[i] != -1)
 			used |= (1 << i);
 	}
+    //Yuanguo: used(bin) = 10010010 10011101 11111111
 
 	for (i = 0; i < UMM_SLABS_CNT; i++) {
 		D_ASSERT(used != 0);
+        //Yuanguo: __builtin_ctz(): count trailing zeros
+        //  i = 0      defined = 0    unit_size = 1*32  = 32     used = 10010010 10011101 11111110
+        //  i = 1      defined = 1    unit_size = 2*32  = 64     used = 10010010 10011101 11111100
+        //  i = 2      defined = 2    unit_size = 3*32  = 96     used = 10010010 10011101 11111000
+        //  ...
+        //  i = 7      defined = 7    unit_size = 8*32  = 256    used = 10010010 10011101 00000000
+        //  i = 8      defined = 8    unit_size = 9*32  = 288    used = 10010010 10011100 00000000
+        //  i = 9      defined = 10   unit_size = 11*32 = 352    used = 10010010 10011000 00000000
+        //  i = 10     defined = 11   unit_size = 12*32 = 384    used = 10010010 10010000 00000000
+        //  i = 11     defined = 12   unit_size = 13*32 = 416    used = 10010010 10000000 00000000
+        //  i = 12     defined = 15   unit_size = 16*32 = 512    used = 10010010 00000000 00000000
+        //  i = 13     defined = 17   unit_size = 18*32 = 576    used = 10010000 00000000 00000000
+        //  i = 14     defined = 20   unit_size = 21*32 = 672    used = 10000000 00000000 00000000
+        //  i = 15     defined = 23   unit_size = 24*32 = 768    used = 00000000 00000000 00000000
 		defined               = __builtin_ctz(used);
 		slab = &ph_p->up_slabs[i];
 		slab->unit_size       = (defined + 1) * 32;
@@ -273,6 +358,33 @@ register_slabs(struct umem_pool *ph_p)
  *
  *  \return	A pointer to the pool, NULL if creation fails.
  */
+//Yuanguo:
+//  MD-on-SSD情况下，创建pool:
+//
+//     dmg pool create --scm-size=200G --nvme-size=3000G --properties rd_fac:2 ensblock
+//
+//     上述200G,3000G都是单个engine的配置；
+//     假设单engine的target数是18
+//     假设pool的uuid是c090c2fc-8d83-45de-babe-104bad165593 (可以通过dmg pool list -v查看)
+//
+//     - path = "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0"  (on tmpfs)
+//                  ...
+//                  这些文件已经被创建(可能是dao_server创建的)
+//                  它们的size都是20G/18
+//
+//     - layout_name = VOS_POOL_LAYOUT("vos_pool_layout")
+//     - flags       = UMEMPOBJ_ENABLE_STATS(0x1)
+//     - poolsize    = 0
+//     - mode        = 0600
+//     - *store      = {
+//                        .stor_blk_size=4k
+//                        .stor_hdr_blks=1
+//                        .stor_size = path文件的大小 - blob-header-size(1*4k) (注意不是struct dav_phdr)
+//                        .store_type = DAOS_MD_BMEM
+//                     }
+//
+// 注意：到了mem模块，pool就不是指"dmg pool create"创建的数据池，而是内存池，是PMDK内的概念。
+//       这里poolsize=0，是因为提供了path文件，它的大小是已知；
 struct umem_pool *
 umempobj_create(const char *path, const char *layout_name, int flags,
 		size_t poolsize, mode_t mode, struct umem_store *store)
@@ -297,6 +409,7 @@ umempobj_create(const char *path, const char *layout_name, int flags,
 		store != NULL ? store->stor_size : 0);
 	switch (umm_pool->up_store.store_type) {
 	case DAOS_MD_PMEM:
+        //Yuanguo: poolsize=0, path应该是devdax类型的PMem namespace (chardev) ??
 		pop = pmemobj_create(path, layout_name, poolsize, mode);
 		if (!pop) {
 			D_ERROR("Failed to create pool %s, size="DF_U64": %s\n",
@@ -304,6 +417,41 @@ umempobj_create(const char *path, const char *layout_name, int flags,
 			goto error;
 		}
 		if (flags & UMEMPOBJ_ENABLE_STATS) {
+            //Yuanguo: stats
+            //  There are two types of statistics:
+            //      - persistent: survive pool restarts. 默认disabled；对性能有影响；
+            //      - transient:  don’t survive pool restarts. 默认enabled；
+            //
+            //  注意：不是同一个counter有persistent和transient两个副本，而是有的counter是persistent，有的是transient；
+            //
+            //  注意：Statistics are not recalculated after enabling; any operations that occur between
+            //        disabling and re-enabling will not be reflected in subsequent values.
+            //        disable和enable之间的op不被统计；
+            //
+            //  - stats.enabled: [read-write entry] Enables or disables runtime collection of statistics.
+            //  - stats.heap.curr_allocated: [read-only, persistent] Reads the number of bytes currently allocated in the heap.
+            //          If statistics were disabled at any time in the lifetime of the heap, this value may be inaccurate.
+            //          只要disable过，这个值就不准！因为curr_allocated是persistent；
+            //  - stats.heap.run_allocated: [read-only, transient] Reads the number of bytes currently allocated using run-based allocation
+            //          classes, i.e., huge allocations are not accounted for in this statistic. This is useful for comparison against
+            //          stats.heap.run_active to estimate the ratio between active and allocated memory.
+            //          Yuanguo: huge allocations之外的、allocated run memory
+            //  - stats.heap.run_active: [read-only, transient] Reads the number of bytes currently occupied by all run memory blocks, including
+            //          both allocated and free space, i.e., this is all the all space that’s not occupied by huge allocations.
+            //          Yuanguo: huge allocations之外的、allocated run memory + free run memory
+            //
+            //    In systems where memory is efficiently used, run_active should closely track run_allocated, and the amount of active, but free, memory should be minimal.
+            //    即：free run memory = stats.heap.run_active - stats.heap.run_allocated 应该很小！
+            //
+            //    A large relative difference between active memory and allocated memory is indicative of heap fragmentation.
+            //    free run memory大意味着fragmentation严重！
+            //
+            //    This information can be used to make a decision to call pmemobj_defrag() if the fragmentation looks to be high.
+            //    所以free run memory可以作为触发pmemobj_defrag()的指标！
+            //
+            //    However, for small heaps run_active might be disproportionately higher than run_allocated because the allocator typically activates a significantly larger
+            //    amount of memory than is required to satisfy a single request in the anticipation of future needs. For example, the first allocation of 100 bytes in a heap
+            //    will trigger activation of 256 kilobytes of space. 我们会有small heap吗？一个heap是一个target分给一个pool的SCM空间；
 			rc = pmemobj_ctl_set(pop, "stats.enabled", &enabled);
 			if (rc) {
 				D_ERROR("Enable SCM usage statistics failed. "DF_RC"\n",
@@ -317,6 +465,10 @@ umempobj_create(const char *path, const char *layout_name, int flags,
 		umm_pool->up_priv = pop;
 		break;
 	case DAOS_MD_BMEM:
+        //Yuanguo:
+        //   poolsize=0
+        //   dav_obj_create通过stat(path)来获取文件大小(包含header)；
+        //   umm_pool->up_store.store_size = path文件大小 - blob-header-size (1*4k) (注意不是struct dav_phdr)
 		dav_hdl = dav_obj_create(path, 0, poolsize, mode, &umm_pool->up_store);
 		if (!dav_hdl) {
 			D_ERROR("Failed to create pool %s, size="DF_U64": errno = %d\n",
@@ -1715,6 +1867,9 @@ umem_cache_alloc(struct umem_store *store, uint64_t max_mapped)
 
 	D_ASSERT(store != NULL);
 
+    //Yuanguo:
+    //  store->stor_size: /mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0 文件的大小 - blob-header-size(默认1*4k) (注意不是struct dav_phdr)
+    //  将store->stor_size向上取整到整page (16MiB/page)；
 	num_pages = (store->stor_size + UMEM_CACHE_PAGE_SZ - 1) >> UMEM_CACHE_PAGE_SZ_SHIFT;
 
 	if (max_mapped != 0) {
@@ -1724,6 +1879,30 @@ umem_cache_alloc(struct umem_store *store, uint64_t max_mapped)
 
 	max_mapped = num_pages;
 
+    //Yuanguo:
+    //   +---------------------------------+
+    //   |                                 |
+    //   |                                 |
+    //   |        struct umem_cache        |
+    //   |                                 |
+    //   |                                 |
+    //   +---------------------------------+
+    //   |        struct umem_page         | ca_pages[0]
+    //   +---------------------------------+
+    //   |        struct umem_page         | ca_pages[1]
+    //   +---------------------------------+
+    //   |        ......                   | ...
+    //   +---------------------------------+
+    //   |        struct umem_page         | ca_pages[num_pages-1]
+    //   +---------------------------------+
+    //   |        struct umem_page_info    | pinfo[0]
+    //   +---------------------------------+
+    //   |        struct umem_page_info    | pinfo[1]
+    //   +---------------------------------+
+    //   |        ......                   | ...
+    //   +---------------------------------+
+    //   |        struct umem_page_info    | pinfo[num_pages-1]
+    //   +---------------------------------+
 	D_ALLOC(cache, sizeof(*cache) + sizeof(cache->ca_pages[0]) * num_pages +
 			   sizeof(cache->ca_pages[0].pg_info[0]) * max_mapped);
 	if (cache == NULL)
@@ -1745,6 +1924,7 @@ umem_cache_alloc(struct umem_store *store, uint64_t max_mapped)
 	for (idx = 0; idx < num_pages; idx++)
 		cache->ca_pages[idx].pg_id = idx;
 
+    //Yuanguo: 注意，idx已经超过cache->ca_pages的边界，到了pinfo数组起始；
 	pinfo = (struct umem_page_info *)&cache->ca_pages[idx];
 
 	for (idx = 0; idx < max_mapped; idx++) {
@@ -1863,11 +2043,16 @@ umem_cache_unpin(struct umem_store *store, umem_off_t addr, daos_size_t size)
 #define UMEM_CHUNK_IDX_BITS  (1 << UMEM_CHUNK_IDX_SHIFT)
 #define UMEM_CHUNK_IDX_MASK  (UMEM_CHUNK_IDX_BITS - 1)
 
+//Yuanguo: 把CachePage内的一个cache-chunk标记为dirty;
 static inline void
 touch_page(struct umem_store *store, struct umem_page_info *pinfo, uint64_t wr_tx,
 	   umem_off_t first_byte, umem_off_t last_byte)
 {
 	struct umem_cache *cache = store->cache;
+    //Yuanguo:
+    //  - pinfo已经指向目标page (16MiB)了；
+    //  - first_byte & UMEM_CACHE_PAGE_SZ_MASK：在目标page内的偏移；"与"掉的高位是page号；
+    //  - 目标page又分成多个4k的cache-chunk； ... >> UMEM_CACHE_CHUNK_SZ_SHIFT 是cache-chunk在目标page内的index(bitmap中的对应bit)
 	uint64_t start_bit = (first_byte & UMEM_CACHE_PAGE_SZ_MASK) >> UMEM_CACHE_CHUNK_SZ_SHIFT;
 	uint64_t end_bit   = (last_byte & UMEM_CACHE_PAGE_SZ_MASK) >> UMEM_CACHE_CHUNK_SZ_SHIFT;
 	uint64_t bit_nr;
@@ -1875,8 +2060,11 @@ touch_page(struct umem_store *store, struct umem_page_info *pinfo, uint64_t wr_t
 	uint64_t idx;
 
 	for (bit_nr = start_bit; bit_nr <= end_bit; bit_nr++) {
+        //Yuanguo: bit_nr就是bitmap中bit的位置；
+        //  但是bitmap是通过uint64_t数组实现的，所以要找到目标uint64_t的目标bit;
 		idx = bit_nr >> UMEM_CHUNK_IDX_SHIFT; /** uint64_t index */
 		bit = bit_nr & UMEM_CHUNK_IDX_MASK;
+        //Yuanguo: 标记dirty;
 		pinfo->pi_bmap[idx] |= 1ULL << bit;
 	}
 
@@ -1943,10 +2131,24 @@ umem_cache_touch(struct umem_store *store, uint64_t wr_tx, umem_off_t addr, daos
 /** Maximum number of sets of pages in-flight at a time */
 #define MAX_INFLIGHT_SETS 4
 /** Maximum contiguous range to checkpoint */
+//Yuanguo: 一个region的最大size；
 #define MAX_IO_SIZE       (8 * 1024 * 1024)
 /** Maximum number of pages that can be in one set */
 #define MAX_PAGES_PER_SET 10
 /** Maximum number of ranges that can be in one page */
+//Yuanguo: 一个page(16M)包含UMEM_CACHE_BMAP_SZ << 6 = 4096 个 cache-chunk(4k)；
+//  为什么要除以2呢？
+//  猜测：连续的cache-chunk被合并成一个region，由一个umem_store_region/d_iov_t表示；
+//        所以，最多有一半；
+//Yuanguo:
+//  但MAX_IOD_PER_SET为啥又乘以2呢？看上去一个umem_checkpoint_data(inflight_set)可以最多包含10个page(16M)
+//  10个page，最多会有MAX_IOD_PER_PAGE*10个region，而不是乘以2 ？
+//Yuanguo: 是这样
+//      - 一个inflight_set(umem_checkpoint_data)最多包含MAX_PAGES_PER_SET(10)个page；
+//      - 虽然10个page最多可能有10*MAX_IOD_PER_PAGE个region，
+//        但规定一个inflight_set最多可以包含MAX_IOD_PER_SET(2*MAX_IOD_PER_PAGE)个region;
+//      - page数和region数有一个达到上限，当前inflight_set就认为已满；
+//  见umem_cache_checkpoint()中的注释
 #define MAX_IOD_PER_PAGE  ((UMEM_CACHE_BMAP_SZ << 6) / 2)
 /** Maximum number of IODs a set can handle */
 #define MAX_IOD_PER_SET   (2 * MAX_IOD_PER_PAGE)
@@ -1974,6 +2176,7 @@ struct umem_checkpoint_data {
 	uint32_t                 cd_nr_dchunks;
 };
 
+//Yuanguo: 把page `pinfo`添加到inflight_set `chkpt_data`
 static void
 page2chkpt(struct umem_store *store, struct umem_page_info *pinfo,
 	   struct umem_checkpoint_data *chkpt_data)
@@ -2004,10 +2207,15 @@ page2chkpt(struct umem_store *store, struct umem_page_info *pinfo,
 
 		bmap = bits[i];
 		do {
+            //Yuanguo: __builtin_ctzll(): count trailing zeros of a 64bit int
 			first_bit_shift = __builtin_ctzll(bmap);
+            //Yuanguo: 末尾有3个0，代表有3个连续的clean cache-chunk(4k)；
+            //  所以，下一个dirty cache-chunk的偏移是3*4k，也就是 3<<12(UMEM_CACHE_CHUNK_SZ_SHIFT)；
+            //  当然，要加上uint64_t对应的起始偏移(`offset`变量)
 			map_offset      = first_bit_shift << UMEM_CACHE_CHUNK_SZ_SHIFT;
 			count      = 0;
 			mask       = 0;
+            //Yuanguo: count是指，接下来有多少个1? 即有多少个连续的dirty cache-chunk?
 			while (first_bit_shift != 64) {
 				bit = 1ULL << first_bit_shift;
 				if ((bmap & bit) == 0)
@@ -2015,6 +2223,9 @@ page2chkpt(struct umem_store *store, struct umem_page_info *pinfo,
 				mask |= bit;
 				count++;
 				first_bit_shift++;
+                //Yuanguo: 太多连续的dirty cache-chunk，超过IO region的大小；
+                // 先构成一个region；
+                // 剩下的，do-while 循环继续处理 (bmap &= ~mask 将处理过的设置为0)；
 				if ((count << UMEM_CACHE_CHUNK_SZ_SHIFT) == MAX_IO_SIZE)
 					break;
 			}
@@ -2031,6 +2242,8 @@ page2chkpt(struct umem_store *store, struct umem_page_info *pinfo,
 		} while (bmap != 0);
 
 next_bmap:
+        //Yuanguo: 一个uint64_t代表64个cache-chunk；
+        //  所以，下一个uint64_t的起始偏移要加上64个cache-chunks，即4k << 6;
 		offset += UMEM_CACHE_CHUNK_SZ << UMEM_CHUNK_IDX_SHIFT;
 		page_addr += UMEM_CACHE_CHUNK_SZ << UMEM_CHUNK_IDX_SHIFT;
 	}
@@ -2133,14 +2346,23 @@ umem_cache_checkpoint(struct umem_store *store, umem_cache_wait_cb_t wait_cb, vo
 			chkpt_data->cd_max_tx                                           = 0;
 			chkpt_data->cd_nr_dchunks                                       = 0;
 
+            //Yuanguo: 一个inflight_set
+            //    - 最多能包含MAX_PAGES_PER_SET(10)个page；
+            //    - 最多能包含MAX_IOD_PER_SET(2*MAX_IOD_PER_PAGE)个region；
+            //
+            // 当cd_store_iod.io_nr == MAX_IOD_PER_PAGE时，还可以再添加一个page，因为一个page最多有MAX_IOD_PER_PAGE个region，
+            //     添加上，不会超过MAX_IOD_PER_SET (2*MAX_IOD_PER_PAGE)个region；
+            // 相反，当cd_store_iod.io_nr > MAX_IOD_PER_PAGE时，就不能再添加了，可能超出MAX_IOD_PER_SET；
 			while (chkpt_data->cd_nr_pages < MAX_PAGES_PER_SET &&
 			       chkpt_data->cd_store_iod.io_nr <= MAX_IOD_PER_PAGE &&
 			       (pinfo = d_list_pop_entry(&cache->ca_pgs_copying,
 							 struct umem_page_info, pi_link)) != NULL) {
 				D_ASSERT(chkpt_data != NULL);
+                //Yuanguo: 把page添加到inflight_set；
 				page2chkpt(store, pinfo, chkpt_data);
 			}
 
+            //Yuanguo: for vos_pool, so_flush_prep = vos_meta_flush_prep
 			rc = store->stor_ops->so_flush_prep(store, &chkpt_data->cd_store_iod,
 							    &chkpt_data->cd_fh);
 			if (rc != 0) {
@@ -2173,6 +2395,7 @@ umem_cache_checkpoint(struct umem_store *store, umem_cache_wait_cb_t wait_cb, vo
 						sgl->sg_iovs[i].iov_buf, sgl->sg_iovs[i].iov_len);
 			}
 
+            //Yuanguo: for vos_pool, so_flush_copy = vos_meta_flush_copy
 			rc = store->stor_ops->so_flush_copy(chkpt_data->cd_fh,
 							    &chkpt_data->cd_sg_list);
 			/** If this fails, it means invalid argument, so assertion here is fine */
@@ -2219,6 +2442,7 @@ umem_cache_checkpoint(struct umem_store *store, umem_cache_wait_cb_t wait_cb, vo
 		 *  before copying another page.  We can revisit this later if the API allows
 		 *  to pass more than one fh.
 		 */
+        //Yuanguo: for vos_pool, so_flush_post = vos_meta_flush_post
 		rc = store->stor_ops->so_flush_post(chkpt_data->cd_fh, rc);
 		for (i = 0; i < chkpt_data->cd_nr_pages; i++) {
 			pinfo = chkpt_data->cd_pages[i];

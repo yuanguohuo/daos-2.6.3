@@ -137,7 +137,15 @@ wal_id_cmp(struct wal_super_info *si, uint64_t id1, uint64_t id2)
 	 * 32 bits sequence number allows the WAL wrapping 4 billion times,
 	 * though we'd still check the unlikely sequence overflow here.
 	 */
+    //Yuanguo:
+    //  cond-A: 当前seq是max (seq是max的时候一定checked point了吗？有没有地方保证每个seq一定有checkpoint?)
+    //  cond-B: 下一个unused seq是0 (假如下一个unused seq还是max说明还没溢出)
 	if (id2seq(si->si_ckp_id) == WAL_ID_SEQ_MAX && id2seq(si->si_unused_id) == 0) {
+        //Yuanguo: 发生seq溢出时，
+        //  - id1和id2的seq相等(都回绕或都没回绕) || 虽不相等但都大于0(都没有回绕)  ==>  直接比
+        //  - 否则 (一个回绕，另一个没有回绕)
+        //      - id1的seq==0 (已回绕)     ==>  id1 > id2 (没有回绕)，返回1
+        //      - 否则，id2回绕id1没有回绕 ==> id1 < id2，返回-1；
 		if ((id2seq(id1) == id2seq(id2)) ||
 		    (id2seq(id1) > 0 && id2seq(id2) > 0))
 			return (id1 < id2) ? -1 : ((id1 > id2) ? 1 : 0);
@@ -192,16 +200,41 @@ wal_used_blks(struct wal_super_info *si)
 
 	next_ckp_id = wal_next_id(si, si->si_ckp_id, si->si_ckp_blks);
 
+    //Yuanguo: 为什么满足 next_ckp_id <= si_unused_id呢？
+    //  虽然checkpoint是写到meta-blob上的（而非wal-blob），但是作checkpoint的时候，
+    //  也分配id (更新si_unused_id)；假设
+    //      - wal总共block数是1024；(si->si_header.wh_tot_blks = 1024)
+    //      - 当前si_unused_id = 5 << 32 | 800
+    //      - 写入一个size=300 blocks的transaction，id = txC = 5 << 32 | 800
+    //      - si_unused_id更新为 6 << 32 | 76
+    //      - 打checkpoint，si_ckp_id = txC = 5 << 32 | 800, si_ckp_blks = txC-sz = 300
+    //
+    //  此时，next_ckp_id = wal_next_id(..., 5 << 32 | 800, 300) = 6 << 32 | 76，等于si_unused_id
+    //  假如又有新的transaction写到wal，那么si_unused_id又更新，肯定大于6 << 32 | 76 (即使seq溢出为0，因为wal_id_cmp会处理溢出)
+    //
+    //  可以把wal看作一个无限长的序列(回绕以及seq溢出情况已被妥善处理)，一个transaction或一个checkpoint都对应唯一一个点
+    //
+    //                               si_ckp_id
+    //    txA        txB               txC     si_ckp_blks        txD            txE      si_unused_id
+    //     |  txA-sz  |      txB-sz     |        txC-sz            |    txD-sz    |  txE-sz  |
+    //  ------------------------------------------------------------------------------------------>
+    //                                                             ^
+    //                                                             |
+    //                                                        next_ckp_id
 	D_ASSERTF(wal_id_cmp(si, next_ckp_id, si->si_unused_id) <= 0,
 		  "Checkpoint ID "DF_U64" > Unused ID "DF_U64"\n",
 		  next_ckp_id, si->si_unused_id);
 
+    //Yuanguo: 若si_unused_id在txD处，打完checkpoint之后，没有新transaction ...
 	/* Everything is check-pointed & no pending transactions */
 	if (next_ckp_id == si->si_unused_id) {
 		D_ASSERT(si->si_ckp_id == si->si_commit_id);
 		return 0;
 	}
 
+    //Yuanguo:
+    //  逻辑上，wal的长度是 si_unused_id - next_ckp_id
+    //  实现上，要考虑回绕以及seq溢出；
 	next_ckp_off = id2off(next_ckp_id);
 	next_ckp_seq = id2seq(next_ckp_id);
 	unused_off = id2off(si->si_unused_id);
@@ -277,6 +310,7 @@ bio_wal_reserve(struct bio_meta_context *mc, uint64_t *tx_id, struct bio_wal_sta
 	struct wal_super_info	*si = &mc->mc_wal_info;
 	int			 rc = 0;
 
+    //Yuanguo: 这里读si->si_rsrv_waiters，以及si->si_rsrv_waiters++没有锁保护，是安全的吗？
 	if (!si->si_rsrv_waiters && reserve_allowed(si))
 		goto done;
 
@@ -526,6 +560,7 @@ struct data_csum_array {
 	struct umem_action	 dca_inline_acts[INLINE_DATA_CSUM_NR];
 };
 
+//Yuanguo: 把transaction序列化到DMA buffer;
 static void
 fill_trans_blks(struct bio_meta_context *mc, struct bio_sglist *bsgl, struct umem_wal_tx *tx,
 		struct data_csum_array *dc_arr, unsigned int blk_sz, struct wal_blks_desc *bd)
@@ -550,10 +585,12 @@ fill_trans_blks(struct bio_meta_context *mc, struct bio_sglist *bsgl, struct ume
 	blk_hdr.th_tot_ents = umem_tx_act_nr(tx) + dc_arr->dca_nr;
 	blk_hdr.th_tot_payload = umem_tx_act_payload_sz(tx);
 
+    //Yuanguo: entry_blk指向DMA buffer中的空间，是序列化(fill)的目的地；
 	/* Initialize first entry block */
 	get_trans_blk(bsgl, 0, blk_sz, &entry_blk);
 	entry_blk.tb_hdr = &blk_hdr;
 	entry_blk.tb_blk_sz = blk_sz;
+    //Yuanguo: 把transaction header (wal_trans_head) 序列化到DMA buffer;
 	place_blk_hdr(&entry_blk);
 
 	/* Initialize first payload block */
@@ -941,6 +978,7 @@ bio_wal_commit(struct bio_meta_context *mc, struct umem_wal_tx *tx, struct bio_d
 		return rc;
 	}
 
+    //Yuanguo: 计算transaction序列化后的大小；block(4k)的整数倍(这样才能原子地写到nvme ssd?)；
 	/* Calculate the required log blocks for this transaction */
 	calc_trans_blks(umem_tx_act_nr(tx) + dc_arr.dca_nr, umem_tx_act_payload_sz(tx),
 			blk_bytes, &blk_desc);
@@ -1013,6 +1051,7 @@ bio_wal_commit(struct bio_meta_context *mc, struct umem_wal_tx *tx, struct bio_d
 		goto out;
 	}
 
+    //Yuanguo: 把transaction序列化到DMA buffer;
 	/* Fill DMA buffer with transaction entries */
 	fill_trans_blks(mc, bsgl, tx, &dc_arr, blk_bytes, &blk_desc);
 
@@ -1029,6 +1068,7 @@ bio_wal_commit(struct bio_meta_context *mc, struct umem_wal_tx *tx, struct bio_d
 	biod->bd_completion = wal_completion;
 	biod->bd_comp_arg = &wal_tx;
 
+    //Yuanguo: 写入nvme ssd?
 	rc = bio_iod_post_async(biod, 0);
 	if (rc)
 		D_ERROR("WAL commit failed. "DF_RC"\n", DP_RC(rc));
@@ -1086,6 +1126,8 @@ load_wal_header(struct bio_meta_context *mc)
 	return 0;
 }
 
+//Yuanguo: 一个struct bio_io_context对象表示对一个blob的一个open (类比fd)
+//  read/write操作需要它做参数(代表目标blob)， 类比文件read/write需要fd参数(代表目标文件)
 static int
 write_header(struct bio_meta_context *mc, struct bio_io_context *ioc, void *hdr,
 	     unsigned int hdr_sz, uint32_t *csum)
@@ -1101,6 +1143,7 @@ write_header(struct bio_meta_context *mc, struct bio_io_context *ioc, void *hdr,
 		return rc;
 	}
 
+    //Yuanguo: 写入meta/wal blob offset=0处
 	bio_addr_set(&addr, DAOS_MEDIA_NVME, 0);
 	d_iov_set(&iov, hdr, hdr_sz);
 
@@ -2042,6 +2085,8 @@ meta_format(struct bio_meta_context *mc, struct meta_fmt_info *fi, bool force)
 		return -DER_INVAL;
 	}
 
+    //Yuanguo: 初始化checksum的算法；
+    //  下面write_header() -> meta_csum_calc()计算checksum结果；
 	rc = meta_csum_init(mc, HASH_TYPE_CRC32);
 	if (rc)
 		return rc;

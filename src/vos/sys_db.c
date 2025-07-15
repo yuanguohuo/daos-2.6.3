@@ -367,6 +367,7 @@ vos_db_init_ex(const char *db_path, const char *db_name, bool force_create, bool
 	if (!db_name)
 		db_name = SYS_DB_NAME;
 
+    //Yuanguo: vos_db.db_file = "/var/daos/config/daos_control/engine1/daos_sys/sys_db"
 	rc = asprintf(&vos_db.db_file, "%s/%s", vos_db.db_path, db_name);
 	if (rc < 0) {
 		D_ERROR("Generate sysdb filename failed. %d\n", rc);
@@ -407,6 +408,10 @@ vos_db_init_ex(const char *db_path, const char *db_name, bool force_create, bool
 	vos_db.db_pub.sd_lock	  = db_lock;
 	vos_db.db_pub.sd_unlock	  = db_unlock;
 
+    //Yuanguo: 猜测
+    //  vos_db是control-plane的元数据，即management-service的元数据，由raft维护;
+    //  它也会存储于SCM上(不考虑MD-on-SSD)，也就是说，和data-plane的元数据(pool, container, ...)存在一起;
+    //  所以，也把vos_db抽象成pool/container来存储，只是它的pool/container uuid是固定的：SYS_DB_POOL, SYS_DB_CONT
 	rc = uuid_parse(SYS_DB_POOL, vos_db.db_pool);
 	D_ASSERTF(rc == 0, "Failed to parse sys pool uuid: %s\n", SYS_DB_POOL);
 

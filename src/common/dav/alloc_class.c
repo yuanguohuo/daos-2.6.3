@@ -111,6 +111,7 @@ struct alloc_class_collection {
 	 * The last size (in bytes) that is handled by runs, everything bigger
 	 * uses the default class.
 	 */
+    //Yuanguo: 能用run分配的最大unit；更大的必须使用huge来分配；
 	size_t last_run_max_size;
 
 	/* maps allocation classes to allocation sizes, excluding the header! */
@@ -188,6 +189,10 @@ alloc_class_new(int id, struct alloc_class_collection *ac,
 	c->unit_size = unit_size;
 	c->header_type = htype;
 	c->type = type;
+    //Yuanguo: 对于调用路径register_slabs() -> set_slab_desc() -> dav_class_register()
+    //Yuanguo: c->header_type = HEADER_NONE    ---->  CHUNK_FLAG_HEADER_NONE
+    //         alignment      = 0              ---->  0
+    //         故c->flags = CHUNK_FLAG_HEADER_NONE | ALLOC_CLASS_DEFAULT_FLAGS(CHUNK_FLAG_FLEX_BITMAP)
 	c->flags = (uint16_t)
 		(header_type_to_flag[c->header_type] |
 		(alignment ? CHUNK_FLAG_ALIGNED : 0)) |

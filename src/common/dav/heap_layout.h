@@ -113,9 +113,11 @@ struct zone_header {
 struct zone {
 	struct zone_header header;
 	struct chunk_header chunk_headers[MAX_CHUNK];
+    //Yuanguo: 等价于 chunks[0]; 不占空间；
 	struct chunk chunks[];
 };
 
+//Yuanguo: sizeof(struct heap_header) = 1024
 struct heap_header {
 	char signature[HEAP_SIGNATURE_LEN];
 	uint64_t major;
@@ -127,6 +129,46 @@ struct heap_header {
 	uint64_t checksum;
 };
 
+//Yuanguo:
+//                           memory             path /mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0
+//
+// hdl->do_base   +---------------------------------+    +---------------------------------+ 0
+//                |                                 |    |                                 |
+//                |         struct dav_phdr         |    |                                 |
+//                |              (4k)               |    |                                 |
+//                |                                 |    |                                 |
+//      heap_base +---------------------------------+    +---------------------------------+ 4k  ---
+//                | +-----------------------------+ |    |                                 |      |
+//                | | struct heap_header (1k)     | |    |                                 |      |
+//                | +-----------------------------+ |    |                                 |      |
+//      zone0 ->  | | struct zone_header (64B)    | |    |                                 |      |
+//                | | struct chunk_header(8B)     | |    |                                 |      |
+//                | | struct chunk_header(8B)     | |    |                                 |      |
+//                | | ...... 65528个,不一定都用   | |    |                                 |      |
+//                | | struct chunk_header(8B)     | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | | ...... 最多65528个          | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | +-----------------------------+ |    |                                 |      |
+//                | | struct zone_header (64B)    | |    |                                 |      |
+//                | | struct chunk_header(8B)     | |    |                                 |      |
+//                | | struct chunk_header(8B)     | |    |                                 |  heap_size = path文件大小 - blob-header-size(4k) - sizeof(struct dav_phdr)(4k)
+//                | | ...... 65528个,不一定都用   | |    |                                 |      |                       (什么是blob-header?)
+//                | | struct chunk_header(8B)     | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | | ...... 最多65528个          | |    |                                 |      |
+//                | | chunk (256k)                | |    |                                 |      |
+//                | +-----------------------------+ |    |                                 |      |
+//                | |                             | |    |                                 |      |
+//                | |     ... more zones ...      | |    |                                 |      |
+//                | |                             | |    |                                 |      |
+//                | |  除了最后一个，前面的zone   | |    |                                 |      |
+//                | |  都是65528个chunk,接近16G   | |    |                                 |      |
+//                | |                             | |    |                                 |      |
+//                | +-----------------------------+ |    |                                 |      |
+//                +---------------------------------+    +---------------------------------+     ---
 struct heap_layout {
 	struct heap_header header;
 	struct zone zone0;	/* first element of zones array */

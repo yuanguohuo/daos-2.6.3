@@ -302,6 +302,11 @@ dss_tgt_nr_check(unsigned int ncores, unsigned int tgt_nr, bool oversubscribe)
 	}
 
 out:
+    //Yuanguo:
+    //  - 如果helper数(配置项nr_xs_helpers)刚好是target数(配置项targets)的整数倍，那么
+    //    就把helper平均分给target；每个target有独占的helper，不共享，也就是非"池化"；
+    //    dss_helper_pool = false；
+    //  - 否则，所有helper形成一个pool，target共享这个pool，所以dss_helper_pool=true;
 	if (dss_tgt_offload_xs_nr % tgt_nr != 0)
 		dss_helper_pool = true;
 
@@ -371,6 +376,9 @@ dss_topo_init(void)
 	hwloc_topology_init(&dss_topo);
 	hwloc_topology_load(dss_topo);
 
+    //Yuanguo: 在2-socket, 24-core-per-socket, 2-thread-per-core的系统上：
+    //  dss_core_nr  = 48   //2个socket的所有core，共2*24=48个；
+    //  numa_node_nr = 2    //2个socket
 	dss_core_depth = hwloc_get_type_depth(dss_topo, HWLOC_OBJ_CORE);
 	dss_core_nr = hwloc_get_nbobjs_by_type(dss_topo, HWLOC_OBJ_CORE);
 	depth = hwloc_get_type_depth(dss_topo, HWLOC_OBJ_NUMANODE);
@@ -383,6 +391,22 @@ dss_topo_init(void)
 	 * maintain mode consistency between engines where one sets it to 0.
 	 */
 	if (dss_core_offset == -1) {
+        //Yuanguo: daos_server自动维护daos_engine的情况下，daos_server会指定dss_numa_node(-p选项)
+        //     /usr/bin/daos_engine  \
+        //            -g daos_server \
+        //            -t 18    \
+        //            -x 4     \
+        //            -T 2     \
+        //            -p 1     \
+        //            -I 1     \
+        //            -r 19456 \
+        //            -H 2     \
+        //            -d /var/run/daos_server \
+        //            -n /var/daos/config/daos_control/engine1/daos_nvme.conf \
+        //            -s /mnt/daos1
+        //
+        // 所以，这里multi_socket=false。虽然系统是multi socket的，但当前daos_engine
+        // 知道自己已绑定到固定一个socket (numa node)；
 		dss_core_offset = 0;
 		if (dss_multi_socket_check(tgt_oversub, numa_node_nr))
 			multi_socket = true;

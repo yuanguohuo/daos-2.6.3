@@ -431,11 +431,19 @@ struct bio_copy_args {
 
 };
 
+//Yuanguo: 拷贝一个列表的regions，即多个regions；
+//  - 这个列表就是bio_copy_args(arg)的arg->ca_sgls[arg->ca_sgl_idx]，
+//    列表的每一项是一个heap region；对于flush操作，heap region是source数据；
+//  - flush的destinations在biod->bd_sgls[0]中(注意，它是一个列表)；列表的每
+//    一项是一个struct bio_iov对象：
+//          bi_addr  --> nvme blob地址；
+//          bi_buf   --> DMA内存region；
 static int
 copy_one(struct bio_desc *biod, struct bio_iov *biov, void *data)
 {
 	struct bio_copy_args	*arg = data;
 	d_sg_list_t		*sgl;
+    //Yuanguo: addr就是DMA内存region;
 	void			*addr = bio_iov2req_buf(biov);
 	ssize_t			 size = bio_iov2req_len(biov);
 	uint16_t		 media = bio_iov2media(biov);
@@ -445,12 +453,15 @@ copy_one(struct bio_desc *biod, struct bio_iov *biov, void *data)
 
 	D_ASSERT(biod->bd_type < BIO_IOD_TYPE_GETBUF);
 	D_ASSERT(arg->ca_sgl_idx < arg->ca_sgl_cnt);
+    //Yuanguo: sgl是内存regions；对于flush操作，就是source regions的指针和size；
 	sgl = &arg->ca_sgls[arg->ca_sgl_idx];
 
 	while (arg->ca_iov_idx < sgl->sg_nr) {
+        //Yuanguo: 处理一个region的IO(对于flush操作，就是内存region -> nvme meta blob region)
 		d_iov_t *iov;
 		ssize_t nob, buf_len;
 
+        //Yuanguo: iov->iov_buf表示heap region，对于flush操作(bd_type=BIO_IOD_TYPE_UPDATE)是source数据；
 		iov = &sgl->sg_iovs[arg->ca_iov_idx];
 		buf_len = (biod->bd_type == BIO_IOD_TYPE_UPDATE) ?
 					iov->iov_len : iov->iov_buf_len;
@@ -481,6 +492,9 @@ copy_one(struct bio_desc *biod, struct bio_iov *biov, void *data)
 		if (addr != NULL) {
 			D_DEBUG(DB_TRACE, "bio copy %p size %zd\n",
 				addr, nob);
+            //Yuanguo: 重要操作，heap region拷贝到DMA region (flush操作)
+            //  对于flush操作(bd_type=BIO_IOD_TYPE_UPDATE)，vos_meta_flush_prep()中分配了DMA region;
+            //  故addr != NULL成立；
 			bio_memcpy(biod, media, addr, iov->iov_buf +
 					arg->ca_iov_off, nob);
 			addr += nob;
@@ -861,6 +875,37 @@ dma_map_one(struct bio_desc *biod, struct bio_iov *biov, void *arg)
 	bdb = iod_dma_buf(biod);
 	dma_biov2pg(biov, &off, &end, &pg_cnt, &pg_off);
 
+    //Yuanguo:
+    //                   +----> +---------------+ <------+
+    //                   |      |               |        |
+    //                   |      |               |        |
+    //                   |      |   DMA reion   |        |
+    //                   |      |               |        |
+    //                   |      |               |        |
+    //                   |      |               |        |
+    //                   |      +---------------+        |
+    //           biov->bi_buf                          biod->bd_rsrvd
+    //                 bi_addr                           |
+    //                   |                               |
+    //                   +----> +---------------+ <------+
+    //                          |               |
+    //                          |               |
+    //                          |   nvme blob   |
+    //                          |     region    |
+    //                          |               |
+    //                          |               |
+    //                          +---------------+
+    //
+    //  本函数的主要任务是
+    //      - 分配DMA内存 (step-A)
+    //      - biov->bi_buf指向DMA region (step-C);
+    //      - 记录biod->bd_rsrvd (step-B.1和step-B.2)
+    //        这其实是在生成"DMA传输指令": 在biod->bd_rsrvd中记录source和destination(destination来自biov->bi_addr)
+    //
+    //  以flush为例(数据从heap region到nvme blob):
+    //      - 往DMA region拷贝数据时，使用biov->bi_buf，见vos_meta_flush_copy() -> bio_iod_copy()
+    //      - DMA数据传输时，使用biod->bd_rsrvd，见vos_meta_flush_post() -> bio_iod_post() -> dma_rw() -> nvme_rw()
+
 	/*
 	 * For huge IOV, we'll bypass our per-xstream DMA buffer cache and
 	 * allocate chunk from the SPDK reserved huge pages directly, this
@@ -869,25 +914,36 @@ dma_map_one(struct bio_desc *biod, struct bio_iov *biov, void *arg)
 	 * We assume the contiguous huge IOV is quite rare, so there won't
 	 * be high contention over the SPDK huge page cache.
 	 */
+    //Yuanguo: IOV (IO的region) 比较大，分配SPDK预留DMA内存；
 	if (pg_cnt > bio_chk_sz) {
+        //Yuanguo:
+        //  step-A: 分配SPDK预留的DMA chunk；
 		chk = dma_alloc_chunk(pg_cnt);
 		if (chk == NULL)
 			return -DER_NOMEM;
 
 		chk->bdc_type = biod->bd_chk_type;
+        //Yuanguo:
+        //  step-B.1: 把DMA chunk记录到biod->bd_rsrvd;
 		rc = iod_add_chunk(biod, chk);
 		if (rc) {
 			dma_free_chunk(chk);
 			return rc;
 		}
+        //Yuanguo:
+        //  step-C: biov->bi_buf指向DMA region (DMA chunk中的一部分);
 		bio_iov_set_raw_buf(biov, chk->bdc_ptr + pg_off);
 		chk_pg_idx = 0;
 
 		D_DEBUG(DB_IO, "Huge chunk:%p[%p], cnt:%u, off:%u\n",
 			chk, chk->bdc_ptr, pg_cnt, pg_off);
 
+        //Yuanguo:
+        //  step-B.2: 把使用的DMA region (可能是DMA chunk的一部分) 记录到biod->bd_rsrvd;
 		goto add_region;
 	}
+
+    //Yuanguo: IO size不大...过程与上类似，只不过对于从哪分配DMA chunk，尝试了不同的方式...
 
 	last_rg = iod_last_region(biod);
 
