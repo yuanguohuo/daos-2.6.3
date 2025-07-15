@@ -392,17 +392,17 @@ dss_topo_init(void)
 	 */
 	if (dss_core_offset == -1) {
         //Yuanguo: daos_server自动维护daos_engine的情况下，daos_server会指定dss_numa_node(-p选项)
-        //     /usr/bin/daos_engine  \
-        //            -g daos_server \
-        //            -t 18    \
-        //            -x 4     \
-        //            -T 2     \
-        //            -p 1     \
-        //            -I 1     \
-        //            -r 19456 \
-        //            -H 2     \
-        //            -d /var/run/daos_server \
-        //            -n /var/daos/config/daos_control/engine1/daos_nvme.conf \
+        //     /usr/bin/daos_engine
+        //            -g daos_server
+        //            -t 18
+        //            -x 4
+        //            -T 2
+        //            -p 1
+        //            -I 1
+        //            -r 19456
+        //            -H 2
+        //            -d /var/run/daos_server
+        //            -n /var/daos/config/daos_control/engine1/daos_nvme.conf
         //            -s /mnt/daos1
         //
         // 所以，这里multi_socket=false。虽然系统是multi socket的，但当前daos_engine
