@@ -1,0 +1,14 @@
+clang
+%c -std=c11
+-isystem
+/usr/include
+-I/usr/local/include
+-I/home/yuanguo.hyg/local/argobots-1.2/include
+-I/home/yuanguo.hyg/local/pmdk-2.1.0/include
+-I/home/yuanguo.hyg/local/spdk-20.07/include
+-I./src/include
+-I./src/include/daos
+-I./src/common
+-I./src/common/dav
+-D_GNU_SOURCE
+-DDAOS_PMEM_BUILD
