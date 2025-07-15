@@ -1,0 +1,23 @@
+//
+// (C) Copyright 2020-2024 Intel Corporation.
+//
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+//
+
+syntax = "proto3";
+package mgmt;
+
+option go_package = "github.com/daos-stack/daos/src/control/common/proto/mgmt";
+
+// Management Service Protobuf Definitions related to interactions between
+// DAOS control server and DAOS containers.
+
+// ContSetOwnerReq changes the ownership of a container.
+message ContSetOwnerReq {
+	string sys = 1; // DAOS system identifier
+	string cont_id = 2; // UUID or label of the container
+	string pool_id = 3; // UUID or label of the pool that the container is in
+	string owner_user = 4; // formatted user e.g. "bob@"
+	string owner_group = 5; // formatted group e.g. "builders@"
+	repeated uint32 svc_ranks = 6; // List of pool service ranks
+}
