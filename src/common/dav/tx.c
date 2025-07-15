@@ -19,18 +19,52 @@
 #include "dav_internal.h"
 
 struct tx_data {
+    //Yuanguo:
+    // struct {
+    //	 struct tx_data *sle_next;
+    // } tx_entry;
 	DAV_SLIST_ENTRY(tx_data) tx_entry;
 	jmp_buf env;
 	enum dav_tx_failure_behavior failure_behavior;
 };
 
+//Yuanguo:
+//  一个线程(xstream)一个struct tx对象，存在thread local 变量里，见get_tx()函数；
+//
+//            struct tx
+//  +---------------------------+
+//  |                           |
+//  |        tx_entries         |
+//  | +-----------------------+ |              struct tx_data                      struct tx_data
+//  | |      *slh_first       | | ----->  +------------------------+   +----> +------------------------+   +----> ...
+//  | +-----------------------+ |         |                        |   |      |                        |   |
+//  |                           |         |      tx_entry          |   |      |      tx_entry          |   |
+//  |        ......             |         | +--------------------+ |   |      | +--------------------+ |   |
+//  +---------------------------+         | |    *sle_next       | |---+      | |    *sle_next       | |---+
+//                                        | +--------------------+ |          | +--------------------+ |
+//                                        |                        |          |                        |
+//                                        |      ......            |          |      ......            |
+//                                        +------------------------+          +------------------------+
+//
+//  transactions可以嵌套，嵌套的transactions共用一个transaction id （其实就是一个transaction?)
+//  每层嵌套有一个struct tx_data对象，构成链表；
+//  最内层的transaction在最前；
 struct tx {
 	dav_obj_t *pop;
 	enum dav_tx_stage stage;
 	int last_errnum;
 
+    //Yuanguo:
+    // struct txd {
+    // 	  struct tx_data *slh_first;
+    // } tx_entries;
 	DAV_SLIST_HEAD(txd, tx_data) tx_entries;
 
+    //Yuanguo:
+    //  使用一个avl-tree 维护current transaction修改的heap ranges;
+    //  一个range被第一次修改时，要生成undo log，即保留未修改时的状态，以便于回滚(abort);
+    //  其实是 Copy-On-Write (COW) 机制；
+    //  详细逻辑见 dav_tx_add_common() 函数;
 	struct ravl *ranges;
 
 	VEC(, struct dav_action) actions;
@@ -948,6 +982,11 @@ dav_tx_merge_flags(struct tx_range_def *dest, struct tx_range_def *merged)
  * dav_tx_add_common -- (internal) common code for adding persistent memory
  * into the transaction
  */
+//Yuanguo:
+//  使用一个avl-tree 维护current transaction修改的heap ranges;
+//  一个range被第一次修改时，要生成undo log，即保留未修改时的状态，以便于回滚(abort);
+//  其实是 Copy-On-Write (COW) 机制，这也是本函数中，snapshot变量名的来源(undo logs
+//  应该维护transaction之前的snapshot，以便回滚).
 static int
 dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 {
@@ -979,6 +1018,10 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 	struct ravl_node *nprev = NULL;
 
 	while (r.size != 0) {
+        //Yuanguo:
+        //  将要修改range r: [r.offset, r.offset+r.size)，
+        //  搜索有没有一个range f紧跟着r，即f: [r.offset+r.size, ...)，
+        //  假如有，那么就可以合并range；
 		search.offset = r.offset + r.size;
 		struct ravl_node *n = ravl_find(tx->ranges, &search, p);
 		/*
@@ -994,6 +1037,12 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 		size_t rend = r.offset + r.size;
 
 		if (fend == 0 || fend < r.offset) {
+            //Yuanguo:
+            //  Case-1: 未找到右边紧跟着r的，或者左边和r overlap的
+            //  问题：为什么可能 fend != 0 && fend < r.offset ?
+            //  猜测：前面搜索时，p=RAVL_PREDICATE_LESS_EQUAL，可能返回小的:
+            //                            r: ================
+            //      f: ===============
 			/*
 			 * If found no range or the found range is not
 			 * overlapping or adjacent on the left side, we can just
@@ -1030,6 +1079,24 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 			ret = dav_tx_add_snapshot(tx, &r);
 			break;
 		} else if (fend <= rend) {
+            //Yuanguo: Case-2:
+            //  不满足Case-1，所以 fend != 0 && fend >= r.offset
+            //       r: ================================
+            //   f:=========================
+            //          |    intersection   | snapshot |
+            //
+            //          r = empty  (r.size -= intersection + snapshot.size之后为0)
+            //          f = f 并 r
+            //          snapshot添加进去，while结束(r.size为0)
+            //
+            //       r: ================================
+            //           f: ================
+            //              | intersection  | snapshot |
+            //          | s |
+            //
+            //          r = s;
+            //          f = f 并 snapshot
+            //          snapshot添加进去，while下一次循环，处理r=s部分；
 			/*
 			 * If found range has its end inside of the desired
 			 * snapshot range, we can extend the found range by the
@@ -1076,6 +1143,27 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 				ravl_remove(tx->ranges, nprev);
 			}
 		} else if (fend >= r.offset) {
+            //Yuanguo:
+            // 不满足Case-1，所以 fend != 0 && fend >= r.offset
+            // 不满足Case-2，所以 fend > rend
+            //
+            //              r: ======================
+            //     f:  =========================================
+            //                 |   overlap          |
+            //
+            //     r = empty  (r.size -= overlap 之后为0)
+            //     while结束(r.size为0)
+            //     这种情况下，没有添加任何range，因为r完全被f覆盖；
+            //
+            //
+            //
+            //              r: ======================
+            //                       f: ========================
+            //                          | overlap   |
+            //                 |   s    |
+            //
+            //     r = s
+            //     while下一次循环，处理r=s部分；overlap部分被f覆盖；
 			/*
 			 * If found range has its end extending beyond the
 			 * desired snapshot.

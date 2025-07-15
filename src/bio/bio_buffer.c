@@ -266,6 +266,22 @@ bio_iod_alloc(struct bio_io_context *ctxt, struct umem_instance *umem,
 	D_ASSERT(ctxt != NULL);
 	D_ASSERT(sgl_cnt != 0);
 
+    //Yuanguo: offsetof(..., bd_sgls[3]) 其实是 "要分配的内存size"；例如sgl_cnt=3
+    //       +-----------------------+ <---- 0
+    //       |                       |     ^
+    //       |                       |     |
+    //       |                       |     |
+    //       |    struct bio_desc    |     |
+    //       |                       |     |
+    //       |                       |   要分配的内存size
+    //       |                       |     |
+    //       +-----------------------+     |
+    //       |   struct bio_sglist   |     |
+    //       +-----------------------+     |
+    //       |   struct bio_sglist   |     |
+    //       +-----------------------+     |
+    //       |   struct bio_sglist   |     V
+    //       +-----------------------+ <----  offsetof(..., bd_sgls[3])
 	D_ALLOC(biod, offsetof(struct bio_desc, bd_sgls[sgl_cnt]));
 	if (biod == NULL)
 		return NULL;
@@ -431,13 +447,27 @@ struct bio_copy_args {
 
 };
 
-//Yuanguo: 拷贝一个列表的regions，即多个regions；
-//  - 这个列表就是bio_copy_args(arg)的arg->ca_sgls[arg->ca_sgl_idx]，
-//    列表的每一项是一个heap region；对于flush操作，heap region是source数据；
-//  - flush的destinations在biod->bd_sgls[0]中(注意，它是一个列表)；列表的每
-//    一项是一个struct bio_iov对象：
-//          bi_addr  --> nvme blob地址；
-//          bi_buf   --> DMA内存region；
+//Yuanguo:
+//  拷贝双方：
+//      Side-A: biov:
+//              1个struct bio_iov对象，描述1个DMA内存region;
+//      Side-B: arg->ca_sgls[arg->ca_sgl_idx].sg_iovs (即代码中的sgl->sg_iovs)
+//              它是一个列表，每个元素是1个struct d_iov_t对象，描述1个heap region；
+//              copy_one从sgl->sg_iovs[arg->ca_iov_idx]元素开始使用，直到Side-A被消耗完；
+//
+//  实际上，通常应该是1对1的，即Side-A (1个struct bio_iov对象，1个DMA内存region) 被消耗完时，
+//  Side-B中只使用了1个struct d_iov_t对象 (1个heap region)；
+//  此时，size=0成立，while中return;
+//  因为，heap region和storage (spdk blob) region通常是1对1的；一个例子是page2chkpt();
+//
+//  对于flush操作(BIO_IOD_TYPE_UPDATE)：
+//      - DMA还没开始；
+//      - 本函数把heap region(source数据)拷贝到DMA region，为DMA做准备；
+//      - 即Side-B  ==> Side-A
+//  对于fetch操作(BIO_IOD_TYPE_FETCH) ：
+//      - DMA已经完成，DMA region中存的是从storage (spdk blob)读到的数据；
+//      - 本函数把它拷贝到heap region(destination);
+//      - 即Side-A  ==> Side-B
 static int
 copy_one(struct bio_desc *biod, struct bio_iov *biov, void *data)
 {
@@ -900,7 +930,7 @@ dma_map_one(struct bio_desc *biod, struct bio_iov *biov, void *arg)
     //      - 分配DMA内存 (step-A)
     //      - biov->bi_buf指向DMA region (step-C);
     //      - 记录biod->bd_rsrvd (step-B.1和step-B.2)
-    //        这其实是在生成"DMA传输指令": 在biod->bd_rsrvd中记录source和destination(destination来自biov->bi_addr)
+    //        这其实是在生成"DMA传输计划": 在biod->bd_rsrvd中记录source和destination(destination来自biov->bi_addr)
     //
     //  以flush为例(数据从heap region到nvme blob):
     //      - 往DMA region拷贝数据时，使用biov->bi_buf，见vos_meta_flush_copy() -> bio_iod_copy()
@@ -1286,6 +1316,10 @@ dma_rw(struct bio_desc *biod)
 	D_ASSERT(biod->bd_inflights > 0);
 	biod->bd_inflights -= 1;
 
+    //Yuanguo: block等待完成；
+    //   - BIO_IOD_TYPE_FETCH : bd_async_post一定为false;
+    //   - BIO_IOD_TYPE_UPDATE: bd_async_post可能为true;
+    //见bio_iod_post_async()函数；
 	if (!biod->bd_async_post) {
 		iod_dma_wait(biod);
 		D_DEBUG(DB_IO, "Wait DMA done, type:%d\n", biod->bd_type);
@@ -1468,6 +1502,7 @@ out:
 	return rc;
 }
 
+//Yuanguo: `type`实际是`enum bio_chunk_type`类型；
 int
 iod_prep_internal(struct bio_desc *biod, unsigned int type, void *bulk_ctxt,
 		  unsigned int bulk_perm)
@@ -1505,6 +1540,10 @@ iod_prep_internal(struct bio_desc *biod, unsigned int type, void *bulk_ctxt,
 		d_tm_set_gauge(bdb->bdb_stats.bds_active_iods, bdb->bdb_active_iods);
 
 	if (biod->bd_type < BIO_IOD_TYPE_GETBUF) {
+        //Yuanguo: In Argobots, an eventual corresponds to the traditional behavior of the future concept.
+        //  A ULT creates an eventual, which is a memory buffer that will eventually contain a value of interest.
+        //  Many ULTs can wait on the eventual (a blocking call), until one ULT signals on that future.
+        //  函数iod_dma_wait()用于等待eventual完成；
 		rc = ABT_eventual_create(0, &biod->bd_dma_done);
 		if (rc != ABT_SUCCESS) {
 			rc = -DER_NOMEM;
@@ -1516,6 +1555,12 @@ iod_prep_internal(struct bio_desc *biod, unsigned int type, void *bulk_ctxt,
 	biod->bd_inflights = 0;
 	biod->bd_result = 0;
 
+    //Yuanguo:
+    //  对于读操作(BIO_IOD_TYPE_FETCH)
+    //    - 直接发起DMA
+    //    - 并block等待完成；biod->bd_async_post为false (只有BIO_IOD_TYPE_UPDATE时bd_async_post才可能为true，见bio_iod_post_async函数)
+    //  对于写操作(BIO_IOD_TYPE_UPDATE)
+    //    - 这里不发起DMA，DMA是在 bio_iod_post() 中发起的；
 	/* Load data from media to buffer on read */
 	if (biod->bd_type == BIO_IOD_TYPE_FETCH)
 		dma_rw(biod);
@@ -1532,6 +1577,7 @@ failed:
 	return rc;
 }
 
+//Yuanguo: `type`实际是`enum bio_chunk_type`类型；
 int
 bio_iod_prep(struct bio_desc *biod, unsigned int type, void *bulk_ctxt,
 	     unsigned int bulk_perm)
@@ -1711,6 +1757,15 @@ bio_rwv(struct bio_io_context *ioctxt, struct bio_sglist *bsgl_in,
 		rc = -DER_NOMEM;
 		goto out;
 	}
+
+    //Yuanguo:
+    //                   读(BIO_IOD_TYPE_FETCH)                 写(BIO_IOD_TYPE_UPDATE)
+    //  -------------------------------------------------------------------------------------------
+    //  bio_iod_prep     准备DMA buffer,发起DMA, 并等待完成     准备DMA buffer
+    //  -------------------------------------------------------------------------------------------
+    //  bio_iod_copy     把数据从DMA buffer拷贝到用户内存       把数据从用户内存拷贝到DMA buffer
+    //  -------------------------------------------------------------------------------------------
+    //  bio_iod_post     释放DMA buffer                         发起DMA，等待完成，并释放DMA buffer
 
 	/* map the biov to DMA safe buffer, fill DMA buffer if read operation */
 	rc = bio_iod_prep(biod, BIO_CHK_TYPE_LOCAL, NULL, 0);

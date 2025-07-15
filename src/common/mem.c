@@ -1561,6 +1561,18 @@ set_offsets(struct umem_instance *umm)
  * \param uma [IN]	Memory attributes to instantiate the memory class.
  * \param umm [OUT]	The instantiated memory class.
  */
+//Yuanguo:
+//  - 全局数组umem_class_defined定义了一些内存class；可以理解为C++
+//    的class(包含成员函数)
+//  - 本函数根据uma提供的信息，初始化一个umem_instance实例；可以理
+//    解为C++的对象；
+//           umem_class_id_t    umm_id;           类成员    类id (pmem:1 bmem:3)
+//           int                umm_nospc_rc;     类成员    空间耗尽时的错误码(纯内存和其它情况不同，更清晰而已)
+//           const char*        umm_name;         类成员    类名字("pmem", "bmem")
+//           struct umem_pool*  umm_pool;         对象成员  内存池(heap本身)
+//           uint64_t           umm_pool_uuid_lo; 对象成员  PMEM/SCM 特有的，struct PMEMoid 的 pool id部分；MD-on-SSD情况下为0;
+//           uint64_t           umm_base;         对象成员  heap起始地址，对于MD-on-SSD就是/mnt/daos0/{pooi-id}/vos-16 mmap的返回地址；
+//           umem_ops_t*        umm_ops;          类成员    成员函数表
 int
 umem_class_init(struct umem_attr *uma, struct umem_instance *umm)
 {

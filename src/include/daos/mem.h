@@ -143,7 +143,7 @@ struct umem_store {
 	uint32_t		 stor_hdr_blks;
 	/** private data passing between layers */
     //Yuanguo: MD-on-SSD场景下，stor_priv 指向 struct bio_meta_context 对象，里面是用于访问
-    //  meta/wal blob的context (spdk blob id等)；
+    //  data/meta/wal blob的context (spdk blob id等)；
 	void			*stor_priv;
 	void			*stor_stats;
 	void                    *vos_priv;
@@ -169,8 +169,8 @@ struct umem_slab_desc {
 
 struct umem_pool {
     //Yuanguo:
-    //  - MD-on-PMEM: up_priv指向pmemobj_create返回的memory pool (transactional object store)；
-    //  - MD-on-SSD:  up_priv指向一个struct dav_obj实例；
+    //  - MD-on-PMEM: up_priv指向pmemobj_create返回的memory pool，类型是PMEMobjpool，即指向一个transactional object store；
+    //  - MD-on-SSD:  up_priv指向一个struct dav_obj实例，其实是模拟PMEMobjpool;
 	void			*up_priv;
 	struct umem_store	 up_store;
 	/** Slabs of the umem pool */
@@ -709,6 +709,7 @@ umem_tx_stage(struct umem_instance *umm)
 static inline uint32_t
 umem_tx_act_nr(struct umem_wal_tx *tx)
 {
+    //Yuanguo: 对于MD-on-SSD (dav)，wtx_act_nr = wal_tx_act_nr
 	return tx->utx_ops->wtx_act_nr(tx);
 }
 

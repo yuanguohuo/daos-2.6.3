@@ -123,7 +123,7 @@ struct wal_super_info {
     //   - si_unused_id分为2个32-bits；
     //       - 高32-bits(WAL_ID_SEQ_BITS)叫做seq(sequence-no)；
     //       - 低32-bits(WAL_ID_OFF_BITS)叫做off(offset);
-    //   - off表示一个transaction在wal中所处的block号；
+    //   - off表示一个transaction在wal中所处的block号(32bit=4G个block号，每个block 4k, wal最大16T)；
     //   - seq每当wal写满回绕时递增1；
     // 见wal_next_id()函数;
     //
@@ -133,6 +133,7 @@ struct wal_super_info {
     // 那么：
     //   - T1: txA reserve id: 3 << 32 | 1000；假设txA的size是20个block；si_unused_id更新为：3 << 32 | 1020
     //   - T2: txB reserve id: 3 << 32 | 1020；假设txB的size是10个block；si_unused_id更新为：4 << 32 | 6
+    //         txB占的空间是第3遍(seq=3)结尾4个block + 第4遍开头6个block;
     //   - T3: txC reserve id: 4 << 32 | 6 ...
     //
     // 注意2：允许seq溢出，程序能过识别出这种情况，见wal_id_cmp()函数；

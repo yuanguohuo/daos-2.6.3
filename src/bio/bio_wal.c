@@ -113,6 +113,7 @@ meta_csum_len(struct bio_meta_context *mc)
 static inline uint32_t
 id2off(uint64_t tx_id)
 {
+    //Yuanguo: 取低32bit
 	return tx_id & WAL_ID_OFF_MASK;
 }
 
@@ -303,6 +304,8 @@ wakeup_reserve_waiters(struct wal_super_info *si, bool wakeup_all)
 	}
 }
 
+//Yuanguo: 若bio_wal_reserve() and bio_wal_submit()之间发生yield，则会发生transaction id重复；
+//         transaction id代表的是空间，故覆盖!
 /* Caller must guarantee no yield between bio_wal_reserve() and bio_wal_submit() */
 int
 bio_wal_reserve(struct bio_meta_context *mc, uint64_t *tx_id, struct bio_wal_stats *stats)
@@ -310,10 +313,18 @@ bio_wal_reserve(struct bio_meta_context *mc, uint64_t *tx_id, struct bio_wal_sta
 	struct wal_super_info	*si = &mc->mc_wal_info;
 	int			 rc = 0;
 
-    //Yuanguo: 这里读si->si_rsrv_waiters，以及si->si_rsrv_waiters++没有锁保护，是安全的吗？
+    //Yuanguo:
+    //  问1：这里读si->si_rsrv_waiters，以及si->si_rsrv_waiters++没有锁保护，是安全的吗？
+    //  答1：应该是一个线程(xstream)，多个ULT (user level thread)，所以是安全的；
+    //  问2：那么下面ABT_mutex_lock/ABT_cond_wait的作用是什么呢？
+    //  答2：应该是为了yield，等待reserve_allowed()变为true，且排在前面的waiter都已分配(si->si_rsrv_wq FIFO队列为空)
 	if (!si->si_rsrv_waiters && reserve_allowed(si))
 		goto done;
 
+    //Yuanguo: 前面有waiter，或者现在reserve_allowed为false；
+    //   - waiter数递增；
+    //   - 进入si->si_rsrv_wq FIFO队列；
+    //   - yield;
 	si->si_rsrv_waiters++;
 	if (stats)
 		stats->ws_waiters = si->si_rsrv_waiters;
@@ -322,18 +333,108 @@ bio_wal_reserve(struct bio_meta_context *mc, uint64_t *tx_id, struct bio_wal_sta
 	ABT_cond_wait(si->si_rsrv_wq, si->si_mutex);
 	ABT_mutex_unlock(si->si_mutex);
 
+    //Yuanguo: reserve_allowed()变为true，且排在前面的waiter都已分配；
 	D_ASSERT(si->si_rsrv_waiters > 0);
 	si->si_rsrv_waiters--;
 
+    //Yuanguo: 唤醒一个排在后面的waiter；
 	wakeup_reserve_waiters(si, false);
 	/* It could happen when wakeup all on WAL unload */
 	if (!reserve_allowed(si))
 		rc = -DER_SHUTDOWN;
 done:
+    //Yuanguo:
+    //  这里没有立即更新si_unused_id(因为当前transaction的大小还不知道？)
+    //  所以，下一个waiter并不能立即分配tx_id，要等到当前transaction commit
+    //  之后才更新(才能分配)，见bio_wal_commit()
+    //  若在此之前去reserve就会transaction id重复(transaction id代表的是空间，故覆盖)；如何保证没有别的ULT去reserve呢？
+    //  见函数前注释：Caller must guarantee no yield between bio_wal_reserve() and bio_wal_submit()
 	*tx_id = si->si_unused_id;
 	return rc;
 }
 
+//Yuanguo:
+//                                         +---------------------------------+ <---------------------
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         |      struct wal_trans_head      |          |
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         +---------------------------------+          |
+//                                         |      struct wal_trans_entry     |          |
+//                                         +---------------------------------+          |
+//                                         |      struct wal_trans_entry     |        block (除了wal_trans_head，全是wal_trans_entry)
+//                                         +---------------------------------+          |
+//                                         |      ......                     |          |
+//                                         +---------------------------------+          |
+//                                         |      struct wal_trans_entry     |          |
+//                                         +---------------------------------+          |
+//                                         |/////////////////////////////////|          |
+//                                         +---------------------------------+ <---------------------
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         |      struct wal_trans_head      |          |
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         +---------------------------------+          |
+//                                         |      struct wal_trans_entry     |          |
+//                                         +---------------------------------+          |
+//                                         |      struct wal_trans_entry     |        block (除了wal_trans_head，是wal_trans_entry，剩下的空间开始存payload)
+//                                         +---------------------------------+          |
+//                                         |      ......                     |          |
+// bd_payload_idx @ bd_payload_off ======> |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++ payload +++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         +---------------------------------+ <---------------------
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         |      struct wal_trans_head      |          |
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         +---------------------------------+          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|        block (除了wal_trans_head，全是payload)
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |++++++++++++ payload ++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         +---------------------------------+ <---------------------
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         |      struct wal_trans_head      |          |
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         +---------------------------------+          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |++++++++++++ payload ++++++++++++|        block (除了wal_trans_head，全是payload，剩下的空间放不下wal_trans_tail)
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |+++++++++++++++++++++++++++++++++|          |
+//                                         |           left_bytes            |          |
+//                                         | 假设放不下struct wal_trans_tail |          |
+//                                         +---------------------------------+ <---------------------
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         |      struct wal_trans_head      |          |
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                     bd_tail_off ======> +---------------------------------+          |
+//         tail在最后一个block内的偏移     |      struct wal_trans_tail      |          |
+//                                         +---------------------------------+          |
+//                                         |                                 |        block (除了wal_trans_head，只存一个wal_trans_tail)
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         |                                 |          |
+//                                         +---------------------------------+ <---------------------
 struct wal_blks_desc {
 	unsigned int	bd_blks;	/* Total blocks for this transaction */
 	unsigned int	bd_payload_idx;	/* Start block index for payload */
@@ -352,6 +453,99 @@ calc_trans_blks(unsigned int act_nr, unsigned int payload_sz, unsigned int blk_s
 
 	D_ASSERT(act_nr > 0);
 	blk_sz -= sizeof(struct wal_trans_head);
+
+    //Yuanguo:
+    //  max_ents   : 1个block，扣除wal_trans_head之后，能存多少wal_trans_entry? (每个block都带wal_trans_head?)
+    //  entry_blks : act_nr个wal_trans_entry需要多少block? (`act_nr + max_ents - 1`是为了向上取整)
+    //  remainder  :
+    //      - 非0：最后1 block内的wal_trans_entry个数；
+    //             left_bytes是最后1 block剩下的bytes;
+    //      - 为0: 每个block都占满(不是1字节不剩，是剩下的不足以存1个wal_trans_entry)；
+    //             left_bytes是最后1 block剩下的bytes (其实是每个block都剩下这些);
+    //
+    //  从下面代码逻辑看来，每1个block都带transaction头(struct wal_trans_head)
+    //
+    //    +---------------------------------+ <---------------------
+    //    |                                 |          |
+    //    |                                 |          |
+    //    |      struct wal_trans_head      |          |
+    //    |                                 |          |
+    //    |                                 |          |
+    //    +---------------------------------+          |
+    //    |      struct wal_trans_entry     |          |
+    //    +---------------------------------+          |
+    //    |      struct wal_trans_entry     |        block
+    //    +---------------------------------+          |
+    //    |      ......                     |          |
+    //    +---------------------------------+          |
+    //    |      struct wal_trans_entry     |          |
+    //    +---------------------------------+          |
+    //    |/////////////////////////////////|          |
+    //    +---------------------------------+ <---------------------
+    //    |                                 |          |
+    //    |                                 |          |
+    //    |      struct wal_trans_head      |          |
+    //    |                                 |          |
+    //    |                                 |          |
+    //    +---------------------------------+          |
+    //    |      struct wal_trans_entry     |          |
+    //    +---------------------------------+          |
+    //    |      struct wal_trans_entry     |        blo
+    //    +---------------------------------+          |
+    //    |      ......                     |          |
+    //    +---------------------------------+          |                 +---------------------------------+   <=== bd->bd_payload_idx @ bd->bd_payload_off
+    //    |                                 |          |                 |+++++++++++++++++++++++++++++++++|
+    //    |           left_bytes            |          |                 |+++++++++++ payload +++++++++++++|
+    //    |                                 |          |                 |+++++++++++++++++++++++++++++++++|
+    //    +---------------------------------+ <---------------------     +---------------------------------+ <---------------------
+    //                                                                   |                                 |          |
+    //                                                                   |                                 |          |
+    //                                                                   |      struct wal_trans_head      |          |
+    //                                                                   |                                 |          |
+    //                                                                   |                                 |          |
+    //                                                                   +---------------------------------+          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|        block
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |++++++++++++ payload ++++++++++++|          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   +---------------------------------+ <---------------------
+    //                                                                   |                                 |          |
+    //                                                                   |                                 |          |
+    //                                                                   |      struct wal_trans_head      |          |
+    //                                                                   |                                 |          |
+    //                                                                   |                                 |          |
+    //                                                                   +---------------------------------+          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |++++++++++++ payload ++++++++++++|        block
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |+++++++++++++++++++++++++++++++++|          |
+    //                                                                   |           left_bytes            |          |
+    //                                                                   | 假设放不下struct wal_trans_tail |          |
+    //    +---------------------------------+ <----------------          +---------------------------------+ <---------------------
+    //    |                                 |          |
+    //    |                                 |          |
+    //    |      struct wal_trans_head      |          |
+    //    |                                 |          |
+    //    |                                 |          |
+    //    +---------------------------------+          | <=== bd->bd_tail_off  最后一个block内的偏移
+    //    |      struct wal_trans_tail      |          |      bd->bd_blks 是总共block数；
+    //    +---------------------------------+          |
+    //    |                                 |        block
+    //    |                                 |          |
+    //    |                                 |          |
+    //    |                                 |          |
+    //    |                                 |          |
+    //    |                                 |          |
+    //    |                                 |          |
+    //    +---------------------------------+ <---------------------
 
 	/* Calculates entry blocks & left bytes in the last entry block */
 	max_ents = blk_sz / entry_sz;
@@ -403,6 +597,7 @@ struct wal_trans_blk {
 	unsigned int		 tb_blk_sz;	/* Block size */
 };
 
+//Yuanguo: idx是目标block号
 /* Get the mapped DMA address for a block used by transaction */
 static void
 get_trans_blk(struct bio_sglist *bsgl, unsigned int idx, unsigned int blk_sz,
@@ -413,9 +608,13 @@ get_trans_blk(struct bio_sglist *bsgl, unsigned int idx, unsigned int blk_sz,
 
 	D_ASSERT(bsgl->bs_nr_out == 1 || bsgl->bs_nr_out == 2);
 	biov = &bsgl->bs_iovs[0];
+    //Yuanguo: iov_blks，第0个DMA buffer包含多少个block；
 	iov_blks = (bio_iov2len(biov) + blk_sz - 1) / blk_sz;
 
 	if (blk_off >= iov_blks) {
+        //Yuanguo:
+        //  若: 目标block号 超出 第0个DMA buffer;
+        //  则：一定有2个DMA buffer (wal回绕的情况)
 		D_ASSERT(bsgl->bs_nr_out == 2);
 
 		blk_off -= iov_blks;
@@ -560,7 +759,9 @@ struct data_csum_array {
 	struct umem_action	 dca_inline_acts[INLINE_DATA_CSUM_NR];
 };
 
-//Yuanguo: 把transaction序列化到DMA buffer;
+//Yuanguo: 把transaction序列化到DMA buffer；即在DMA buffer中构建bd描述的layout(见struct wal_blks_desc前的注释)；
+//  - bsgl->bs_iovs : 指向一个struct bio_iov对象数组，元素可能是1个(wal没有回绕)或2个(wal回绕)，即bsgl->bs_nr_out = 1或2
+//  - tx            : transaction在内存中的表示；本函数就是把它序列化；
 static void
 fill_trans_blks(struct bio_meta_context *mc, struct bio_sglist *bsgl, struct umem_wal_tx *tx,
 		struct data_csum_array *dc_arr, unsigned int blk_sz, struct wal_blks_desc *bd)
@@ -590,14 +791,24 @@ fill_trans_blks(struct bio_meta_context *mc, struct bio_sglist *bsgl, struct ume
 	get_trans_blk(bsgl, 0, blk_sz, &entry_blk);
 	entry_blk.tb_hdr = &blk_hdr;
 	entry_blk.tb_blk_sz = blk_sz;
-    //Yuanguo: 把transaction header (wal_trans_head) 序列化到DMA buffer;
+    //Yuanguo: 第1个entry block开头放置transaction header (wal_trans_head)
 	place_blk_hdr(&entry_blk);
+
+    //Yuanguo: 见struct wal_blks_desc前的注释
+    //  注意!!!!!!!!! transaction所占的每个block，开头都要放置transaction header (wal_trans_head)，见下面:
+    //       place_blk_hdr(&payload_blk);                               //第1个payload block
+    //       next_trans_blk() --> place_blk_hdr();                      //后续entry block
+    //       place_payload()  --> next_trans_blk() --> place_blk_hdr(); //后续payload block
 
 	/* Initialize first payload block */
 	get_trans_blk(bsgl, bd->bd_payload_idx, blk_sz, &payload_blk);
 	payload_blk.tb_hdr = &blk_hdr;
 	payload_blk.tb_blk_sz = blk_sz;
 	D_ASSERT(bd->bd_payload_off >= sizeof(blk_hdr));
+    //Yuanguo:
+    //  - 若payload开始于一个新block，在block开头放置transaction header (wal_trans_head).
+    //  - 若payload开始于最后一个wal_trans_entry block内部，那个block已经放置了transaction header (wal_trans_head)，
+    //    紧跟着放置payload;
 	/* Payload starts from a new block */
 	if (bd->bd_payload_off == sizeof(blk_hdr))
 		place_blk_hdr(&payload_blk);
@@ -611,9 +822,13 @@ fill_trans_blks(struct bio_meta_context *mc, struct bio_sglist *bsgl, struct ume
 		/* Locate the entry block for this action */
 		if (entry_blk.tb_idx < bd->bd_payload_idx) {
 			D_ASSERT(entry_blk.tb_off <= blk_sz);
+            //Yuanguo: 当前block剩余left字节
 			left = blk_sz - entry_blk.tb_off;
 			/* Current entry block is full, move to next entry block */
 			if (left < entry_sz) {
+                //Yuanguo: 当前block剩余left字节不足以存储一个struct wal_trans_entry对象
+                //   - 把剩余left字节设置为0 (如果有)
+                //   - 跳到下一个block，并在其开头放置transaction header (wal_trans_head)
 				/* Zeroing left bytes for csum calculation */
 				if (left > 0)
 					memset(entry_blk.tb_buf + entry_blk.tb_off, 0, left);
@@ -637,6 +852,21 @@ fill_trans_blks(struct bio_meta_context *mc, struct bio_sglist *bsgl, struct ume
 				src_addr = (uint64_t)&act->ac_copy.payload;
 			else
 				src_addr = act->ac_copy_ptr.ptr;
+            //Yuanguo: 注意!!!!!!!!!!!!!!!
+            //  对于UMEM_ACT_COPY_PTR，把src处的数据(bytes)保存到了wal中，而不是只保存其地址，这是保证日志幂等的关键!!!!!!!!!!!!!!!
+            //
+            //  若只保存地址则不幂等，例如，初始状态；
+            //      srcAddr处数据：3333       (4B)
+            //      dstAddr处数据：no-matter  (4B)
+            //  则下面的日志序列不幂等:
+            //      COPY_PTR   srcAddr        --> dstAddr  (4B)
+            //      COPY       4444(payload)  --> srcAddr  (4B)
+            //  第1次执行：
+            //      dstAddr: 3333
+            //      srcAddr: 4444
+            //  第2次执行：
+            //      dstAddr: 4444
+            //      srcAddr: 4444
 			place_entry(&entry_blk, &entry);
 			place_payload(bsgl, bd, &payload_blk, src_addr, entry.te_len);
 			break;
@@ -931,6 +1161,8 @@ wait_tx_committed(struct wal_tx_desc *wal_tx)
 	D_ASSERT(biod_tx->bd_dma_done != ABT_EVENTUAL_NULL);
 	D_ASSERT(xs_ctxt != NULL);
 
+    //Yuanguo: 对于target xstream，xs_ctxt->bxc_self_polling都为false；
+    // 见src/engine/srv.c  dss_srv_handler() --> bio_xsctxt_alloc(..., false);
 	if (xs_ctxt->bxc_self_polling) {
 		D_DEBUG(DB_IO, "Self poll completion\n");
 		rc = xs_poll_completion(xs_ctxt, &biod_tx->bd_inflights, 0);
@@ -990,6 +1222,18 @@ bio_wal_commit(struct bio_meta_context *mc, struct umem_wal_tx *tx, struct bio_d
 		goto out;
 	}
 
+    //Yuanguo:
+    //       +-----------------------+
+    //       |                       |
+    //       |                       |
+    //       |                       |
+    //       |    struct bio_desc    |
+    //       |                       |
+    //       |                       |
+    //       |                       |
+    //       +-----------------------+
+    //       |   struct bio_sglist   |  只有1个list
+    //       +-----------------------+
 	biod = bio_iod_alloc(mc->mc_wal, NULL, 1, BIO_IOD_TYPE_UPDATE);
 	if (biod == NULL) {
 		rc = -DER_NOMEM;
@@ -997,13 +1241,21 @@ bio_wal_commit(struct bio_meta_context *mc, struct umem_wal_tx *tx, struct bio_d
 	}
 
 	/* Figure out the regions in WAL for this transaction */
+    //Yuanguo: si_unused_id还没有更新，还是current transaction的ID
+    //                         si_ckp_id                                        (tx_id)
+    //         txB               txC     si_ckp_blks  txD            txE     si_unused_id                            wal_next_id
+    //  .....   |      txB-sz     |        txC-sz      |    txD-sz    |  txE-sz    |       当前transaction占的空间       |
+    // ----------------------------------------------------------------------------------------------------------------------> wal
 	D_ASSERT(wal_id_cmp(si, tx_id, si->si_unused_id) == 0);
+
 	unused_off = id2off(si->si_unused_id);
 	D_ASSERT(unused_off < tot_blks);
 	if ((unused_off + blk_desc.bd_blks) <= tot_blks) {
+        //Yuanguo: 没有发生回绕，使用一个DMA IO即可完成(iov_nr = 1)
 		iov_nr = 1;
 		blks = blk_desc.bd_blks;
 	} else {
+        //Yuanguo: 发生回绕，必须使用两个DMA IO(iov_nr = 2); blks是第1个IO的size；
 		iov_nr = 2;
 		blks = (tot_blks - unused_off);
 	}
@@ -1013,9 +1265,14 @@ bio_wal_commit(struct bio_meta_context *mc, struct umem_wal_tx *tx, struct bio_d
 	if (rc)
 		goto out;
 
+    //Yuanguo:
+    //  第1个DMA IO(若没有回绕，也是唯一1个IO)对应到spdk wal blob中的地址；
 	bio_addr_set(&addr, DAOS_MEDIA_NVME, off2lba(si, unused_off));
 	bio_iov_set(&bsgl->bs_iovs[0], addr, (uint64_t)blks * blk_bytes);
 	if (iov_nr == 2) {
+        //Yuanguo: 若发生回绕，
+        //   addr: 第2个DMA IO的地址，回到wal blob的起始处(offset = 0)，即紧跟wal blob header之后；
+        //   blks: transaction总size - 第1个IO的size；
 		bio_addr_set(&addr, DAOS_MEDIA_NVME, off2lba(si, 0));
 		blks = blk_desc.bd_blks - blks;
 		bio_iov_set(&bsgl->bs_iovs[1], addr, (uint64_t)blks * blk_bytes);
@@ -1037,12 +1294,17 @@ bio_wal_commit(struct bio_meta_context *mc, struct umem_wal_tx *tx, struct bio_d
 	}
 
 	/* Update next unused ID */
+    //Yuanguo: 现在才更新si_unused_id，别的ULT可以bio_wal_reserve()了；
+    // 若在此之前去reserve就会transaction id重复(transaction id代表的是空间，故覆盖)；如何保证没有别的ULT去reserve呢？
+    // 见bio_wal_reserve函数前注释：
+    //     Caller must guarantee no yield between bio_wal_reserve() and bio_wal_submit()
 	si->si_unused_id = wal_next_id(si, si->si_unused_id, blk_desc.bd_blks);
 
 	/*
 	 * Map the WAL regions to DMA buffer, bio_iod_prep() can guarantee FIFO order
 	 * when it has to yield and wait for DMA buffer.
 	 */
+    //Yuanguo: 准备DMA内存；
 	rc = bio_iod_prep(biod, BIO_CHK_TYPE_LOCAL, NULL, 0);
 	if (rc) {
 		D_ERROR("WAL IOD prepare failed. "DF_RC"\n", DP_RC(rc));
@@ -1051,9 +1313,11 @@ bio_wal_commit(struct bio_meta_context *mc, struct umem_wal_tx *tx, struct bio_d
 		goto out;
 	}
 
-    //Yuanguo: 把transaction序列化到DMA buffer;
+    //Yuanguo: 把transaction序列化到DMA内存;
 	/* Fill DMA buffer with transaction entries */
 	fill_trans_blks(mc, bsgl, tx, &dc_arr, blk_bytes, &blk_desc);
+
+    //Yuanguo: biod_data 和 biod 什么关系？
 
 	/* Set proper completion callbacks for data I/O & WAL I/O */
 	if (biod_data != NULL) {
@@ -1068,7 +1332,7 @@ bio_wal_commit(struct bio_meta_context *mc, struct umem_wal_tx *tx, struct bio_d
 	biod->bd_completion = wal_completion;
 	biod->bd_comp_arg = &wal_tx;
 
-    //Yuanguo: 写入nvme ssd?
+    //Yuanguo: 发起DMA IO
 	rc = bio_iod_post_async(biod, 0);
 	if (rc)
 		D_ERROR("WAL commit failed. "DF_RC"\n", DP_RC(rc));
@@ -1175,6 +1439,8 @@ bio_wal_flush_header(struct bio_meta_context *mc)
 	return write_header(mc, mc->mc_wal, hdr, sizeof(*hdr), &hdr->wh_csum);
 }
 
+//Yuanguo:
+//  mc: 存储访问spdk data/meta/wal blob的io-contxt；这里要访问(read)的是wal blob;
 static int
 load_wal(struct bio_meta_context *mc, char *buf, unsigned int max_blks, uint64_t tx_id)
 {
@@ -1195,6 +1461,38 @@ load_wal(struct bio_meta_context *mc, char *buf, unsigned int max_blks, uint64_t
 	sgl.sg_nr_out = 0;
 
 	/* Read in 1MB sized IOVs */
+    //Yuanguo:
+    //    blk_bytes = 4k
+    //    nr_blks = 256; 256 block (即1M) 组成一个DMA IO，由一个struct bio_iov对象描述；
+    //    iov_nr = 要传输max_blks个block，需要多少个 1M-DMA-IO (struct bio_iov对象)
+    //             为何加1? 因为wal blob可能发生回绕，那样的话，由一个DMA-IO不满1M，故多占一个DMA-IO;
+    //
+    //
+    //                                                                             +------------------+
+    //                                                                             |    wal header    |
+    //                                                                             +------------------+
+    //                                           DMA buffer                       /|                  |
+    //                    buf                  (本函数未分配)                    / |                  |
+    // sgl ----> +---------------------+    +---------------------+ <---- bsgl  /  |                  |
+    //           |                     |    |                     | \          /  /+------------------|
+    //  1块连续  |                     |    |   1M DMA region     |   \       /  / |                  |
+    //  内存     |                     |    +---------------------+     \    /  /  |                  |
+    //           |                     |    +---------------------+       \ /  /   |                  |
+    //           |                     |    |                     |        /\ /    |                  |
+    //           |                     |    |   1M DMA region     |       /  / \   |                  |
+    //           |                     |    +--------------------+|      /  /    \ |                  |
+    //           |                     |    +---------------------+     /  /       +------------------+
+    //           |                     |    |                     |    /  /        |                  |
+    //           |                     |    |   ......            |   /  /         |                  |
+    //           |                     |    +---------------------+ \/  /          |                  |
+    //           |                     |    +---------------------+/  \/           |                  |
+    //           |                     |    |                     |  /  \          |                  |
+    //           |                     |    |   1M DMA region     | /     \        |                  |
+    //           +---------------------+    +---------------------+/        \      |                  |
+    //                                                                        \    |                  |
+    //                                                                          \  |                  |
+    //                                                                             +------------------+
+    // DMA buffer 在 bio_readv() --> bio_rwv() --> bio_iod_prep()中分配；
 	nr_blks = (1UL << 20) / blk_bytes;
 	D_ASSERT(nr_blks > 0);
 	iov_nr = (max_blks + nr_blks - 1) / nr_blks + 1;
@@ -1202,12 +1500,17 @@ load_wal(struct bio_meta_context *mc, char *buf, unsigned int max_blks, uint64_t
 	if (rc)
 		return rc;
 
+    //Yuanguo: transaction id (tx_id)是 seq << 32 | offset-in-wal-blob
+    //  off 就是低32bit，也就是在wal blob中的位置；
 	off = id2off(tx_id);
+    //Yuanguo: 循环初始化DMA IO (struct bio_iov对象) 的bi_addr和bi_data_len，指向wal blob中的区间；
+    //  一次一个bio_iov，代表1M(wal回绕、以及最后一个除外)
 	while (max_blks > 0) {
 		biov = &bsgl.bs_iovs[bsgl.bs_nr_out];
 
 		bio_addr_set(&addr, DAOS_MEDIA_NVME, off2lba(si, off));
 		blks = min(max_blks, nr_blks);
+        //Yuanguo: 发生回绕；
 		if (off + blks > tot_blks)
 			blks = tot_blks - off;
 		bio_iov_set(biov, addr, (uint64_t)blks * blk_bytes);
@@ -1215,6 +1518,7 @@ load_wal(struct bio_meta_context *mc, char *buf, unsigned int max_blks, uint64_t
 		bsgl.bs_nr_out++;
 		max_blks -= blks;
 		off += blks;
+        //Yuanguo: 发生回绕，在wal blob中的偏移归0；
 		if (off == tot_blks)
 			off = 0;
 		D_ASSERT(bsgl.bs_nr_out <= iov_nr);
@@ -1222,6 +1526,7 @@ load_wal(struct bio_meta_context *mc, char *buf, unsigned int max_blks, uint64_t
 	/* Adjust the bs_nr for following bio_readv() */
 	bsgl.bs_nr = bsgl.bs_nr_out;
 
+    //Yuanguo: 分配DMA buffer，发起DMA，把数据拷贝到buf (sgl), 释放DMA buffer;
 	rc = bio_readv(mc->mc_wal, &bsgl, &sgl);
 	bio_sgl_fini(&bsgl);
 
@@ -1714,6 +2019,16 @@ bio_wal_replay(struct bio_meta_context *mc, struct bio_wal_rp_stats *wrs,
 		goto out;
 	}
 
+    //Yuanguo:
+    //        txB               txC  si->si_ckp_blks       txD            txE      si_unused_id
+    //  ...    |      txB-sz     |        txC-sz            |    txD-sz    |  txE-sz  |
+    //  ------------------------------------------------------------------------------------------>
+    //                           ^
+    //                           |
+    //                     si->si_ckp_id
+    //
+    //  tx_id 就是si->si_ckp_id (txC) + si->si_ckp_blks (txC-sz) = txD
+    //  即从txD开始replay；txD是checkpoint之后的第一条日志；
 	tx_id = wal_next_id(si, si->si_ckp_id, si->si_ckp_blks);
 	start_id = tx_id;
 
@@ -1724,6 +2039,8 @@ bio_wal_replay(struct bio_meta_context *mc, struct bio_wal_rp_stats *wrs,
 load_wal:
 	tight_loop = 0;
 	blk_off = 0;
+    //Yuanguo: load max_blks(4096)个block (4k)，16MiB数据；
+    //  注意：不是一次load一个transaction；
 	rc = load_wal(mc, buf, max_blks, tx_id);
 	if (rc) {
 		D_ERROR("Failed to load WAL. "DF_RC"\n", DP_RC(rc));
@@ -1732,20 +2049,34 @@ load_wal:
 
 	while (1) {
 		/* Something went wrong, it's impossible to replay the whole WAL */
+        //Yuanguo: 若tx_id.seq != start_id.seq，那么wal一定回绕了
+        //  这种情况下，tx_id.offset 一定小于 start_id.offset
 		if (id2seq(tx_id) != id2seq(start_id) && id2off(tx_id) >= id2off(start_id)) {
 			D_ERROR("Whole WAL replayed. "DF_U64"/"DF_U64"\n", start_id, tx_id);
 			rc = -DER_INVAL;
 			break;
 		}
 
+        //Yuanguo: 每次循环，处理一个transaction；
+        //   - 第1次循环 ： 因为是从start_id处开始读的wal blob，所以，buf开始处一定是transaction header(blk_off=0);
+        //   - 后续循环  ： 前一次跳过了一整个transaction，所以，又是transaction header;
 		hdr = (struct wal_trans_head *)(buf + blk_off * blk_bytes);
+
+        //Yuanguo: 这里应该是replay的结束点 !!!!!!!!!
+        //  也就是说，一直找到一块错乱的数据；
+        //  为什么不replay到si->si_commit_id结束呢？从下面的代码看，可能发生transaction持久化但super info没有持久化的情况。
+        //  这和cephfs的log-replay有点类似 !!!!!!!!!
 		rc = verify_tx_hdr(si, hdr, tx_id);
 		if (rc)
 			break;
 
+        //Yuanguo: 计算当前transaction的size；
 		calc_trans_blks(hdr->th_tot_ents, hdr->th_tot_payload, blk_bytes, &blk_desc);
 
 		if (blk_off + blk_desc.bd_blks > max_blks) {
+            //Yuanguo: 当前transaction的size超过了buf中的数据；
+            //   若是第1个transaction，肯定是transaction太大了(写入时保证不可能，所以是corrupted)
+            //   否则，肯定是16MiB buf的尾巴(前面的transaction已经被replay)，丢弃(memset 0)，从当前transaction(tx_id)load数据；
 			if (blk_off == 0) {
 				D_ERROR("Too large tx, the WAL is corrupted\n");
 				rc = -DER_INVAL;
@@ -1776,16 +2107,25 @@ load_wal:
 
 		/* Bump last committed tx ID in WAL super info */
 		if (wal_id_cmp(si, tx_id, si->si_commit_id) > 0) {
+            //Yuanguo: 现在是进程/机器重启之后的replay过程，replay的transaction是
+            //  committed过的；commit它的时候，应该在super info的si_commit_id中记
+            //  录了它的id(后来可能又增大了)，所以应该满足:
+            //       tx_id <= si->si_commit_id
+            //  什么情况下会出现 tx_id > si->si_commit_id呢？
+            //  需要看transaction block的持久化和super info所在block的持久化是否原子。
 			si->si_commit_id = tx_id;
 			si->si_commit_blks = blk_desc.bd_blks;
 		}
+        //Yuanguo: 下一个transaction;
 		tx_id = wal_next_id(si, tx_id, blk_desc.bd_blks);
 
+        //Yuanguo: 一个transaction之后，刚好buf耗尽，继续load wal blob;
 		if (blk_off == max_blks) {
 			memset(buf, 0, max_blks * blk_bytes);
 			goto load_wal;
 		}
 
+        //Yuanguo: 为什么yield呢？wal没有replay完成，heap还没有恢复到最新状态，有什么别的事更紧急？
 		if (tight_loop >= 20) {
 			tight_loop = 0;
 			bio_yield(NULL);
@@ -1802,8 +2142,38 @@ out:
 	if (rc >= 0) {
 		D_DEBUG(DB_IO, "Replayed %u WAL transactions\n", nr_replayed);
 		D_ASSERT(si->si_commit_blks == 0 || wal_id_cmp(si, tx_id, si->si_commit_id) > 0);
+        //Yuanguo: 即使出现
+        //     - transaction block持久化
+        //     - 但last committed tx id(super info block)未持久化
+        //  的情况，前面也已经处理了(更新了si->si_commit_id和si->si_commit_blks)，
+        //  这里可以安全的预留下一个transaction的位置(id)了；
 		si->si_unused_id = wal_next_id(si, si->si_commit_id, si->si_commit_blks);
 
+        //Yuanguo: 注意，这里不是unmap刚刚replay过的transaction区域，而是unmap所有其它区域；
+        //  - 假如replay的区域是offset [1000 ~ 2000)，那么unmap的是 [2000 ~ wal结尾) + [wal开头 ~ 1000)
+        //  - 假如replay的区域是offset [5000 ~ wal结尾) + [wal开头 ~ 3000)，那么unmap的是 [3000 ~ 5000)
+        //
+        // 原因：
+        //                         Tx       Ty         T1         T2
+        //                    ...   |  有效  |   有效   |   无效   |    有效  |
+        //     断电重启前： ------------------------------------------------------->  wal
+        //
+        //               Ty之前的都已成功commit;
+        //               T1和T2都在commit进行中；
+        //               T2已经持久化，T1未持久化，也就是说，T1 和 T2 之间留下一个hole；
+        //
+        //     加电重启后：
+        //               replay到Ty结束；它是last committed tx;
+        //               si_unused_id指向T1;
+        //               这时commit一条transaction T3，其size刚好等于T1的size，即刚好把hole补上；
+        //               然后，又断电 ...
+        //
+        //     加电重启后：
+        //               这次replay: ..., Tx, Ty, T3, T2
+        //               错误：T2不应该被replay，它是stale的；
+        //
+        // 针对上述问题，replay transaction之后，立即unmap掉 “有效日志之外的区域”；
+        // 详见下面注释。
 		unmap_start = id2off(si->si_unused_id);
 		unmap_end = id2off(start_id);
 		/*

@@ -60,6 +60,11 @@ struct sys_db;
 /** Ensure this remains compatible */
 D_CASSERT(sizeof(((bio_addr_t *)0)->ba_off) == sizeof(umem_off_t));
 
+//Yuanguo: 描述一个DMA IO；
+// 对于NVMe:
+//     bi_buf      -->  DMA region的地址；
+//     bi_addr     -->  spdk blob内的对应地址；
+//     bi_data_len --> IO size；
 struct bio_iov {
 	/*
 	 * For SCM, it's direct memory address of 'ba_off';

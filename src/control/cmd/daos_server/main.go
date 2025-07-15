@@ -152,6 +152,14 @@ func parseOpts(args []string, opts *mainOpts, log *logging.LeveledLogger) error 
 			}
 		}
 
+		//Yuanguo:
+		//  - 强制把cmd转换成`interface{ initWith(initScmCmdFn) error }`类型；这个类型是：
+		//    任意实现了interface{ initWith(initScmCmdFn) error }的struct；
+		//  - 在storage_utils.go中，struct scmCmd 实现了这个interface (定义了函数`initWith(initScmCmdFn) error`);
+		//  - 所以，若cmd是*scmCmd类型，则强制转换成功；就调用它的`initWith(initScmCmdFn)`函数，传入参数`opts.scmInitHelper`；
+		//    这个参数又是一个函数指针，指向`storage_utils.go: initScmCmd`(见main()函数); 也就是调用:
+		//          scmInitCmd.initWith(initScmCmd)
+		//    对scmInitCmd(也就是cmd)产生副作用，即初始化cmd;
 		if scmInitCmd, ok := cmd.(interface{ initWith(initScmCmdFn) error }); ok {
 			if err := scmInitCmd.initWith(opts.scmInitHelper); err != nil {
 				return err
