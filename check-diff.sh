@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo "all changes"
-git diff 3f64a5454a52f4ee8e56ec22052136836e892ca0 \
+git diff 3f64a5454a52f4ee8e56ec22052136836e892ca0 ':!.gitignore' ':!ccls-linux' ':!check-diff.sh' \
     | grep ^[+-]                     \
     | egrep -v '^\+[[:space:]]*\/\/' \
     | egrep -v '^\+$'                \
