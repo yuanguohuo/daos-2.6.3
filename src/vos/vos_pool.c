@@ -1277,7 +1277,7 @@ vos_pool_create_ex(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_
 	}
 
     //Yuanguo:
-    //  对于persistent memory(MD-on-SSD是模拟的persistent memory)，机器重启之后，内存上存的数据在哪呢？
+    //  对于persistent memory(包括MD-on-SSD，它是模拟的persistent memory)，机器重启之后，内存上存的数据在哪呢？
     //  要访问内存上的数据，就需要一个root，通过这个root可达重启之前的所有内存数据(有点类似与Java虚拟
     //  机管理内存)。这个root存在于“已知的固定的位置”，相对于persistent memory的起始地址(起始地址每次
     //  重启可能mmap到不同地址)
@@ -1307,20 +1307,41 @@ vos_pool_create_ex(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_
 	if (rc != 0)
 		goto close;
 
-    //Yuanguo: 开始一个transaction.
-    //  对于pmem: pmem_tx_begin()
-    //  对于bmem: bmem_tx_begin()
+    //Yuanguo: 通过transaction修改持久化内存(包括MD-on-SSD):
+    //
+    //       step-1   :  创建transaction;
+    //       step-2   :  对要修改的ranges打snapshot，保存在transaction中，生成undo log;
+    //       step-3   :  修改ranges;
+    //       step-4.a :  commit: 生成redo log，并持久化；
+    //       step-4.b :  abort;
+    //
+    // MD-on-SSD容易理解，但为什么SCM也需要这样的操作呢？
+    // 因为SCM本身并不是transactional的，PMDK的基础库libpmem/libpmem2也不是transactional的；是libpmemobj库实现
+    // 的事物机制，实现方式也和MD-on-SSD一样：redo/undo log
+    // 其实MD-on-SSD事物机制(以及heap layout, slab等很大部分)是从libpmemobj拷贝的；
+
+    //Yuanguo: step-1: 创建transaction;
+    //  - pmem: pmem_tx_begin()
+    //  - bmem: bmem_tx_begin()
 	rc = umem_tx_begin(&umem, NULL);
 	if (rc != 0)
 		goto close;
 
-    //Yuanguo:
-    //  对于pmem: pmem_tx_add_ptr()
-    //  对于bmem: bmem_tx_add_ptr()
+    //Yuanguo: step-2: 对要修改的ranges打snapshot，保存在transaction中，生成undo log;
+    //  Takes a "snapshot" of the given memory region and saves it in the undo log.
+    //  The application is then free to directly modify the object in that memory
+    //  range.
+    //  In case of failure or abort, all the changes within this range will
+    //  be rolled-back automatically.
+    //  这里的range就是`pool_df`占的区域；
+    //
+    //  - pmem: pmem_tx_add_ptr()
+    //  - bmem: bmem_tx_add_ptr()
 	rc = umem_tx_add_ptr(&umem, pool_df, sizeof(*pool_df));
 	if (rc != 0)
 		goto end;
 
+    //Yuanguo:  step-3: 修改ranges;
 	memset(pool_df, 0, sizeof(*pool_df));
 	rc = dbtree_create_inplace(VOS_BTR_CONT_TABLE, 0, VOS_CONT_ORDER,
 				   &uma, &pool_df->pd_cont_root, &hdl);
@@ -1345,6 +1366,9 @@ end:
 	 * only when there is no memory, either due
 	 * to loss of power or no more memory in pool
 	 */
+    //Yuanguo:
+    //  step-4.a: commit: 生成redo log，并持久化；
+    //  step-4.b: abort;
 	if (rc == 0)
 		rc = umem_tx_commit(&umem);
 	else
@@ -1370,6 +1394,23 @@ end:
 		vea_compat |= VEA_COMPAT_FEATURE_BITMAP;
 
 	/* Format SPDK blob*/
+    //Yuanguo: 初始化 NVMe空间(spdk data blob) 管理器；
+    //  - The Versioned Block Allocator is used by VOS for managing blocks on NVMe SSD, it's basically an extent based block allocator specially designed for DAOS.
+    //    为什么叫VEA而不是VBA? 是Versioned Extent Allocator的缩写吗？
+    //  - The blocks allocated by VEA are used to store single value or array value in VOS.
+    //  - Since the address and size from each allocation is tracked in VOS index trees, the VEA allocation metadata tracks only free extents in a btree;
+    //  - more importantly, this allocation metadata is stored on SCM along with the VOS index trees, so that block allocation and index updating could be easily made
+    //    into single PMDK transaction, at the same time, the performance would be much better than storing the metadata on NVMe SSD.
+    //
+    // 如上所述，SCM (包括MD-on-SSD)中记录两类索引:
+    //  - VOS index;
+    //  - free extents;
+    //
+    // 分配data blob (NVMe)空间，写入key-value的value，在SCM中记录value的索引(VOS index)，从free extents中扣除；这些操作如何保证原子性呢？
+    //  1. 先在DRAM中记录分配的data blob空间 (transient reservation);
+    //  2. 通过RMDA往分配的data blob空间写入数据(key-value的value);
+    //  3. 通过同一个transaction更新VOS index和free extents;
+    // 就是比较常见的"delayed atomicity"方式；
 	rc = vea_format(&umem, vos_txd_get(flags & VOS_POF_SYSDB), &pool_df->pd_vea_df,
 			VOS_BLK_SZ, VOS_BLOB_HDR_BLKS, nvme_sz, vos_blob_format_cb,
 			&blob_hdr, false, vea_compat);

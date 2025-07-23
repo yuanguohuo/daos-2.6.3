@@ -254,6 +254,7 @@ struct vos_cont_df {
 	uint32_t			cd_pad;
 	daos_size_t			cd_used;
 	daos_epoch_t			cd_hae;
+    //Yuanguo: object index btree
 	struct btr_root			cd_obj_root;
 	/** reserved for placement algorithm upgrade */
 	uint64_t			cd_reserv_upgrade;

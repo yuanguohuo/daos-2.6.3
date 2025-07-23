@@ -49,6 +49,7 @@ struct tx_data {
 //  transactions可以嵌套，嵌套的transactions共用一个transaction id （其实就是一个transaction?)
 //  每层嵌套有一个struct tx_data对象，构成链表；
 //  最内层的transaction在最前；
+//  所以，outermost transaction的tx_entry是NULL;
 struct tx {
 	dav_obj_t *pop;
 	enum dav_tx_stage stage;
@@ -61,9 +62,8 @@ struct tx {
 	DAV_SLIST_HEAD(txd, tx_data) tx_entries;
 
     //Yuanguo:
-    //  使用一个avl-tree 维护current transaction修改的heap ranges;
-    //  一个range被第一次修改时，要生成undo log，即保留未修改时的状态，以便于回滚(abort);
-    //  其实是 Copy-On-Write (COW) 机制；
+    //  使用一个avl-tree保存current transaction修改的heap ranges的原状态，就是这些ranges的snapshot；
+    //  以便在transaction abort时回滚；就是undo log;
     //  详细逻辑见 dav_tx_add_common() 函数;
 	struct ravl *ranges;
 
@@ -781,6 +781,8 @@ dav_tx_commit(void)
 
 	struct tx_data *txd = DAV_SLIST_FIRST(&tx->tx_entries);
 
+    //Yuanguo: 见`struct tx`前的注释，tx_entries链表中，越内层的transaction越靠前，所以最外层transaction
+    //    的tx_entry的next为NULL；
 	if (DAV_SLIST_NEXT(txd, tx_entry) == NULL) {
 		/* this is the outermost transaction */
 
@@ -983,10 +985,9 @@ dav_tx_merge_flags(struct tx_range_def *dest, struct tx_range_def *merged)
  * into the transaction
  */
 //Yuanguo:
-//  使用一个avl-tree 维护current transaction修改的heap ranges;
-//  一个range被第一次修改时，要生成undo log，即保留未修改时的状态，以便于回滚(abort);
-//  其实是 Copy-On-Write (COW) 机制，这也是本函数中，snapshot变量名的来源(undo logs
-//  应该维护transaction之前的snapshot，以便回滚).
+//  使用一个avl-tree保存current transaction修改的heap ranges的原状态，就是这些ranges的snapshot；
+//  以便在transaction abort时回滚；就是undo log;
+//  显而易见，一个range只在第一次被修改时，才保存；
 static int
 dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 {
@@ -1037,12 +1038,12 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 		size_t rend = r.offset + r.size;
 
 		if (fend == 0 || fend < r.offset) {
-            //Yuanguo:
-            //  Case-1: 未找到右边紧跟着r的，或者左边和r overlap的
-            //  问题：为什么可能 fend != 0 && fend < r.offset ?
-            //  猜测：前面搜索时，p=RAVL_PREDICATE_LESS_EQUAL，可能返回小的:
-            //                            r: ================
+            //Yuanguo: Case1
+            //  未找到紧跟着r.end的，也未找到左边和r有verlap的.
+            //  问题：为什么可能 fend != 0 && fend < r.offset (如下)?
+            //                                 r: ================
             //      f: ===============
+            //  猜测：前面搜索时，p=RAVL_PREDICATE_LESS_EQUAL，可能返回小的:
 			/*
 			 * If found no range or the found range is not
 			 * overlapping or adjacent on the left side, we can just
@@ -1079,8 +1080,8 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 			ret = dav_tx_add_snapshot(tx, &r);
 			break;
 		} else if (fend <= rend) {
-            //Yuanguo: Case-2:
-            //  不满足Case-1，所以 fend != 0 && fend >= r.offset
+            //Yuanguo: Case2
+            //  不满足Case1，所以 fend != 0 && fend >= r.offset
             //       r: ================================
             //   f:=========================
             //          |    intersection   | snapshot |
@@ -1143,9 +1144,9 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 				ravl_remove(tx->ranges, nprev);
 			}
 		} else if (fend >= r.offset) {
-            //Yuanguo:
-            // 不满足Case-1，所以 fend != 0 && fend >= r.offset
-            // 不满足Case-2，所以 fend > rend
+            //Yuanguo: Case3
+            // 不满足Case1，所以 fend != 0 && fend >= r.offset
+            // 不满足Case2，所以 fend > rend
             //
             //              r: ======================
             //     f:  =========================================
@@ -1205,6 +1206,15 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
  * dav_tx_add_range_direct -- adds persistent memory range into the
  *					transaction
  */
+//Yuanguo: 等价于PMem的函数(见pmdk-2.1.0/include/libpmemobj/tx_base.h)
+//     int pmemobj_tx_add_range_direct(const void *ptr, size_t size);
+// 它的注释是：
+//     Takes a "snapshot" of the given memory region and saves it in the undo log.
+//     (Yuanguo: region就是参数ptr指向的大小为size的heap区域，在函数中使用struct tx_range_def类型表示)
+//     The application is then free to directly modify the object in that memory
+//     range.
+//     In case of failure or abort, all the changes within this range will
+//     be rolled-back automatically.
 int
 dav_tx_add_range_direct(const void *ptr, size_t size)
 {

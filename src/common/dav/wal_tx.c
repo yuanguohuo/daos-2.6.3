@@ -202,6 +202,10 @@ dav_wal_tx_reserve(struct dav_obj *hdl, uint64_t *id)
 /**
  * snapshot data from src to either wal redo log.
  */
+//Yuanguo: 针对被修改的内heap range
+//  - 把对应pages标记为dirty (umem_cache_touch)，为checkpoint做准备(checkpoint时，只把dirty pages flush到spdk meta blob)；
+//  - 生成一个UMEM_ACT_COPY_PTR或UMEM_ACT_COPY类型的redo log entry
+//  - 添加到struct dav_tx wt_redo链表尾；
 int
 dav_wal_tx_snap(void *hdl, void *addr, daos_size_t size, void *src, uint32_t flags)
 {

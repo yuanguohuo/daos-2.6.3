@@ -648,6 +648,9 @@ umem_tx_xadd_ptr(struct umem_instance *umm, void *ptr, size_t size,
 static inline int
 umem_tx_begin(struct umem_instance *umm, struct umem_tx_stage_data *txd)
 {
+    //Yuanguo:
+    //  pmem: pmem_tx_begin
+    //  bmem: bmem_tx_begin
 	if (umm->umm_ops->mo_tx_begin)
 		return umm->umm_ops->mo_tx_begin(umm, txd);
 	else
@@ -657,6 +660,9 @@ umem_tx_begin(struct umem_instance *umm, struct umem_tx_stage_data *txd)
 static inline int
 umem_tx_commit_ex(struct umem_instance *umm, void *data)
 {
+    //Yuanguo:
+    //  - pmem: pmem_tx_commit()
+    //  - bmem: bmem_tx_commit()
 	if (umm->umm_ops->mo_tx_commit)
 		return umm->umm_ops->mo_tx_commit(umm, data);
 	else
@@ -672,6 +678,9 @@ umem_tx_commit(struct umem_instance *umm)
 static inline int
 umem_tx_abort(struct umem_instance *umm, int err)
 {
+    //Yuanguo:
+    //  - pmem: pmem_tx_abort()
+    //  - bmem: bmem_tx_abort()
 	if (umm->umm_ops->mo_tx_abort)
 		return umm->umm_ops->mo_tx_abort(umm, err);
 	else

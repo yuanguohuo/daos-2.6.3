@@ -271,6 +271,16 @@ vos_oi_find_alloc(struct vos_container *cont, daos_unit_oid_t oid,
 	D_DEBUG(DB_TRACE, "Object "DF_UOID" not found adding it..\n",
 		DP_UOID(oid));
 
+    //Yuanguo:
+    //  val_iov在
+    //      dbtree_upsert() -> btr_upsert() -> btr_insert() -> btr_rec_alloc() -> oi_rec_alloc(..., val_iov, ...)
+    //  中被初始化为一个struct vos_obj_df对象的内存空间，在PMem(包括MD-on-SSD场景)中，val_iov.iov_buf是PMem地址的
+    //  映射地址；
+    //  在btree中存储的是
+    //      btr_record {
+    //          rec_off: val_iov.iov_buf地址的PMem表示；
+    //          rec_hkey: oid的hash值，但在本实现中，就是oid本身(可以认为h(x)=x也是一种hash)；
+    //      }
 	d_iov_set(&val_iov, NULL, 0);
 	d_iov_set(&key_iov, &oid, sizeof(oid));
 

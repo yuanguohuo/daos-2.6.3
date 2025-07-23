@@ -200,11 +200,20 @@ vea_format(struct umem_instance *umem, struct umem_tx_stage_data *txd, struct ve
 	/* Create free extent tree */
 	uma.uma_id = umem->umm_id;
 	uma.uma_pool = umem->umm_pool;
+    //Yuanguo:
+    //  - DBTREE_CLASS_IFV: IFV 代表 Integer-fixed-value pairs.
+    //        Each key is uint64_t integer, values have fixed size. Keys ordered numerically.
+    //  - BTR_FEAT_DIRECT_KEY: key is not hashed. User must provide to_key_cmp callback.
+    //  - VEA_TREE_ODR: 20, btree的order.
+    //  - uma: 内存信息，PMEM or BMEM, 以及mem pool指针
+    //  - md->vsd_free_tree: out参数，free extent tree的root
+    //  - free_btr: 操作btree (md->vsd_free_tree) 的handle，下面要操作它(插入第一个free extent，整个空间)
 	rc = dbtree_create_inplace(DBTREE_CLASS_IFV, BTR_FEAT_DIRECT_KEY, VEA_TREE_ODR, &uma,
 				   &md->vsd_free_tree, &free_btr);
 	if (rc != 0)
 		goto out;
 
+    //Yuanguo: 初始状态，整个空间(offset是hdr_blks，即从header之后开始，size为tot_blks)作为一个free extent；
 	/* Insert the initial free extent */
 	free_ext.vfe_blk_off = hdr_blks;
 	free_ext.vfe_blk_cnt = tot_blks;

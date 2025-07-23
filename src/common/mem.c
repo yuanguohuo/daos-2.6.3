@@ -37,6 +37,29 @@ struct umem_tx_stage_item {
 static int daos_md_backend = DAOS_MD_PMEM;
 #define UMM_SLABS_CNT 16
 
+//Yuanguo: 通过transaction修改持久化内存(包括MD-on-SSD):
+//
+//       step-1   :  创建transaction;
+//       step-2   :  对要修改的ranges打snapshot，保存在transaction中，生成undo log;
+//       step-3   :  修改ranges;
+//       step-4.a :  commit: 生成redo log，并持久化；
+//       step-4.b :  abort;
+//
+// 一个例子是：vos_pool.c : vos_pool_create_ex()
+//
+//       umem_tx_begin( ... );
+//       umem_tx_add_ptr( ... );
+//       修改ranges
+//       if (rc == 0)
+//           rc = umem_tx_commit(&umem);
+//       else
+//           rc = umem_tx_abort(&umem, rc);
+//
+// MD-on-SSD容易理解，但为什么SCM也需要这样的操作呢？
+// 因为SCM本身并不是transactional的，PMDK的基础库libpmem/libpmem2也不是transactional的；是libpmemobj库实现
+// 的事物机制，实现方式也和MD-on-SSD一样：redo/undo log
+// 其实MD-on-SSD事物机制(以及heap layout, slab等很大部分)是从libpmemobj拷贝的；
+
 /** Initializes global settings for the pmem objects.
  *
  *  \param	md_on_ssd[IN]	Boolean indicating if MD-on-SSD is enabled.
@@ -2055,7 +2078,8 @@ umem_cache_unpin(struct umem_store *store, umem_off_t addr, daos_size_t size)
 #define UMEM_CHUNK_IDX_BITS  (1 << UMEM_CHUNK_IDX_SHIFT)
 #define UMEM_CHUNK_IDX_MASK  (UMEM_CHUNK_IDX_BITS - 1)
 
-//Yuanguo: 把CachePage内的一个cache-chunk标记为dirty;
+//Yuanguo: 把CachePage内的一个cache-chunk标记为dirty; 为checkpoint做准备；
+//  checkpoint时，只把dirty cache-chunk flush到spdk meta blob；
 static inline void
 touch_page(struct umem_store *store, struct umem_page_info *pinfo, uint64_t wr_tx,
 	   umem_off_t first_byte, umem_off_t last_byte)

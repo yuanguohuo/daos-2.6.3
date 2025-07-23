@@ -131,6 +131,15 @@ struct btr_context {
 	struct btr_instance		 tc_tins;
 	/** embedded iterator */
 	struct btr_iterator		 tc_itr;
+
+    //Yuanguo: embedded value情况下，tc_tins.ti_root->tr_node指向的不是一个struct btr_node对象，
+    //  而是"真实数据"(以object index B+树为例，真实数据就是一个struct vos_obj_df对象)，缺失了
+    //  B+Tree record的概念；
+    //  所以使用下面的 `tc_record` 和 `tc_hkey` 来辅助处理embedded value，相当于tc_record(tc_hkey)
+    //  是 embedded record，它的value在tc_tins.ti_root->tr_node处；
+    //
+    //  注意：tc_record和tc_hkey必须连续；tc_record的union rec_hkey[0]/rec_ukey[0]/rec_node[0]的
+    //  空间是tc_hkey;
 	/** embedded fake record for the purpose of handling embedded value */
 	struct btr_record                tc_record;
 	/** This provides space for the hkey for the fake record */
@@ -138,6 +147,9 @@ struct btr_context {
 	/** cached configured tree order */
 	uint16_t			 tc_order;
 	/** cached tree depth, avoid loading from slow memory */
+    //Yuanguo: 因为是B+Tree，inner节点不保存数据，数据只在leaf节点中，所以probe(lookup)操作若成功，
+    //  则tc_trace.ti_trace数组(lookup经过的path)的长度一定是tc_depth (从root到leaf)；tc_depth-1是
+    //  最后一个trace对象，指向结果record；见dbtree_fetch()函数。
 	uint16_t			 tc_depth;
 	/** credits for drain, see dbtree_drain */
 	uint32_t                         tc_creds    : 30;
@@ -162,22 +174,28 @@ struct btr_context {
 	/** trace buffer */
     //Yuanguo:
     //
-    //    low addr |  ......              |
-    //             +----------------------+ <-- tc_trace.ti_trace
-    //       |     |  struct btr_trace    |
-    //       |     +----------------------+
-    //       |     |  struct btr_trace    |
-    //       V     +----------------------+
-    //             |  struct btr_trace    |
-    //   high addr +----------------------+ <-- current op的trace
-    //             |  struct btr_trace    |
+    // low addr    |  ......              |
     //             +----------------------+
-    //             |  ......              |
+    //     |       |  struct btr_trace    |
+    //     |       +----------------------+
+    //     |       |  struct btr_trace    |
+    //     |       +----------------------+
+    //     |       |  struct btr_trace    | <-- current op的path起点(tc_trace.ti_trace)
+    //     |       +----------------------+
+    //     |       |  struct btr_trace    |
+    //     |       +----------------------+
+    //     V       |  struct btr_trace    |
+    //             +----------------------+
+    // high addr   |  struct btr_trace    | <-- current op的path的终点
+    //             +----------------------+
     //
-    //  - tc_traces存的是各层(从root到当前操作的层)内的位置；就是lookup过程走的路径；
-    //  - tc_trace.ti_trace指向root；
-    //  - 所以 current op的trace >= tc_trace.ti_trace；指针直接比较，比较地址高低；见btr_node_split_and_insert()
-    //  - 所以，当前操作的层 level = current op的trace - tc_trace.ti_trace；指针直接相减，结果是间隔的元素的个数；见btr_node_split_and_insert()
+    //  - tc_traces用于存储probe(lookup)过程走的path；注意：path不一定从tc_traces[0]开始，即tc_trace.ti_trace不一定指向tc_traces[0]。
+    //    猜测：可能为了支持嵌套op，类似于函数调用形成的frames；
+    //  - current op的path的终点trace >= tc_trace.ti_trace(指针直接比较，比较地址高低)一定成立，见btr_node_split_and_insert函数中的assert;
+    //  - 若path起点(tc_trace.ti_trace)是btree的root，那么：当前op的level = current op的path的终点trace - tc_trace.ti_trace；
+    //    指针直接相减，结果是间隔的元素的个数；见btr_node_split_and_insert()
+    //  - 查询操作dbtree_fetch()：若查询成功，则结果一定在leaf节点(B+Tree的性质)，path的长度就是树的深度(从root到leaf)， 所以终点trace就是
+    //    `tc_trace.ti_trace[tc_depth - 1]`，指向结果record;
 	struct btr_trace		 tc_traces[BTR_TRACE_MAX];
 };
 
@@ -586,6 +604,8 @@ btr_hkey_gen(struct btr_context *tcx, d_iov_t *key, void *hkey)
 		hkey_int_gen(key, hkey);
 		return;
 	}
+    //Yuanguo:
+    //  对于object index btree (OI table): oi_hkey_gen()
 	btr_ops(tcx)->to_hkey_gen(&tcx->tc_tins, key, hkey);
 }
 
@@ -647,6 +667,8 @@ btr_rec_alloc(struct btr_context *tcx, d_iov_t *key, d_iov_t *val,
 		return -DER_KEY2BIG;
 	}
 
+    //Yuanguo:
+    //  - 对于object index tree (OI table): oi_rec_alloc()
 	return btr_ops(tcx)->to_rec_alloc(&tcx->tc_tins, key, val, rec, val_out);
 }
 
@@ -820,6 +842,7 @@ btr_node_rec_at(struct btr_context *tcx, umem_off_t nd_off,
 	struct btr_node *nd = btr_off2ptr(tcx, nd_off);
 	char		*addr = (char *)&nd[1];
 
+    //Yuanguo: 返回tn_recs[at]
 	return (struct btr_record *)&addr[btr_rec_size(tcx) * at];
 }
 
@@ -1081,8 +1104,10 @@ btr_root_start(struct btr_context *tcx, struct btr_record *rec, d_iov_t *key, bo
 		 *  must calculate the compare the hashed values.
 		 */
 		if (!btr_is_direct_key(tcx)) {
+            //Yuanguo: 计算new key (参数`key`) 的hash；
 			btr_hkey_gen(tcx, key, &rec->rec_hkey[0]);
 
+            //Yuanguo: 计算embedded key的hash;
 			rc = btr_embedded_create_hash(tcx, false);
 			if (rc != 0)
 				return rc;
@@ -1326,11 +1351,11 @@ btr_node_insert_rec_only(struct btr_context *tcx, struct btr_trace *trace,
 	if (nd->tn_keyn > 0) {
 		struct btr_check_alb	alb;
 
-        //Yuanguo: 看看能不能复用record;
+        //Yuanguo: 看能不能复用record;
         //  - trace->tr_at != nd->tn_keyn:
         //          目标位置指向中间某个record，那就测这个record可不可以复用；
         //  - 否则trace->tr_at == nd->tn_keyn：
-        //          目标位置不指向某个record，而是指向last-record之后的空白位置，那就测能否复用last-record;
+        //          目标位置不指向某个record，而是指向last record之后的空白位置，那就测能否复用last record;
 		if (trace->tr_at != nd->tn_keyn)
 			alb.at = trace->tr_at;
 		else
@@ -1587,12 +1612,14 @@ btr_node_split_and_insert(struct btr_context *tcx, struct btr_trace *trace,
 	 */
     //Yuanguo: 前面rec_src处的record已被拷贝到右节点的tn_child，
     //  btr_rec_at(tcx, rec_src, 1)是找它后面的那个record；
+    //  即从rec_src[1]开始拷贝，因为rec_src[0]拷贝奥tn_child上了；
 	btr_rec_copy(tcx, rec_dst, btr_rec_at(tcx, rec_src, 1),
 		     nd_right->tn_keyn);
 
 	/* backup it because the below btr_node_insert_rec_only may
 	 * overwrite it.
 	 */
+    //Yuanguo: rec_src现在就是右节点的first child
 	btr_hkey_copy(tcx, &hkey_buf[0], &rec_src->rec_hkey[0]);
 
     //Yuanguo: 现在已经分裂完成，insert *rec记录；
@@ -1601,6 +1628,7 @@ btr_node_split_and_insert(struct btr_context *tcx, struct btr_trace *trace,
 	if (rc)
 		return rc;
 
+    //Yuanguo: 递归向上时，始终保持 rec 是右节点的first child
 	btr_hkey_copy(tcx, &rec->rec_hkey[0], &hkey_buf[0]);
 
     //递归向上
@@ -2357,6 +2385,9 @@ dbtree_fetch(daos_handle_t toh, dbtree_probe_opc_t opc, uint32_t intent,
 		break;
 	}
 
+    //Yuanguo: 因为是B+Tree，inner节点不保存数据，数据只在leaf节点中，所以probe(lookup)操作若成功，
+    //  则tc_trace.ti_trace数组(lookup经过的path)的长度一定是tc_depth (从root到leaf)；tc_depth-1是
+    //  最后一个trace对象，指向结果record；
 	rec = btr_trace2rec(tcx, tcx->tc_depth - 1);
 
 	return btr_rec_fetch(tcx, rec, key_out, val_out);
@@ -2562,6 +2593,7 @@ btr_insert(struct btr_context *tcx, d_iov_t *key, d_iov_t *val, d_iov_t *val_out
 	if (D_LOG_ENABLED(DB_TRACE))
 		rec_str = btr_rec_string(tcx, rec, true, str, BTR_PRINT_BUF);
 
+    //Yuanguo: btr_upsert()调用本函数之前，已经调用过btr_probe，所以 tcx->tc_trace.ti_trace 已经指向目标位置；
 	if (tcx->tc_depth != 0 && !btr_has_embedded_value(tcx)) {
 		struct btr_trace *trace;
 
