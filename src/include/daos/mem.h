@@ -614,6 +614,9 @@ static inline int
 umem_tx_xadd_range(struct umem_instance *umm, umem_off_t umoff, uint64_t offset,
 		   size_t size, uint64_t flags)
 {
+	//Yuanguo:
+	//  pmem: pmem_tx_xadd
+	//  bmem: bmem_tx_xadd
 	if (umm->umm_ops->mo_tx_xadd)
 		return umm->umm_ops->mo_tx_xadd(umm, umoff, offset, size,
 						flags);

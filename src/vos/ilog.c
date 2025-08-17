@@ -34,6 +34,12 @@ enum {
  *  The tree is used more like a set where only the key is used.
  */
 
+//Yuanguo:
+//  上面注释中说ilog (incarnation log) 使用b+tree实现，但代码是一个array，
+//  应该是代码更新了，注释是过时的、错误的；
+//    - it_embedded=true  ：struct ilog_root::lr_id有效，ilog只有这一条entry;
+//    - it_embedded=false ：struct ilog_root::lr_tree.it_root有效，指向一个array;
+
 struct ilog_tree {
 	umem_off_t	it_root;
 	uint64_t	it_embedded;
@@ -116,6 +122,8 @@ ilog_is_same_tx(struct ilog_context *lctx, const struct ilog_id *id, bool *same)
 	if (!cbs->dc_is_same_tx_cb)
 		return 0;
 
+    //Yuanguo: for vos ilog, see vos_ilog_desc_cbs_init()
+    //    cbs->dc_is_same_tx_cb = vos_ilog_is_same_tx
 	return cbs->dc_is_same_tx_cb(lctx->ic_umm, id->id_tx_id, id->id_epoch, same,
 				     cbs->dc_is_same_tx_args);
 }
@@ -195,6 +203,12 @@ ilog_init(void)
 	return 0;
 }
 
+//Yuanguo:
+//    magic:    low 4-bit
+//    version:  high 28-bit
+//    ILOG_MAGIC_MASK   = 0x 0000000F
+//    ILOG_VERSION_INC  = 0x 00000010
+//    ILOG_VERSION_MASK = 0x FFFFFFF0
 /* 4 bit magic number + version */
 #define ILOG_MAGIC		0x00000006
 #define ILOG_MAGIC_BITS		4
@@ -222,6 +236,8 @@ ilog_ver_inc(struct ilog_context *lctx)
 
 	D_ASSERT(ILOG_MAGIC_VALID(magic));
 
+	//Yuanguo: 若version达到最大值 FFFFFFFx， 则version = 0000001x (最小值)
+	//         否则, version递增1 (version递增1，magic递增16)
 	if ((magic & ILOG_VERSION_MASK) == ILOG_VERSION_MASK)
 		magic = (magic & ~ILOG_VERSION_MASK) + ILOG_VERSION_INC;
 	else
@@ -370,6 +386,8 @@ done:
 #define ilog_ptr_set(lctx, dest, src)	\
 	ilog_ptr_set_full(lctx, dest, src, sizeof(*(src)))
 
+//Yuanguo: 本函数只是设置了root(看作struct ilog_root类型)的lr_magic字段；
+// 并没有创建ilog array;
 int
 ilog_create(struct umem_instance *umm, struct ilog_df *root)
 {
@@ -385,6 +403,7 @@ ilog_create(struct umem_instance *umm, struct ilog_df *root)
 
 	tmp.lr_magic = ILOG_MAGIC + ILOG_VERSION_INC;
 
+	//Yuanguo: 等价于*((struct ilog_root*)root) = tmp，只不过通过transaction保证原子性；
 	rc = ilog_ptr_set(&lctx, root, &tmp);
 	lctx.ic_ver_inc = false;
 
@@ -440,6 +459,11 @@ ilog_close(daos_handle_t loh)
 	return 0;
 }
 
+//Yuanguo: 把ilog (incarnation log)的entries放到cache中(没有copy，只是通过指针指向):
+// 分为3种情况:
+//   - empty
+//   - multi-entries in array
+//   - single-embedded-entry
 static void
 ilog_log2cache(struct ilog_context *lctx, struct ilog_array_cache *cache)
 {
@@ -518,6 +542,14 @@ D_CASSERT(sizeof(struct ilog_array) + sizeof(struct ilog_id) * ILOG_ARRAY_INIT_N
 	  ILOG_ARRAY_CHUNK_SIZE);
 D_CASSERT(sizeof(struct ilog_id) * ILOG_ARRAY_APPEND_NR == ILOG_ARRAY_CHUNK_SIZE);
 
+//Yuanguo:
+//   - ilog有一个embedded entry (就是lctx->ic_root->lr_id)
+//   - 现在又要添加一个entry (参数id_in)
+// 本函数就是完成这个任务；具体过程是这样的：
+//   1. 分配一个array，64字节(ILOG_ARRAY_CHUNK_SIZE=64)的空间，包含一个struct ilog_array对象(16字节)和
+//      3(ILOG_ARRAY_INIT_NR=3)个struct ilog_id对象构成的数组(16*3=48字节)；
+//   2. 把embedded entry和新加entry放到数组的0和1两个位置；大的放后面小的放前面，见`if (root->lr_id.id_epoch > id_in->id_epoch)`
+//   3. 设置lr_tree.it_embedded = 0; 因为不再是embedded模式了；
 static int
 ilog_root_migrate(struct ilog_context *lctx, const struct ilog_id *id_in)
 {
@@ -568,6 +600,7 @@ ilog_root_migrate(struct ilog_context *lctx, const struct ilog_id *id_in)
 	tmp.lr_magic = ilog_ver_inc(lctx);
 	tmp.lr_ts_idx = root->lr_ts_idx;
 
+    //Yuanguo: 等价于*root = tmp; 只不过通过transaction保证原子性；
 	return ilog_ptr_set(lctx, root, &tmp);
 }
 
@@ -685,6 +718,10 @@ set_id:
 	return ilog_ptr_set(lctx, &id_out->id_value, &saved_id.id_value);
 }
 
+//Yuanguo: 把ilog (incarnation log) 重置为
+//   - 空 (i == -1)
+//   - single-embedded-entry (i != -1); entry来自cache->ac_entries[i]
+// ilog原来的数组空间(lctx->ic_root->lr_tree.it_root)被释放(若有);
 static int
 reset_root(struct ilog_context *lctx, struct ilog_array_cache *cache, int i)
 {
@@ -702,11 +739,14 @@ reset_root(struct ilog_context *lctx, struct ilog_array_cache *cache, int i)
 
 
 	if (i != -1) {
+		//Yuanguo: 这里设置了tmp.lr_id，所以应该是embedded模式，为什么没有设置tmp.lr_tree.it_embedded 为 非0 呢？
+		//  因为tmp.lr_tree.it_embedded 和 tmp.lr_id.id_epoch 是相同内存空间，设置了后者就是设置了前者(非0)；
 		tmp.lr_id.id_value = cache->ac_entries[i].id_value;
 		tmp.lr_id.id_epoch = cache->ac_entries[i].id_epoch;
 		tmp.lr_ts_idx = lctx->ic_root->lr_ts_idx;
 	}
 
+	//Yuanguo: 等价于 *lctx->ic_root = tmp; 只不过通过transaction保证原子性；
 	rc = ilog_ptr_set(lctx, lctx->ic_root, &tmp);
 	if (rc != 0)
 		return rc;
@@ -752,6 +792,7 @@ remove_entry(struct ilog_context *lctx, struct ilog_array_cache *cache, int i)
 	return ilog_ptr_set(lctx, &array->ia_len, &new_len);
 }
 
+//Yuanguo: ilog最初可能被设计为一个btree，后来改成array，函数名应该是不准确的；
 static int
 ilog_tree_modify(struct ilog_context *lctx, const struct ilog_id *id_in,
 		 const daos_epoch_range_t *epr, int opc)
@@ -784,9 +825,11 @@ ilog_tree_modify(struct ilog_context *lctx, const struct ilog_id *id_in,
 			D_DEBUG(DB_TRACE, "No entry found, done\n");
 			return 0;
 		}
+		//Yuanguo: 全都大于*id_in，把*id_in 插入到数组开头 (i为-1);
 		goto insert;
 	}
 
+	//Yuanguo: i >= 0，cache.ac_entries[i] (id_out) <= *id_in；i后面的都大于*id_in；
 	id_out = &cache.ac_entries[i];
 
 	visibility = ILOG_UNCOMMITTED;
@@ -817,6 +860,8 @@ ilog_tree_modify(struct ilog_context *lctx, const struct ilog_id *id_in,
 	if (id_in->id_punch_minor_eph == 0 && visibility != ILOG_UNCOMMITTED &&
 	    id_out->id_update_minor_eph > id_out->id_punch_minor_eph)
 		return 0;
+//Yuanguo: 把`*id_in`插入到数组的对应位置；
+//  若数组已满，则重新分配更大的空间；
 insert:
 	rc = ilog_tx_begin(lctx);
 	if (rc != 0)

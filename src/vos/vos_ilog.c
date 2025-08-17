@@ -87,6 +87,7 @@ vos_ilog_del(struct umem_instance *umm, umem_off_t ilog_off, uint32_t tx_id,
 	return vos_dtx_deregister_record(umm, coh, tx_id, epoch, ilog_off);
 }
 
+//Yuanguo: coh是container handle，coh.cookie是指向struct vos_container对象的指针；
 void
 vos_ilog_desc_cbs_init(struct ilog_desc_cbs *cbs, daos_handle_t coh)
 {

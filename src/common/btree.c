@@ -4759,6 +4759,22 @@ btr_class_init(umem_off_t root_off, struct btr_root *root,
 	 * supported.  Rather than flagging an error just set the
 	 * appropriate flag.
 	 */
+    //Yuanguo:
+    //  修改后的*tree_feats将会被设置到btree实例；
+    //       dbtree_create_inplace_ex
+    //            btr_context_create
+    //                btr_class_init 这里修改*tree_feats
+    //            btr_tx_tree_init
+    //                btr_tree_init
+    //                    btr_root_init 这里复制到 root->tr_feats;
+    //
+    //  这里可能修改*tree_feats:
+    //    - 若class没设置BTR_FEAT_UINT_KEY 或 BTR_FEAT_DIRECT_KEY，那么对象肯定不会额外设置(因为special_feat=0, *tree_feats |= 0 不会变化)
+    //    - 若class设置了BTR_FEAT_UINT_KEY 或 BTR_FEAT_DIRECT_KEY:
+    //        - 创建btree实例时传来的*tree_feats也设置了：保持原状(因为下面if条件不满足)
+    //        - 创建btree实例时传来的*tree_feats没设置  ：取决于class是否定义了to_hkey_gen和to_hkey_size;
+    //            - 若没定义：则设置BTR_FEAT_UINT_KEY 或 BTR_FEAT_DIRECT_KEY，因为没有to_hkey_gen和to_hkey_size，只能是direct key或者uint key;
+    //            - 若定义了：则不设置BTR_FEAT_UINT_KEY 或 BTR_FEAT_DIRECT_KEY，因为有了to_hkey_gen和to_hkey_size，可以支持hashed key;
 	special_feat = tc->tc_feats & (BTR_FEAT_UINT_KEY | BTR_FEAT_DIRECT_KEY);
 	if (!(special_feat & *tree_feats) &&
 	    (tc->tc_ops->to_hkey_gen == NULL ||

@@ -69,6 +69,9 @@ oi_hkey_cmp(struct btr_instance *tins, struct btr_record *rec, void *hkey)
 	return dbtree_key_cmp_rc(memcmp(oid1, oid2, sizeof(*oid1)));
 }
 
+//Yuanguo: 本函数在PMem(包括MD-on-SSD)上创建object；
+// 注意object的dkey btree (obj->vo_tree)没有创建；
+// 看上去是lazy creating ... (需要的时候再创建)
 static int
 oi_rec_alloc(struct btr_instance *tins, d_iov_t *key_iov,
 	     d_iov_t *val_iov, struct btr_record *rec, d_iov_t *val_out)
@@ -271,25 +274,28 @@ vos_oi_find_alloc(struct vos_container *cont, daos_unit_oid_t oid,
 	D_DEBUG(DB_TRACE, "Object "DF_UOID" not found adding it..\n",
 		DP_UOID(oid));
 
-    //Yuanguo:
-    //  val_iov在
-    //      dbtree_upsert() -> btr_upsert() -> btr_insert() -> btr_rec_alloc() -> oi_rec_alloc(..., val_iov, ...)
-    //  中被初始化为一个struct vos_obj_df对象的内存空间，在PMem(包括MD-on-SSD场景)中，val_iov.iov_buf是PMem地址的
-    //  映射地址；
-    //  在btree中存储的是
-    //      btr_record {
-    //          rec_off: val_iov.iov_buf地址的PMem表示；
-    //          rec_hkey: oid的hash值，但在本实现中，就是oid本身(可以认为h(x)=x也是一种hash)；
-    //      }
 	d_iov_set(&val_iov, NULL, 0);
 	d_iov_set(&key_iov, &oid, sizeof(oid));
 
+	//Yuanguo: 在container的object index btree (cont->vc_btr_hdl) 中插入一个btr_record
+	//    {
+	//        .rec_off  = 指向struct vos_obj_df对象的指针(PMem表示，包括MD-on-SSD)
+	//        .rec_hkey = oid (本该是oid的hash值，但在本实现中，就是oid本身，可以认为h(x)=x也是一种hash)
+	//    }
+	// 其中
+	//   - .rec_off的初始化，见dbtree_upsert() -> btr_upsert() -> btr_insert() -> btr_rec_alloc() ->
+	//             oi_rec_alloc(..., key_iov, val_iov, ...)
+	//             key_iov参数就是这里的key_iov(oid);
+	//             val_iov参数就是这里的val_iov(NULL); 在oi_rec_alloc()中，它被初始化为指向struct vos_obj_df对象的指针(DRAM表示);
+	//   - .rec_hkey的初始化，见dbtree_upsert() -> btr_upsert() -> btr_insert() -> btr_hkey_gen() ->
+	//             oi_hkey_gen(..., key_iov, hkey);
 	rc = dbtree_upsert(cont->vc_btr_hdl, BTR_PROBE_EQ, DAOS_INTENT_DEFAULT,
 			   &key_iov, &val_iov, NULL);
 	if (rc) {
 		D_ERROR("Failed to update Key for Object index\n");
 		return rc;
 	}
+    //Yuanguo: 如上所述，val_iov.iov_buf已经被初始化为指向struct vos_obj_df对象的指针;
 	obj = val_iov.iov_buf;
 	/** Since we just allocated it, we can save a tx_add later to set this */
 	obj->vo_max_write = epoch;
@@ -300,11 +306,44 @@ do_log:
 	if (!log)
 		goto skip_log;
 	vos_ilog_desc_cbs_init(&cbs, vos_cont2hdl(cont));
+	//Yuanguo: 和很多别的资源一样，ilog的操作也需要一个handle；
+	// - create handle (open ilog); just like create file handle (open file)
+	// - operate ilog with handle;  just like read/write file with file handle;
+	// - close handle; just like close file;
+	//Yuanguo:
+	// 创建一个 struct ilog_context 对象 (通过&loh返回)
+	//        {
+	//            .ic_root        = &obj->vo_ilog;
+	//            .ic_cbs         = &cbs;
+	//            .ic_root_off    = ic_root的PMem表示；
+	//            .ic_umm         = vos_cont2umm(cont);
+	//            .ic_ref         = 1;
+	//            .ic_in_txn      = false;
+	//            .ic_ver_inc     = false;
+	//            .ic_fixed_epoch = (dth == NULL)   //operation with fixed epoch (rebuild, ec_agg, ec_rep, etc.)
+	//        }
+	// 这个对象就是操作current obj的ilog的handle (loh)；
+	// 下面ilog_update(loh, ...) 就是操作ilog; 操作完之后ilog_close(loh);
 	rc = ilog_open(vos_cont2umm(cont), &obj->vo_ilog, &cbs, dth == NULL, &loh);
 	D_ASSERTF(rc != -DER_NONEXIST, "Uncorrectable incarnation log corruption detected");
 	if (rc != 0)
 		return rc;
 
+	//Yuanguo:
+	// obj->vo_ilog是empty的；现在增加一条log entry (single-embedded)，obj->vo_ilog状态变为
+	//    struct ilog_root {
+	//    	    union {
+	//    	    	.lr_id = {  // single-embedded log entry
+	//                          .id_tx_id = 2,
+	//                          .id_epoch = epoch,
+	//                          .id_punch_minor_eph = 0,
+	//                          .id_update_minor_eph = dth->dth_op_seq 或 1
+	//                       };
+	//    	    	.lr_tree (无用)
+	//    	    };
+	//    	    .lr_ts_idx = 0
+	//    	    .lr_magic  = 2 << ILOG_MAGIC_BITS | ILOG_MAGIC
+	//    };
 	rc = ilog_update(loh, NULL, epoch,
 			 dtx_is_valid_handle(dth) ? dth->dth_op_seq : 1, false);
 

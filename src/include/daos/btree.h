@@ -56,14 +56,12 @@ struct btr_record {
 	 * - a structure includes both the variable-length key and value.
 	 * - a complex data structure under this record, e.g. a sub-tree.
 	 */
-    //Yuanguo: 两种情况
-    //  - 指向child的指针：
-    //  - 指向value的指针: 对应key的3种情况，value不同
-    //      - 若是variable-length/large key: 指向key-val-pair；这种情况下，类似于hashmap,
-    //        btree中排序的key是hash值(hashed key or hkey)，指向的是key-val-pair；
-    //        hash conflict如何处理？
-    //      - 若是uint64_t key: 指向value本身；
-    //      - 若是direct key (fixed-size-small-bytearray): 指向value本身；
+    //Yuanguo:
+    //  - inner节点 ：指向child的指针(memory ID)；
+    //  - leaf节点  ：指向body的指针(memory ID)；
+    //      - 对于hashed key类型的btree : body是variable-length/large key and value (包含key和value，因为rec_hkey不是real key)
+    //      - 对于uint key类型的btree   : body是value (key不必存在body中，因为rec_ukey就是real key)
+    //      - 对于direct key类型的btree : body是key and value (包含key和value，因为rec_node不是real key)
 	umem_off_t		rec_off;
 	/**
 	 * Fix-size key can be stored in if it is small enough (DAOS_HKEY_MAX),
@@ -76,12 +74,13 @@ struct btr_record {
 	 * When BTR_FEAT_DIRECT_KEY is used, we store the umem offset of the
 	 * relevant leaf node for direct key comparison
 	 */
-    //Yuanguo: record的key，在btree中有序(即使hash key，也是有序的)，有3种情况：
-    //  - 用户key是variable-length/large key: 这里存它的hash值(算法不同hash值的长度也不相同，但对于一颗btree是固定的)，key-val-pair由rec_off指向；
-    //  - 用户key是uint64_t: 这里就是uint64_t key
-    //  - 用户key是fixed-size-small-bytearray (direct key)，bytearray直接用于比较，决定顺序；
-    //      - leaf node：存储bytearray本身  (待确认)
-    //      - non-leaf-node: 存储指向leaf node的指针，避免冗余  (待确认)
+    //Yuanguo: record的key，在btree中有序(即使hash key，也是有序的)：
+    //
+    //  - 对于hashed key类型的btree : 使用rec_hkey，存储的是real key的hash值；
+    //  - 对于uint key类型的btree   : 使用rec_ukey，存储的是real key；
+    //  - 对于direct key类型的btree : 使用rec_node
+    //      - leaf节点  ：应该没有用，因为从body(rec_off指向的)可以获取到real key;
+    //      - inner节点 ：指向子孙leaf节点，从那里可以查询到本节点的real key;
 	union {
 		char			rec_hkey[0]; /* hashed key */
 		uint64_t		rec_ukey[0]; /* uint key */

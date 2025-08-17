@@ -410,6 +410,18 @@ daos_obj_set_oid(daos_obj_id_t *oid, enum daos_otype_t type,
 
 	/** XXX: encode nr_grps as-is for now */
 
+	//Yuanguo:
+	//  oid->hi的低32bit以及oid->lo(64bit)共96bit是用户设置的；
+	//  DAOS使用oid->hi的高32bit来记录object的一些特性；
+	//
+	//  oid->hi 的结构是这样的:
+	//     1B        1B           2B                         4B
+	//  +--------+--------+--------+--------+--------+--------+--------+--------+
+	//  |  type  |  ord   |     nr_grps     | ############ user filled #########|
+	//  +--------+--------+--------+--------+--------+--------+--------+--------+
+	//  high                                                                   low
+	//
+	//  这里是把oid->hi的高32bit先清零(当然，保留其低32bit不变，那是用户设置的)；
 	oid->hi &= (1ULL << OID_FMT_INTR_BITS) - 1;
 	/**
 	 * | Upper bits contain

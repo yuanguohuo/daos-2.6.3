@@ -324,6 +324,7 @@ vos_ilog_is_punched(daos_handle_t coh, struct ilog_df *ilog, const daos_epoch_ra
 static inline void
 vos_ilog_ts_ignore(struct umem_instance *umm, struct ilog_df *ilog)
 {
+    //Yuanguo: DAOS_ON_VALGRIND is true;
 	if (!DAOS_ON_VALGRIND)
 		return;
 

@@ -1341,8 +1341,9 @@ vos_pool_create_ex(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_
 	if (rc != 0)
 		goto end;
 
-    //Yuanguo:  step-3: 修改ranges;
+    //Yuanguo: step-3: 修改ranges;
 	memset(pool_df, 0, sizeof(*pool_df));
+    //Yuanguo: 创建container btree (container table)
 	rc = dbtree_create_inplace(VOS_BTR_CONT_TABLE, 0, VOS_CONT_ORDER,
 				   &uma, &pool_df->pd_cont_root, &hdl);
 	if (rc != 0)

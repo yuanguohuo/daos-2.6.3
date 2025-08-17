@@ -85,6 +85,8 @@ cont_df_rec_alloc(struct btr_instance *tins, d_iov_t *key_iov,
 
 	D_DEBUG(DB_DF, "Allocating container uuid=" DF_UUID "\n",
 		DP_UUID(ukey->uuid));
+	//Yuanguo: 在container btree中，btr_record的rec_off指向一个struct vos_cont_df对象；
+	//  rec_hkey就是container的uuid (见上面的cont_df_hkey_gen函数)
 	offset = umem_zalloc(&tins->ti_umm, sizeof(struct vos_cont_df));
 	if (UMOFF_IS_NULL(offset))
 		return -DER_NOSPACE;
@@ -92,6 +94,18 @@ cont_df_rec_alloc(struct btr_instance *tins, d_iov_t *key_iov,
 	cont_df = umem_off2ptr(&tins->ti_umm, offset);
 	uuid_copy(cont_df->cd_id, ukey->uuid);
 
+	//Yuanguo: 本函数的功能是创建一个container btree的btr_record，也就是一个container；
+	//  container包含一个object index btree，也叫object index table (OI table)，下面就是创建它。
+	//
+	//Yuanguo: 摘自文档
+	//  The container itself contains three indices.
+	//    - The first is an object index used to map an object ID and epoch to object metadata
+	//      efficiently when servicing I/O requests.
+	//    - The other two indices are for maintining active and committed DTX records for ensuring
+	//      efficient updates across multiple replicas.
+	//
+	// object index btree是创建在PMem(包括MD-on-SSD)上的；
+	// 另外两个创建在DRAM上，所以每次open container的时候创建，见vos_cont_open()函数。
 	rc = dbtree_create_inplace_ex(VOS_BTR_OBJ_TABLE, 0, VOS_OBJ_ORDER,
 				      &pool->vp_uma, &cont_df->cd_obj_root,
 				      DAOS_HDL_INVAL, pool, &hdl);
@@ -144,6 +158,10 @@ static btr_ops_t vct_ops = {
 	.to_rec_update  = cont_df_rec_update,
 };
 
+//Yuanguo: 找到对应的btr_record之后，回调
+//      cont_df_rec_fetch(..., val_iov);
+// 其中val_iov就是这里的args;
+// cont_df_rec_fetch()函数设置args->ca_cont_df，指向struct vos_cont_df对象，就是查找的目标；
 static int
 cont_df_lookup(struct vos_pool *vpool, struct d_uuid *ukey,
 	       struct cont_df_args *args)
@@ -159,6 +177,7 @@ cont_df_lookup(struct vos_pool *vpool, struct d_uuid *ukey,
  * Container cache secondary key
  * comparison
  */
+//Yuanguo: 比较vos pool的uuid
 bool
 cont_cmp(struct d_ulink *ulink, void *cmp_args)
 {
@@ -293,6 +312,10 @@ vos_cont_create(daos_handle_t poh, uuid_t co_uuid)
 	uuid_copy(ukey.uuid, co_uuid);
 	args.ca_pool = vpool;
 
+	//Yuanguo: 找到对应的btr_record之后，回调
+	//      cont_df_rec_fetch(..., val_iov);
+	// 其中val_iov就是这里的args;
+	// cont_df_rec_fetch()函数设置args->ca_cont_df，指向struct vos_cont_df对象，就是查找的目标；
 	rc = cont_df_lookup(vpool, &ukey, &args);
 	if (!rc) {
 		/* Check if attempt to reuse the same container uuid */
@@ -307,6 +330,18 @@ vos_cont_create(daos_handle_t poh, uuid_t co_uuid)
 	d_iov_set(&key, &ukey, sizeof(ukey));
 	d_iov_set(&value, &args, sizeof(args));
 
+	//Yuanguo: 在vos pool的container btree (vpool->vp_cont_th) 中插入一个btr_record
+	//   {
+	//       .rec_off  = 指向struct vos_cont_df对象的指针(PMem表示，包括MD-on-SSD)
+	//       .rec_hkey = container uuid (可以认为是container uuid的hash，hash函数是h(x)=x)
+	//   }
+	//
+	// 其中
+	//   - .rec_off的初始化，见dbtree_update() -> btr_upsert() -> btr_insert() -> btr_rec_alloc() ->
+	//             cont_df_rec_alloc(..., key_iov, val_iov, ...)
+	//     key_iov参数就是这里的key(uuid), val_iov就是value(args);
+	//   - .rec_hkey的初始化，见dbtree_update() -> btr_upsert() -> btr_insert() -> btr_hkey_gen() ->
+	//             cont_df_hkey_gen(..., key_iov, hkey);
 	rc = dbtree_update(vpool->vp_cont_th, &key, &value);
 
 	rc = umem_tx_end(vos_pool2umm(vpool), rc);
@@ -322,6 +357,11 @@ static const struct lru_callbacks lru_cont_cbs = {
 /**
  * Open a container within a VOSP
  */
+//Yuanguo:
+//  - [IN] poh  : vos pool的handle (struct vos_pool对象)
+//  - [OUT] coh : 返回的container handle(本质是一个struct vos_container对象);
+//                struct vos_container是container在DRAM中的表示；
+//  所以，本函数的主要任务就是创建一个 struct vos_container对象；
 int
 vos_cont_open(daos_handle_t poh, uuid_t co_uuid, daos_handle_t *coh)
 {
@@ -348,6 +388,7 @@ vos_cont_open(daos_handle_t poh, uuid_t co_uuid, daos_handle_t *coh)
 	 * Check if handle exists
 	 * then return the handle immediately
 	 */
+	//Yuanguo: 只被打开一次，即对一个vos pool，只创建一个struct vos_container，通过引用计数共享；
 	rc = cont_lookup(&ukey, &pkey, &cont, pool->vp_sysdb);
 	if (rc == 0) {
 		cont->vc_open_count++;
@@ -358,6 +399,8 @@ vos_cont_open(daos_handle_t poh, uuid_t co_uuid, daos_handle_t *coh)
 		D_GOTO(exit, rc);
 	}
 
+	//Yuanguo: 查找成功之后，回调cont_df_rec_fetch()函数，设置args->ca_cont_df，指向struct vos_cont_df对象，
+	//  就是查找的目标；
 	rc = cont_df_lookup(pool, &ukey, &args);
 	if (rc) {
 		D_DEBUG(DB_TRACE, DF_UUID" container does not exist\n",
@@ -395,6 +438,8 @@ vos_cont_open(daos_handle_t poh, uuid_t co_uuid, daos_handle_t *coh)
 		D_GOTO(exit, rc);
 	}
 
+	//Yuanguo: active DTX btree and committed DTX btree are on VMEM (DRAM), so
+	// they are created every time container is open;
 	memset(&uma, 0, sizeof(uma));
 	uma.uma_id = UMEM_CLASS_VMEM;
 
