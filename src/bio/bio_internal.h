@@ -401,7 +401,8 @@ struct bio_xs_context {
 	unsigned int		 bxc_self_polling:1;	/* for standalone VOS */
 };
 
-//Yuanguo: 一个struct bio_io_context对象表示对一个blob的一个open (类比fd)
+//Yuanguo: 一个struct bio_io_context对象表示对一个blob的一个open (类比fd)，或者说叫做blob
+//  的句柄/描述符；
 //  read/write操作需要它做参数(代表目标blob)， 类比文件read/write需要fd参数(代表目标文件)
 /* Per VOS instance I/O context */
 struct bio_io_context {
@@ -450,9 +451,12 @@ struct bio_rsrvd_dma {
 	unsigned int		  brd_chk_cnt;
 };
 
+//Yuanguo: SPDK blob I/O descriptor
 /* I/O descriptor */
 struct bio_desc {
 	struct umem_instance	*bd_umem;
+	//Yuanguo: struct bio_io_context* bd_ctxt描述对一个SPDK blob的open(相当于posix文件的fd)，
+	//  用于IO(read,write);
 	struct bio_io_context	*bd_ctxt;
 	/* DMA buffers reserved by this io descriptor */
 	struct bio_rsrvd_dma	 bd_rsrvd;

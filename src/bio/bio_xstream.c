@@ -1206,20 +1206,26 @@ is_role_match(unsigned int roles, unsigned int req_role)
 bool
 bio_nvme_configured(enum smd_dev_type type)
 {
-    //Yuanguo:
-    //    #cat /var/daos/config/daos_control/engine0/daos_nvme.conf
-    //    ...
-    //    "name": "Nvme_enss219546408046.cn5820_0_1_7",
-    //    ...
-    //
-    //    其中“Nvme_enss219546408046.cn5820_0_1_7”末尾的7，就是role，代表二进制111b:
-    //    表示此NVME同时用作DATA, META, WAL
-    //
-    //        #define NVME_ROLE_DATA	(1 << 0)
-    //        #define NVME_ROLE_META	(1 << 1)
-    //        #define NVME_ROLE_WAL		(1 << 2)
-    //
-    //    nvme_glb.bd_nvme_roles 就是所有NVME的role的bit-or;
+	//Yuanguo:
+	//    #cat /var/daos/config/daos_control/engine0/daos_nvme.conf
+	//    ...
+	//    "name": "Nvme_enss219546408046.cn5820_0_1_7",
+	//    ...
+	//
+	//    其中“Nvme_enss219546408046.cn5820_0_1_7”末尾的7，就是role，代表二进制111b:
+	//    表示此NVME同时用作DATA, META, WAL
+	//
+	//        #define NVME_ROLE_DATA	(1 << 0)
+	//        #define NVME_ROLE_META	(1 << 1)
+	//        #define NVME_ROLE_WAL		(1 << 2)
+	//
+	//    nvme_glb.bd_nvme_roles 就是所有NVME的role的bit-or;
+	//
+	//Yuanguo:
+	//    本函数经常被用于判断是否是MD-on-SSD:
+	//         假如nvme承担了meta的角色，那么一定是MD-on-SSD；
+	//         否则，不是MD-on-SSD
+	//    即： bio_nvme_configured(SMD_DEV_TYPE_META) 返回true，代表MD-on-SSD;
 	if (nvme_glb.bd_nvme_conf == NULL)
 		return false;
 

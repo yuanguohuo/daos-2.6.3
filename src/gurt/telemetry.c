@@ -269,6 +269,7 @@ new_shmem(key_t key, size_t size, struct d_tm_shmem_hdr **shmem)
 static int
 open_shmem(key_t key, struct d_tm_shmem_hdr **shmem)
 {
+	//Yuanguo: 这里是"打开"shm(由daos engine创建的)，而不是创建，所以size和flags都为0；
 	return attach_shmem(key, 0, 0, shmem);
 }
 
@@ -4034,6 +4035,10 @@ allocate_shared_memory(key_t key, size_t mem_size,
  *
  * \return		New context, or NULL if failure
  */
+//Yuanguo: id指定the telemetry region; telemetry region是什么呢？
+// - 命令"daos_metrics -S 1"(1是一个daos server上daos engine的id, 例如一个daos server有4个daos engine，则id可以是0,1,2,3)
+//   这里id就是1；
+// - 命令"daos_metrics -j jobid"中，id是DC_TM_JOB_ROOT_ID (=256)
 struct d_tm_context *
 d_tm_open(int id)
 {
@@ -4042,7 +4047,10 @@ d_tm_open(int id)
 	key_t			key;
 	int			shmid;
 
+	//Yuanguo: key = D_TM_SHARED_MEMORY_KEY + id
 	key = d_tm_get_srv_key(id);
+	//Yuanguo: 根据key查找Linux系统(本地)的System V shm id (返回值shmid)；然后attach到该shm，获得shm空间的地址(out参数addr);
+	//  shm空间里有root of metric tree;
 	shmid = open_shmem(key, &addr);
 	if (shmid < 0)
 		return NULL;

@@ -297,6 +297,13 @@ struct vos_pool {
 	struct bio_io_context	*vp_dummy_ioctxt;
 	/** In-memory free space tracking for NVMe device */
 	struct vea_space_info	*vp_vea_info;
+	//Yuanguo: 预留的空间（包括SCM,NVMe），用于
+	//  - gc，                                   见gc_reserve_space()
+	//  - aggregate，                            见agg_reserve_space()
+	//  - 处理碎片化（deal with fragmentation），见frag_reserve_space()
+	//  - additional memory (> 50% of remaining usable for INSTALLSNAPSHOT / staging log container), 见
+	//    rdb_open_internal() --> vos_pool_space_sys_set() --> vos_space_sys_set()
+	//    Yuanguo: 不明白，预留 > 50% 的剩余可用空间？
 	/** Reserved sys space (for space reclaim, rebuild, etc.) in bytes */
 	daos_size_t		vp_space_sys[DAOS_MEDIA_MAX];
 	/** Held space by in-flight updates. In bytes */
@@ -310,6 +317,7 @@ struct vos_pool {
 	/* The count of committed DTXs for the whole pool. */
 	uint32_t		 vp_dtx_committed_count;
 	/** Data threshold size */
+	//Yuanguo: 小于(严格小于，不是小于等于)vp_data_thresh的record extent写在SCM(PMEM/BMEM)上；
 	uint32_t		 vp_data_thresh;
 	/** Space (in percentage) reserved for rebuild */
 	unsigned int		 vp_space_rb;

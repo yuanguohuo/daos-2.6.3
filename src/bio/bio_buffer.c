@@ -266,22 +266,22 @@ bio_iod_alloc(struct bio_io_context *ctxt, struct umem_instance *umem,
 	D_ASSERT(ctxt != NULL);
 	D_ASSERT(sgl_cnt != 0);
 
-    //Yuanguo: offsetof(..., bd_sgls[3]) 其实是 "要分配的内存size"；例如sgl_cnt=3
-    //       +-----------------------+ <---- 0
-    //       |                       |     ^
-    //       |                       |     |
-    //       |                       |     |
-    //       |    struct bio_desc    |     |
-    //       |                       |     |
-    //       |                       |   要分配的内存size
-    //       |                       |     |
-    //       +-----------------------+     |
-    //       |   struct bio_sglist   |     |
-    //       +-----------------------+     |
-    //       |   struct bio_sglist   |     |
-    //       +-----------------------+     |
-    //       |   struct bio_sglist   |     V
-    //       +-----------------------+ <----  offsetof(..., bd_sgls[3])
+	//Yuanguo: offsetof(..., bd_sgls[3]) 其实是 "要分配的内存size"；例如sgl_cnt=3
+	//       +-----------------------+ <---- 0
+	//       |                       |     ^
+	//       |                       |     |
+	//       |                       |     |
+	//       |    struct bio_desc    |     |
+	//       |                       |     |
+	//       |                       |   要分配的内存size
+	//       |                       |     |
+	//       +-----------------------+     |
+	//       |   struct bio_sglist   |     |
+	//       +-----------------------+     |
+	//       |   struct bio_sglist   |     |
+	//       +-----------------------+     |
+	//       |   struct bio_sglist   |     V
+	//       +-----------------------+ <----  offsetof(..., bd_sgls[3])
 	D_ALLOC(biod, offsetof(struct bio_desc, bd_sgls[sgl_cnt]));
 	if (biod == NULL)
 		return NULL;
@@ -473,7 +473,11 @@ copy_one(struct bio_desc *biod, struct bio_iov *biov, void *data)
 {
 	struct bio_copy_args	*arg = data;
 	d_sg_list_t		*sgl;
-    //Yuanguo: addr就是DMA内存region;
+	//Yuanguo:
+	//  对于SCM ：        addr是SCM(PMEM/BMEM)上的数据的地址;
+	//                    对于flush/update操作，数据写到addr也就完成了；
+	//  对于NVMe(DMA IO)：addr是DMA内存region;
+	//                    对于flush/update操作，数据写到addr还需发起DMA操作；
 	void			*addr = bio_iov2req_buf(biov);
 	ssize_t			 size = bio_iov2req_len(biov);
 	uint16_t		 media = bio_iov2media(biov);
@@ -483,15 +487,15 @@ copy_one(struct bio_desc *biod, struct bio_iov *biov, void *data)
 
 	D_ASSERT(biod->bd_type < BIO_IOD_TYPE_GETBUF);
 	D_ASSERT(arg->ca_sgl_idx < arg->ca_sgl_cnt);
-    //Yuanguo: sgl是内存regions；对于flush操作，就是source regions的指针和size；
+	//Yuanguo: sgl是内存regions；对于flush操作，就是source regions的指针和size；
 	sgl = &arg->ca_sgls[arg->ca_sgl_idx];
 
 	while (arg->ca_iov_idx < sgl->sg_nr) {
-        //Yuanguo: 处理一个region的IO(对于flush操作，就是内存region -> nvme meta blob region)
+		//Yuanguo: 处理一个region的IO(对于flush操作，就是内存region -> nvme meta blob region)
 		d_iov_t *iov;
 		ssize_t nob, buf_len;
 
-        //Yuanguo: iov->iov_buf表示heap region，对于flush操作(bd_type=BIO_IOD_TYPE_UPDATE)是source数据；
+		//Yuanguo: iov->iov_buf表示heap region，对于flush操作(bd_type=BIO_IOD_TYPE_UPDATE)是source数据；
 		iov = &sgl->sg_iovs[arg->ca_iov_idx];
 		buf_len = (biod->bd_type == BIO_IOD_TYPE_UPDATE) ?
 					iov->iov_len : iov->iov_buf_len;
@@ -522,9 +526,14 @@ copy_one(struct bio_desc *biod, struct bio_iov *biov, void *data)
 		if (addr != NULL) {
 			D_DEBUG(DB_TRACE, "bio copy %p size %zd\n",
 				addr, nob);
-            //Yuanguo: 重要操作，heap region拷贝到DMA region (flush操作)
-            //  对于flush操作(bd_type=BIO_IOD_TYPE_UPDATE)，vos_meta_flush_prep()中分配了DMA region;
-            //  故addr != NULL成立；
+			//Yuanguo: 重要操作
+			//  对于NVMe (DMA IO):
+			//      - flush操作：heap region拷贝到DMA region
+			//        对于flush操作(bd_type=BIO_IOD_TYPE_UPDATE)，vos_meta_flush_prep()中分配了DMA region; 故addr != NULL成立；
+			//      - fetch操作：addr == NULL成立？
+			//  对于SCM:
+			//      - flush操作：heap region拷贝到SCM空间；
+			//      - fetch操作：addr == NULL成立？
 			bio_memcpy(biod, media, addr, iov->iov_buf +
 					arg->ca_iov_off, nob);
 			addr += nob;
@@ -905,36 +914,36 @@ dma_map_one(struct bio_desc *biod, struct bio_iov *biov, void *arg)
 	bdb = iod_dma_buf(biod);
 	dma_biov2pg(biov, &off, &end, &pg_cnt, &pg_off);
 
-    //Yuanguo:
-    //                   +----> +---------------+ <------+
-    //                   |      |               |        |
-    //                   |      |               |        |
-    //                   |      |   DMA reion   |        |
-    //                   |      |               |        |
-    //                   |      |               |        |
-    //                   |      |               |        |
-    //                   |      +---------------+        |
-    //           biov->bi_buf                          biod->bd_rsrvd
-    //                 bi_addr                           |
-    //                   |                               |
-    //                   +----> +---------------+ <------+
-    //                          |               |
-    //                          |               |
-    //                          |   nvme blob   |
-    //                          |     region    |
-    //                          |               |
-    //                          |               |
-    //                          +---------------+
-    //
-    //  本函数的主要任务是
-    //      - 分配DMA内存 (step-A)
-    //      - biov->bi_buf指向DMA region (step-C);
-    //      - 记录biod->bd_rsrvd (step-B.1和step-B.2)
-    //        这其实是在生成"DMA传输计划": 在biod->bd_rsrvd中记录source和destination(destination来自biov->bi_addr)
-    //
-    //  以flush为例(数据从heap region到nvme blob):
-    //      - 往DMA region拷贝数据时，使用biov->bi_buf，见vos_meta_flush_copy() -> bio_iod_copy()
-    //      - DMA数据传输时，使用biod->bd_rsrvd，见vos_meta_flush_post() -> bio_iod_post() -> dma_rw() -> nvme_rw()
+	//Yuanguo:
+	//                   +----> +---------------+ <------+
+	//                   |      |               |        |
+	//                   |      |               |        |
+	//                   |      |   DMA reion   |        |
+	//                   |      |               |        |
+	//                   |      |               |        |
+	//                   |      |               |        |
+	//                   |      +---------------+        |
+	//           biov->bi_buf                          biod->bd_rsrvd
+	//                 bi_addr                           |
+	//                   |                               |
+	//                   +----> +---------------+ <------+
+	//                          |               |
+	//                          |               |
+	//                          |   nvme blob   |
+	//                          |     region    |
+	//                          |               |
+	//                          |               |
+	//                          +---------------+
+	//
+	//  本函数的主要任务是
+	//      - 分配DMA内存 (step-A)
+	//      - biov->bi_buf指向DMA region (step-C);
+	//      - 记录biod->bd_rsrvd (step-B.1和step-B.2)
+	//        这其实是在生成"DMA传输计划": 在biod->bd_rsrvd中记录source和destination(destination来自biov->bi_addr)
+	//
+	//  以flush为例(数据从heap region到nvme blob):
+	//      - 往DMA region拷贝数据时，使用biov->bi_buf，见vos_meta_flush_copy() -> bio_iod_copy()
+	//      - DMA数据传输时，使用biod->bd_rsrvd，见vos_meta_flush_post() -> bio_iod_post() -> dma_rw() -> nvme_rw()
 
 	/*
 	 * For huge IOV, we'll bypass our per-xstream DMA buffer cache and
@@ -944,36 +953,36 @@ dma_map_one(struct bio_desc *biod, struct bio_iov *biov, void *arg)
 	 * We assume the contiguous huge IOV is quite rare, so there won't
 	 * be high contention over the SPDK huge page cache.
 	 */
-    //Yuanguo: IOV (IO的region) 比较大，分配SPDK预留DMA内存；
+	//Yuanguo: IOV (IO的region) 比较大，分配SPDK预留DMA内存；
 	if (pg_cnt > bio_chk_sz) {
-        //Yuanguo:
-        //  step-A: 分配SPDK预留的DMA chunk；
+		//Yuanguo:
+		//  step-A: 分配SPDK预留的DMA chunk；
 		chk = dma_alloc_chunk(pg_cnt);
 		if (chk == NULL)
 			return -DER_NOMEM;
 
 		chk->bdc_type = biod->bd_chk_type;
-        //Yuanguo:
-        //  step-B.1: 把DMA chunk记录到biod->bd_rsrvd;
+		//Yuanguo:
+		//  step-B.1: 把DMA chunk记录到biod->bd_rsrvd;
 		rc = iod_add_chunk(biod, chk);
 		if (rc) {
 			dma_free_chunk(chk);
 			return rc;
 		}
-        //Yuanguo:
-        //  step-C: biov->bi_buf指向DMA region (DMA chunk中的一部分);
+		//Yuanguo:
+		//  step-C: biov->bi_buf指向DMA region (DMA chunk中的一部分);
 		bio_iov_set_raw_buf(biov, chk->bdc_ptr + pg_off);
 		chk_pg_idx = 0;
 
 		D_DEBUG(DB_IO, "Huge chunk:%p[%p], cnt:%u, off:%u\n",
 			chk, chk->bdc_ptr, pg_cnt, pg_off);
 
-        //Yuanguo:
-        //  step-B.2: 把使用的DMA region (可能是DMA chunk的一部分) 记录到biod->bd_rsrvd;
+		//Yuanguo:
+		//  step-B.2: 把使用的DMA region (可能是DMA chunk的一部分) 记录到biod->bd_rsrvd;
 		goto add_region;
 	}
 
-    //Yuanguo: IO size不大...过程与上类似，只不过对于从哪分配DMA chunk，尝试了不同的方式...
+	//Yuanguo: IO size不大...过程与上类似，只不过对于从哪分配DMA chunk，尝试了不同的方式...
 
 	last_rg = iod_last_region(biod);
 
@@ -1307,6 +1316,12 @@ dma_rw(struct bio_desc *biod)
 		D_ASSERT(rg->brr_chk != NULL);
 		D_ASSERT(rg->brr_end > rg->brr_off);
 
+		//Yuanguo:
+		//  - 对于SCM: 
+		//    bio_iod_copy -> iterate_biov -> copy_one()中不是已经把数据拷贝
+		//    到SCM (biod->bd_sgls中的的struct bio_io的bi_buf) 了吗？这里拷贝
+		//    什么呢？ 答：这里是RDMA IO；普通的SCM IO应该是已经完成了；
+		//  - 对于NVMe: 发起DMA IO；
 		if (rg->brr_media == DAOS_MEDIA_SCM)
 			scm_rw(biod, rg);
 		else
@@ -1316,10 +1331,10 @@ dma_rw(struct bio_desc *biod)
 	D_ASSERT(biod->bd_inflights > 0);
 	biod->bd_inflights -= 1;
 
-    //Yuanguo: block等待完成；
-    //   - BIO_IOD_TYPE_FETCH : bd_async_post一定为false;
-    //   - BIO_IOD_TYPE_UPDATE: bd_async_post可能为true;
-    //见bio_iod_post_async()函数；
+	//Yuanguo: block等待完成；
+	//   - BIO_IOD_TYPE_FETCH : bd_async_post一定为false;
+	//   - BIO_IOD_TYPE_UPDATE: bd_async_post可能为true;
+	//见bio_iod_post_async()函数；
 	if (!biod->bd_async_post) {
 		iod_dma_wait(biod);
 		D_DEBUG(DB_IO, "Wait DMA done, type:%d\n", biod->bd_type);
@@ -1526,11 +1541,16 @@ iod_prep_internal(struct bio_desc *biod, unsigned int type, void *bulk_ctxt,
 		arg = &bulk_arg;
 	}
 
+	//Yuanguo: 对biod->bd_sgls中的每个struct bio_sglist中的每个struct bio_iov* biov调用：
+	//  - dma_map_one(biod, biov, NULL)   (若arg == NULL)
+	//      主要任务是分配一块DMA内存，记录到biov->bi_buf，同时记录到biod->bd_rsrvd;
+	//  - bulk_map_one(biod, biov, arg)   (若arg != NULL)
 	rc = iod_map_iovs(biod, arg);
 	if (rc)
 		return rc;
 
 	/* All direct SCM access, no DMA buffer prepared */
+	//Yuanguo: 没有NVMe IO，不需要DMA；
 	if (biod->bd_rsrvd.brd_rg_cnt == 0)
 		return 0;
 
@@ -1540,10 +1560,10 @@ iod_prep_internal(struct bio_desc *biod, unsigned int type, void *bulk_ctxt,
 		d_tm_set_gauge(bdb->bdb_stats.bds_active_iods, bdb->bdb_active_iods);
 
 	if (biod->bd_type < BIO_IOD_TYPE_GETBUF) {
-        //Yuanguo: In Argobots, an eventual corresponds to the traditional behavior of the future concept.
-        //  A ULT creates an eventual, which is a memory buffer that will eventually contain a value of interest.
-        //  Many ULTs can wait on the eventual (a blocking call), until one ULT signals on that future.
-        //  函数iod_dma_wait()用于等待eventual完成；
+		//Yuanguo: In Argobots, an eventual corresponds to the traditional behavior of the future concept.
+		//  A ULT creates an eventual, which is a memory buffer that will eventually contain a value of interest.
+		//  Many ULTs can wait on the eventual (a blocking call), until one ULT signals on that future.
+		//  函数iod_dma_wait()用于等待eventual完成；
 		rc = ABT_eventual_create(0, &biod->bd_dma_done);
 		if (rc != ABT_SUCCESS) {
 			rc = -DER_NOMEM;
@@ -1555,12 +1575,21 @@ iod_prep_internal(struct bio_desc *biod, unsigned int type, void *bulk_ctxt,
 	biod->bd_inflights = 0;
 	biod->bd_result = 0;
 
-    //Yuanguo:
-    //  对于读操作(BIO_IOD_TYPE_FETCH)
-    //    - 直接发起DMA
-    //    - 并block等待完成；biod->bd_async_post为false (只有BIO_IOD_TYPE_UPDATE时bd_async_post才可能为true，见bio_iod_post_async函数)
-    //  对于写操作(BIO_IOD_TYPE_UPDATE)
-    //    - 这里不发起DMA，DMA是在 bio_iod_post() 中发起的；
+	//Yuanguo:
+	//                   读(BIO_IOD_TYPE_FETCH)                 写(BIO_IOD_TYPE_UPDATE)
+	//  -------------------------------------------------------------------------------------------
+	//  bio_iod_prep     准备DMA buffer,发起DMA, 并等待完成     准备DMA buffer
+	//  -------------------------------------------------------------------------------------------
+	//  bio_iod_copy     把数据从DMA buffer拷贝到用户内存       把数据从用户内存拷贝到DMA buffer
+	//  -------------------------------------------------------------------------------------------
+	//  bio_iod_post     释放DMA buffer                         发起DMA，等待完成，并释放DMA buffer
+
+	//Yuanguo:
+	//  对于读操作(BIO_IOD_TYPE_FETCH)
+	//    - 直接发起DMA
+	//    - 并block等待完成；biod->bd_async_post为false (只有BIO_IOD_TYPE_UPDATE时bd_async_post才可能为true，见bio_iod_post_async函数)
+	//  对于写操作(BIO_IOD_TYPE_UPDATE)
+	//    - 这里不发起DMA，DMA是在 bio_iod_post() 中发起的；
 	/* Load data from media to buffer on read */
 	if (biod->bd_type == BIO_IOD_TYPE_FETCH)
 		dma_rw(biod);
@@ -1758,14 +1787,14 @@ bio_rwv(struct bio_io_context *ioctxt, struct bio_sglist *bsgl_in,
 		goto out;
 	}
 
-    //Yuanguo:
-    //                   读(BIO_IOD_TYPE_FETCH)                 写(BIO_IOD_TYPE_UPDATE)
-    //  -------------------------------------------------------------------------------------------
-    //  bio_iod_prep     准备DMA buffer,发起DMA, 并等待完成     准备DMA buffer
-    //  -------------------------------------------------------------------------------------------
-    //  bio_iod_copy     把数据从DMA buffer拷贝到用户内存       把数据从用户内存拷贝到DMA buffer
-    //  -------------------------------------------------------------------------------------------
-    //  bio_iod_post     释放DMA buffer                         发起DMA，等待完成，并释放DMA buffer
+	//Yuanguo:
+	//                   读(BIO_IOD_TYPE_FETCH)                 写(BIO_IOD_TYPE_UPDATE)
+	//  -------------------------------------------------------------------------------------------
+	//  bio_iod_prep     准备DMA buffer,发起DMA, 并等待完成     准备DMA buffer
+	//  -------------------------------------------------------------------------------------------
+	//  bio_iod_copy     把数据从DMA buffer拷贝到用户内存       把数据从用户内存拷贝到DMA buffer
+	//  -------------------------------------------------------------------------------------------
+	//  bio_iod_post     释放DMA buffer                         发起DMA，等待完成，并释放DMA buffer
 
 	/* map the biov to DMA safe buffer, fill DMA buffer if read operation */
 	rc = bio_iod_prep(biod, BIO_CHK_TYPE_LOCAL, NULL, 0);

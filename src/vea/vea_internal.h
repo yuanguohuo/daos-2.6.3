@@ -162,6 +162,7 @@ struct vea_metrics {
 
 #define MAX_FLUSH_FRAGS	256
 
+//Yuanguo: vea代表Versioned Block Allocator
 /* In-memory compound index */
 struct vea_space_info {
 	/* Instance for the pmemobj pool on SCM */

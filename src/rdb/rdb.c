@@ -296,6 +296,7 @@ rdb_open_internal(daos_handle_t pool, daos_handle_t mc, const uuid_t uuid, uint6
 	 * rdb here set aside additional memory, > 50% of remaining usable
 	 * for INSTALLSNAPSHOT / staging log container.
 	 */
+	//Yuanguo: 不明白，预留52%的剩余可用空间？
 	rc = vos_pool_query_space(db->d_uuid, &vps);
 	if (rc != 0) {
 		D_ERROR(DF_DB": failed to query vos pool space: "DF_RC"\n",

@@ -21,6 +21,12 @@
 #include <daos/mem.h>
 
 /** I/O context */
+//Yuanguo:
+// 1. 对于update:
+//     - 1个update操作包含1个dkey下的多个(ic_iod_nr个)akey; 当然不能包含多个dkey，因为不同dkey分布在不同的vos/daos_engine上；
+//     - 1个akey对应ic_iods中的一个元素，其中包含akey；
+//     - 1个akey在ic_biod中有一个bio_sglist(bd_sgls)与之对应(对于singe-value，bio_sglist(bd_sgls)只包含1个bio_iov，对于array-value包含多个)
+// 2. 对于fetch:
 struct vos_io_context {
 	EVT_ENT_ARRAY_LG_PTR(ic_ent_array);
 	/** The epoch bound including uncertainty */
@@ -28,11 +34,36 @@ struct vos_io_context {
 	daos_epoch_range_t	 ic_epr;
 	daos_unit_oid_t		 ic_oid;
 	struct vos_container	*ic_cont;
+	//Yuanguo: ic_iod_nr个akey; 通过ic_sgl_at索引（见iod_set_cursor()函数）；
 	daos_iod_t		*ic_iods;
 	struct dcs_iod_csums	*ic_iod_csums;
 	/** reference on the object */
 	struct vos_object	*ic_obj;
 	/** BIO descriptor, has ic_iod_nr SGLs */
+	//Yuanguo: ic_biod: SPDK blob I/O descriptor;
+	// 1. 对于update: 一个upate包含一个dkey下的ic_iod_nr个akey，对应这里ic_iod_nr个bio_sglist(bd_sgls);
+	//       +-----------------------+
+	//       |                       |
+	//       |                       |
+	//       |                       |
+	//       |    struct bio_desc    |
+	//       |                       |
+	//       |                       |
+	//       |                       |
+	//       +-----------------------+ <---- bd_sgls
+	//       |   struct bio_sglist   |     |
+	//       +-----------------------+     |
+	//       |   struct bio_sglist   |     |
+	//       +-----------------------+   ic_iod_nr个
+	//       |   ......              |     |
+	//       +-----------------------+     |
+	//       |   struct bio_sglist   |     V
+	//       +-----------------------+ <----
+	//
+	//       每个bio_sglist包含多少个bio_iov呢？
+	//         - single-value: 1个
+	//         - array-value:  record extent个数
+	// 2. 对于fetch:
 	struct bio_desc		*ic_biod;
 	struct vos_ts_set	*ic_ts_set;
 	/** Checksums for bio_iovs in \ic_biod */
@@ -44,6 +75,18 @@ struct vos_io_context {
 	/** cursor of SGL & IOV in BIO descriptor */
 	unsigned int		 ic_sgl_at;
 	unsigned int		 ic_iov_at;
+
+	//Yuanguo:
+	//  对dkey的一次update中，包含ic_iod_nr个akey，每个akey可能是single value也可能是
+	//  array value; 一个single-value-akey算1个record extent；一个array-value-akey包
+	//  含多个record extents;
+	//  每个record extents是一个action;
+	//  假设总共有total_acts个record extents(即total_acts个action)，下面：
+	//      - ic_rsrvd_scm (从PMEM/BMEM分配) : struct umem_rsrvd_act结构体后面跟total_acts个struct pobj_action
+	//                                         或struct dav_action对象；
+	//      - ic_umoffs    (从DRAM中分配)    : total_acts个元素的数组；
+	//  见vos_io.c : vos_ioc_create() --> vos_ioc_reserve_init()函数；
+
 	/** reserved SCM extents */
 	struct umem_rsrvd_act	*ic_rsrvd_scm;
 	/** reserved offsets for SCM update */
@@ -54,6 +97,8 @@ struct vos_io_context {
 	d_list_t		 ic_blk_exts;
 	daos_size_t		 ic_space_held[DAOS_MEDIA_MAX];
 	/** number DAOS IO descriptors */
+	//Yuanguo: 对于update而言，一个dkey update中，包含ic_iod_nr个akey，它们可以是
+	//single-value-akey和array-value-akey的任意组合；
 	unsigned int		 ic_iod_nr;
 	/** deduplication threshold size */
 	uint32_t		 ic_dedup_th;
@@ -727,7 +772,32 @@ vos_ioc_create(daos_handle_t coh, daos_unit_oid_t oid, bool read_only,
 		return 0;
 	}
 
+	//Yuanguo: bioc是SPDK blob句柄(描述符，代表对一个blob的open；类比file的fd);
 	bioc = vos_data_ioctxt(cont->vc_pool);
+	//Yuanguo: 分配SPDK blob I/O descriptor;
+	//例如update操作，一个upate包含一个dkey下的iod_nr个akey，这里就有iod_nr个
+	//bio_sglist(bd_sgls);
+	//       +-----------------------+
+	//       |                       |
+	//       |                       |
+	//       |                       |
+	//       |    struct bio_desc    |
+	//       |                       |
+	//       |                       |
+	//       |                       |
+	//       +-----------------------+ <---- bd_sgls
+	//       |   struct bio_sglist   |     |
+	//       +-----------------------+     |
+	//       |   struct bio_sglist   |     |
+	//       +-----------------------+   iod_nr个
+	//       |   ......              |     |
+	//       +-----------------------+     |
+	//       |   struct bio_sglist   |     V
+	//       +-----------------------+ <----
+	//每个bio_sglist包含多少个bio_iov呢？
+	//  - single-value: 1个
+	//  - array-value:  record extent个数
+	//见下面初始化bio_sglist;
 	ioc->ic_biod = bio_iod_alloc(bioc, vos_ioc2umm(ioc), iod_nr,
 			read_only ? BIO_IOD_TYPE_FETCH : BIO_IOD_TYPE_UPDATE);
 	if (ioc->ic_biod == NULL) {
@@ -739,6 +809,9 @@ vos_ioc_create(daos_handle_t coh, daos_unit_oid_t oid, bool read_only,
 	if (rc != 0)
 		goto error;
 
+	//Yuanguo: iods[i]代表一个akey，若是single value akey，则iod_nr必须为1；
+	//  否则，是array value akey，iod_nr等于IO中指定的record extent个数；
+	//  与这个akey对应的bio_sglist也分配iod_nr个元素(bio_iov);
 	for (i = 0; i < iod_nr; i++) {
 		int iov_nr = iods[i].iod_nr;
 		struct bio_sglist *bsgl;
@@ -2150,6 +2223,8 @@ iod_reserve(struct vos_io_context *ioc, struct bio_iov *biov)
 }
 
 /* Reserve single value record on specified media */
+//Yuanguo: 在SCM(PMEM/BMEM)或NVMe上分配payload空间；同时在SCM(PMEM/BMEM)上分配一个struct vos_irec_df结构，记录
+//  "payload空间在哪里"; struct vos_irec_df结构的起始地址保存在ioc->ic_umoffs[对应akey]中；
 static int
 vos_reserve_single(struct vos_io_context *ioc, uint16_t media,
 		   daos_size_t size)
@@ -2174,6 +2249,9 @@ vos_reserve_single(struct vos_io_context *ioc, uint16_t media,
 		vos_recx2irec_size(size, value_csum) :
 		vos_recx2irec_size(0, value_csum);
 
+	//Yuanguo: 无论media是不是DAOS_MEDIA_SCM，都要占一部分SCM;
+	//  DAOS_MEDIA_SCM:  scm_size包含struct vos_irec_df结构的空间和payload空间，下面不用再reserve了；
+	//  DAOS_MEDIA_NVME: scm_size包含struct vos_irec_df结构的空间，下面还要在NVME上reserve payload空间；
 	rc = reserve_space(ioc, DAOS_MEDIA_SCM, scm_size, &off);
 	if (rc) {
 		D_ERROR("Reserve SCM for SV failed. "DF_RC"\n", DP_RC(rc));
@@ -2181,7 +2259,10 @@ vos_reserve_single(struct vos_io_context *ioc, uint16_t media,
 	}
 
 	D_ASSERT(ioc->ic_umoffs_cnt > 0);
+	//Yuanguo: 上面reserve_space()刚刚在ioc->ic_umoffs[ioc->ic_umoffs_cnt - 1]处填了预留空间的起始地址；
+	//  所以umoff预留空间的起始地址，也就是struct vos_irec_df结构的地址；
 	umoff = ioc->ic_umoffs[ioc->ic_umoffs_cnt - 1];
+	//Yuanguo: irec是驻留在PMEM/BMEM上的结构，描述一个single value (DAOS_IOD_SINGLE类型的akey的value);
 	irec = (struct vos_irec_df *)umem_off2ptr(vos_ioc2umm(ioc), umoff);
 	vos_irec_init_csum(irec, value_csum);
 
@@ -2197,6 +2278,24 @@ vos_reserve_single(struct vos_io_context *ioc, uint16_t media,
 		/* Get the record payload offset */
 		payload_addr = vos_irec2data(irec);
 		D_ASSERT(payload_addr >= (char *)irec);
+		//Yuanguo: data也在SCM上；umoff是irec的地址；payload_addr - (char *)irec是irec的大小+csum大小；所以，off是payload的起始地址；
+		//     +------------------------------------+ <--  umoff (irec)
+		//     |                                    |
+		//     |                                    |
+		//     |         struct vos_irec_df         |
+		//     |                                    |
+		//     |                                    |
+		//     +------------------------------------+ <--  irec->ir_body
+		//     |                                    |
+		//     |             checksum               |
+		//     |                                    |
+		//     +------------------------------------+ <--  off (payload_addr)
+		//     |                                    |
+		//     |                                    |
+		//     |               data                 |
+		//     |                                    |
+		//     |                                    |
+		//     +------------------------------------+
 		off = umoff + (payload_addr - (char *)irec);
 	} else {
 		rc = reserve_space(ioc, DAOS_MEDIA_NVME, size, &off);
@@ -2209,11 +2308,18 @@ vos_reserve_single(struct vos_io_context *ioc, uint16_t media,
 done:
 	bio_addr_set(&biov.bi_addr, media, off);
 	bio_iov_set_len(&biov, size);
+	//Yuanguo: 无论media是SCM还是NVMe，biov都指向payload空间；
+	//  把它记录到ioc->ic_biod->bd_sgls(bio_sglist)中(akey对应的bio_sglist的bs_iovs[0]；对于single，只有一个iov)
+	//  ioc->ic_biod->bd_sgls(bio_sglist)将来用于DMA传输(待确认)；
+	//  元数据直接修改SCM了，所以bio_sglist不包括元数据部分；
 	rc = iod_reserve(ioc, &biov);
 
 	return rc;
 }
 
+//Yuanguo: 对于single value，有一个驻留在SCM(PMEM/BMEM)上的struct vos_irec_df结构来描述“真实payload在哪里”(可能在NVMe也可能SCM上)
+//  其地址保存在ioc->ic_umoffs[对应akey]中，见上面的vos_reserve_single函数；
+//  对应array value，没有这样一个结构，如何从元数据找到payload呢？
 static int
 vos_reserve_recx(struct vos_io_context *ioc, uint16_t media, daos_size_t size,
 		 struct dcs_csum_info *csum, daos_size_t csum_len)
@@ -2265,6 +2371,13 @@ done:
 	return rc;
 }
 
+//Yuanguo:
+//     - 1个update操作包含1个dkey下的多个(ic_iod_nr个)akey;
+//     - 1个akey对应ic_iods中的一个元素，其中包含akey；
+//     - 1个akey在ic_biod中有一个bio_sglist(bd_sgls)与之对应(对于singe-value，bio_sglist只包含1个bio_iov，对于array-value包含多个)
+//  dkey_update_begin() 调用本函数的时候，已经设置好ioc->ic_sgl_at，指向特定的akey (ic_iods[ioc->ic_sgl_at])
+//
+//  本函数的主要任务是reserve payload空间，记录到ioc->ic_biod->bd_sgls(对应当前akey的项)中；
 static int
 akey_update_begin(struct vos_io_context *ioc)
 {
@@ -2278,13 +2391,17 @@ akey_update_begin(struct vos_io_context *ioc)
 		return -DER_IO_INVAL;
 	}
 
+	//Yuanguo: for each record extent (single-value-akey看作1个record extent)
 	for (i = 0; i < iod->iod_nr; i++) {
 		daos_size_t size;
 		uint16_t media;
 
+		//Yuanguo: 对于single-value-akey: iod->iod_size；
+		//         对于array-value-akey:  当前record extent的record-nr * record-sz
 		size = (iod->iod_type == DAOS_IOD_SINGLE) ? iod->iod_size :
 				iod->iod_recxs[i].rx_nr * iod->iod_size;
 
+		//Yuanguo: 小于(严格小于，不是小于等于)vp_data_thresh的record extent写在SCM(PMEM/BMEM)上；
 		if (vos_io_scm(vos_cont2pool(ioc->ic_cont), iod->iod_type, size, VOS_IOS_GENERIC))
 			media = DAOS_MEDIA_SCM;
 		else
@@ -2850,6 +2967,15 @@ vos_obj_copy(struct vos_io_context *ioc, d_sg_list_t *sgls,
 {
 	int rc;
 
+	//Yuanguo:
+	//                   读(BIO_IOD_TYPE_FETCH)                 写(BIO_IOD_TYPE_UPDATE)
+	//  -------------------------------------------------------------------------------------------
+	//  bio_iod_prep     准备DMA buffer,发起DMA, 并等待完成     准备DMA buffer
+	//  -------------------------------------------------------------------------------------------
+	//  bio_iod_copy     把数据从DMA buffer拷贝到用户内存       把数据从用户内存拷贝到DMA buffer
+	//  -------------------------------------------------------------------------------------------
+	//  bio_iod_post     释放DMA buffer                         发起DMA，等待完成，并释放DMA buffer
+
 	D_ASSERT(sgl_nr == ioc->ic_iod_nr);
 	rc = bio_iod_prep(ioc->ic_biod, BIO_CHK_TYPE_IO, NULL, 0);
 	if (rc)
@@ -2880,6 +3006,9 @@ vos_obj_update_ex(daos_handle_t coh, daos_unit_oid_t oid, daos_epoch_t epoch,
 	}
 
 	if (sgls) {
+		//Yuanguo: 见vos_obj_copy -> bio_iod_copy -> iterate_biov -> copy_one
+		//  - 若涉及NVMe：通过DMA把数据写到NVMe SPDK blob;
+		//  - 否则全是SCM：把数据拷贝到SCM(PMEM/BMEM)
 		rc = vos_obj_copy(vos_ioh2ioc(ioh), sgls, iod_nr);
 		if (rc)
 			D_ERROR("Copy "DF_UOID" failed "DF_RC"\n", DP_UOID(oid),

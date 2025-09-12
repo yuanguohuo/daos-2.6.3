@@ -71,6 +71,9 @@ process_metrics(int metric_id, char *dirname, int format, int filter, int extra_
 	int                      iteration = 0;
 	int                      rc        = 0;
 
+	//Yuanguo: open并attach到共享内存(System V shm)；
+	//  shm是由daos_engine创建并维护的，里面存储metric tree的root（当然，通过root可以读取整个metric tree）;
+	//  root就是ctx->shmem_root->sh_root;
 	ctx = d_tm_open(metric_id);
 	if (!ctx)
 		D_GOTO(out, rc = 0);
@@ -120,6 +123,18 @@ iter_reset(struct d_tm_context *ctx, struct d_tm_node_t *node, int level, char *
 	d_tm_reset_node(ctx, node, level, path, format, opt_fields, (FILE *)arg);
 }
 
+//Yuanguo:
+//  daos_engine进程创建System V shm，并在其中维护metric tree;
+//  本工具attach到shm，并读取metric tree；
+//  可以通过--path指定tree的分支；
+//      daos_metrics -S 1 --path /started_at
+//      daos_metrics -S 1 --path /net
+//      daos_metrics -S 1 --path /mem
+//      daos_metrics -S 1 --path /mem/vos
+//      daos_metrics -S 1 --path /pool/{pool-id}/vos_space
+//      daos_metrics -S 1 --path /pool/{pool-id}/vos_space/scm_used
+//      daos_metrics -S 1 --path /pool/{pool-id}/vos_space/scm_total
+//  其中{pool-id}可以通过`dmg pool list -v`查询
 int
 main(int argc, char **argv)
 {

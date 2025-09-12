@@ -7,6 +7,11 @@ def scons():
 
     denv = env.Clone()
 
+    #Yuanguo: src/vos/SConscript中编译出2个版本的vos库：
+    #    /usr/lib64/daos_srv/libvos_srv.so  standalone = False
+    #    /usr/lib64/daos_srv/libvos.so      standalone = True
+    # 服务程序/usr/bin/daos_engine 链接前者；
+    # 这里是debug工具ddb，链接后者；
     libs = ['vos', 'daos_common_pmem', 'abt', 'gurt', 'uuid', 'bio', 'cart']
     # spdk libraries
     libs += ['spdk_event', 'spdk_log']

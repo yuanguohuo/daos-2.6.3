@@ -60,6 +60,11 @@ def scons():
 
     # Compiler options
     denv.Append(CPPDEFINES=['-DDAOS_PMEM_BUILD'])
+    #Yuanguo: 这里编译出2个版本的vos库：
+    #    /usr/lib64/daos_srv/libvos_srv.so  standalone = False
+    #    /usr/lib64/daos_srv/libvos.so      standalone = True
+    # 服务程序/usr/bin/daos_engine 链接前者；
+    # debug工具ddb (src/utils/ddb) 链接后者；
     build_vos(denv, False)
     build_vos(denv, True)
     build_vos_internal(denv)

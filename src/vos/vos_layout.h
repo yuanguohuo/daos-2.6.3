@@ -332,6 +332,7 @@ struct vos_krec_df {
  * Persisted VOS single value & epoch record, it is referenced by
  * btr_record::rec_off of btree VOS_BTR_SINGV.
  */
+//Yuanguo: 驻留在PMEM/BMEM上的结构，描述一个single value (DAOS_IOD_SINGLE类型的akey的value);
 struct vos_irec_df {
 	/** key checksum size (in bytes) */
 	uint16_t			ir_cs_size;
@@ -364,6 +365,9 @@ struct vos_irec_df {
  * VOS object, assume all objects are KV store...
  * NB: PMEM data structure.
  */
+//Yuanguo: 驻留在PMEM/BMEM上的object的描述结构；
+// vos_space.c : estimate_space ()函数预估一个object占多少空间，会
+// 把本结构体计算上；
 struct vos_obj_df {
 	daos_unit_oid_t			vo_id;
 	/** The latest sync epoch */

@@ -336,49 +336,49 @@ vos_meta_flush_prep(struct umem_store *store, struct umem_store_iod *iod, daos_h
 		return -DER_NOMEM;
 
 	bsgl = bio_iod_sgl(biod, 0);
-    //Yuanguo:
-    // - iod->io_regions是一个列表，有iod->io_nr项，每一项描述spdk meta blob上的一个region；
-    //   对于flush来说，它们是IO的destinations;
-    // - struct umem_checkpoint_data的cd_sg_list也是一个列表，和iod->io_regions一一对应，
-    //   它们描述的是heap regions；对于flush来说，这些heap regions是IO的sources;
-    //   (这里还用不到它们，vos_meta_flush_copy的时候才用到，cd_sg_list作为参数`sgl`传给它)
-    //
-    // struct bio_desc对象是bio的核心，它的bd_sgls是一个"列表的数组"，我们只考虑单个列表的情况，
-    // 即`bd_sgls[0]`是一个列表，也就是这里的`bsgl`指向的列表；它的项数和sources/destinations
-    // 项数一样(一一对应)；每一项包含IO操作的DMA region 和 meta blob上的region；
-    //
-    //  struct umem_checkpoint_data的cd_sg_list                              iod->io_regions
-    //              (heap regions)                (DMA regions)               (meta blob)
-    //
-    //         +---------------------+      +---------------------+       +---------------------+
-    //         |      region0        |      |                     |       |                     |
-    //         +---------------------+      +---------------------+       +---------------------+
-    //
-    //         +---------------------+      +---------------------+       +---------------------+
-    //         |                     |      |                     |       |                     |
-    //         |      region1        |      |                     |       |                     |
-    //         |                     |      |                     |       |                     |
-    //         +---------------------+      +---------------------+       +---------------------+
-    //
-    //         +---------------------+      +---------------------+       +---------------------+
-    //         |      region2        |      |                     |       |                     |
-    //         +---------------------+      +---------------------+       +---------------------+
-    //
-    // `bd_sgls[0]/bsgl`里的元素是struct bio_iov对象:
-    //      void*        bi_buf        ---> 指向DMA region；
-    //      bio_addr_t	 bi_addr       ---> 指向meta blob内的区间；
-	//      size_t       bi_data_len
-    //
-    // 这里初始化`bd_sgls[0]/bsgl`，即分配一个struct bio_iov对象数组，个数是iod->io_nr；
+  //Yuanguo:
+  // - iod->io_regions是一个列表，有iod->io_nr项，每一项描述spdk meta blob上的一个region；
+  //   对于flush来说，它们是IO的destinations;
+  // - struct umem_checkpoint_data的cd_sg_list也是一个列表，和iod->io_regions一一对应，
+  //   它们描述的是heap regions；对于flush来说，这些heap regions是IO的sources;
+  //   (这里还用不到它们，vos_meta_flush_copy的时候才用到，cd_sg_list作为参数`sgl`传给它)
+  //
+  // struct bio_desc对象是bio的核心，它的bd_sgls是一个"列表的数组"，我们只考虑单个列表的情况，
+  // 即`bd_sgls[0]`是一个列表，也就是这里的`bsgl`指向的列表；它的项数和sources/destinations
+  // 项数一样(一一对应)；每一项包含IO操作的DMA region 和 meta blob上的region；
+  //
+  //  struct umem_checkpoint_data的cd_sg_list                              iod->io_regions
+  //              (heap regions)                (DMA regions)               (meta blob)
+  //
+  //         +---------------------+      +---------------------+       +---------------------+
+  //         |      region0        |      |                     |       |                     |
+  //         +---------------------+      +---------------------+       +---------------------+
+  //
+  //         +---------------------+      +---------------------+       +---------------------+
+  //         |                     |      |                     |       |                     |
+  //         |      region1        |      |                     |       |                     |
+  //         |                     |      |                     |       |                     |
+  //         +---------------------+      +---------------------+       +---------------------+
+  //
+  //         +---------------------+      +---------------------+       +---------------------+
+  //         |      region2        |      |                     |       |                     |
+  //         +---------------------+      +---------------------+       +---------------------+
+  //
+  // `bd_sgls[0]/bsgl`里的元素是struct bio_iov对象:
+  //      void*        bi_buf        ---> 指向DMA region；
+  //      bio_addr_t	 bi_addr       ---> 指向meta blob内的区间；
+  //      size_t       bi_data_len
+  //
+  // 这里初始化`bd_sgls[0]/bsgl`，即分配一个struct bio_iov对象数组，个数是iod->io_nr；
 	rc = bio_sgl_init(bsgl, iod->io_nr);
 	if (rc)
 		goto free;
 
-    //Yuanguo: 把destinations地址(meta blob上的region地址)转换成bio_iov对象需要的形式，存到bsgl的各项(struct bio_iov)的bi_addr；
+  //Yuanguo: 把destinations地址(meta blob上的region地址)转换成bio_iov对象需要的形式，存到bsgl的各项(struct bio_iov)的bi_addr；
 	vos_iod2bsgl(store, iod, bsgl);
 
-    //Yuanguo: 准备DMA region，设置到bio_iov对象的bi_buf；
-    //  (sources数据(heap中的regions) 在vos_meta_flush_copy中才用的上)
+  //Yuanguo: 准备DMA region，设置到bio_iov对象的bi_buf；
+  //  (sources数据(heap中的regions) 在vos_meta_flush_copy中才用的上)
 	rc = bio_iod_try_prep(biod, BIO_CHK_TYPE_LOCAL, NULL, 0);
 	if (rc) {
 		DL_CDEBUG(rc == -DER_AGAIN, DB_TRACE, DLOG_ERR, rc, "Failed to prepare DMA buffer");

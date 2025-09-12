@@ -1025,6 +1025,11 @@ vos_self_init_ext(const char *db_path, bool use_sys_db, int tgt_id, bool nvme_in
 
 	vos_start_epoch = 0;
 
+	//Yuanguo: 编译出2个版本的vos库，见src/vos/SConscript；
+	//    /usr/lib64/daos_srv/libvos_srv.so  standalone = False，即VOS_STANDALONE未定义
+	//    /usr/lib64/daos_srv/libvos.so      standalone = True， 即VOS_STANDALONE被定义
+	// 服务程序/usr/bin/daos_engine 链接前者；
+	// debug工具ddb (src/utils/ddb) 链接后者；
 #if VOS_STANDALONE
 	rc = vos_standalone_tls_init(DAOS_TGT_TAG);
 	if (rc) {

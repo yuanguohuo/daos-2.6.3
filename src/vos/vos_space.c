@@ -203,6 +203,10 @@ estimate_space_key(struct umem_instance *umm, daos_key_t *key)
  * conservative estimation always assumes new object, dkey, akey will be
  * created for the update.
  */
+//Yuanguo: update dkey & akey时，预估将要使用的空间；
+//预估比较保守，即认为object、dkey、akey都是新建的，不是在原来tree node
+//上增加一个版本(节点)，而是认为会新建object tree-node, dkey tree-node,
+//akey tree-node；
 static void
 estimate_space(struct vos_pool *pool, daos_key_t *dkey, unsigned int iod_nr,
 	       daos_iod_t *iods, struct dcs_iod_csums *iods_csums,
@@ -221,24 +225,29 @@ estimate_space(struct vos_pool *pool, daos_key_t *dkey, unsigned int iod_nr,
 	scm += 1024;
 
 	/* Dkey */
+	//Yuanguo: dkey本身占的空间：包括dkey本身的字节，也包括dkey在index tree中的node(认为新建dkey)；
 	scm += estimate_space_key(umm, dkey);
 
 	for (i = 0; i < iod_nr; i++) {
 		iod = &iods[i];
 
 		/* Akey */
+		//Yuanguo: akey本身占的空间：包括akey本身的字节，也包括akey在index tree中的node(认为新建akey)；
 		scm += estimate_space_key(umm, &iod->iod_name);
 
 		csums = vos_csum_at(iods_csums, i);
 		/* Single value */
 		if (iod->iod_type == DAOS_IOD_SINGLE) {
+			//Yuanguo: 对于single-value的akey，iod->iod_size是value数据本身的长度；
 			size = iod->iod_size;
 
 			/* Single value record */
 			if (vos_io_scm(pool, iod->iod_type, size, VOS_IOS_GENERIC)) {
 				/** store data on DAOS_MEDIA_SCM */
+				//Yuanguo: value数据本身也放在SCM(PMEM/BMEM)上；
 				scm += vos_recx2irec_size(size, csums);
 			} else {
+				//Yuanguo: value数据本身放在NVMe上；
 				scm += vos_recx2irec_size(0, csums);
 				if (iod->iod_size != 0)
 					nvme += vos_byte2blkcnt(iod->iod_size);
@@ -253,6 +262,10 @@ estimate_space(struct vos_pool *pool, daos_key_t *dkey, unsigned int iod_nr,
 			recx = &iod->iod_recxs[j];
 			recx_csum = recx_csum_at(csums, j, iod);
 
+			//Yuanguo: 对于array-value的akey，iod->iod_size是一个record的size；
+			//  当前akey(即iods[i])包含iod->iod_nr个record-extent；// i=0,1,...
+			//      当前record-extent(即iod_recxs[j])包含recx->rx_nr个record；// j=0,1,...
+			// 所以这里是{record个数}*{record-size}
 			size = recx->rx_nr * iod->iod_size;
 
 			/* Extent */

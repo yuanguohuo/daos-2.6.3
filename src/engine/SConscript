@@ -12,6 +12,11 @@ def scons():
 
     denv.AppendUnique(CPPPATH=[Dir('..').srcnode()])
     denv.Append(CPPDEFINES=['-DDAOS_PMEM_BUILD'])
+    #Yuanguo: src/vos/SConscript中编译出2个版本的vos库：
+    #    /usr/lib64/daos_srv/libvos_srv.so  standalone = False
+    #    /usr/lib64/daos_srv/libvos.so      standalone = True
+    # 这里是服务程序daos_engine 链接前者；
+    # debug工具ddb (src/utils/ddb) 链接后者；
     libraries = ['daos_common_pmem', 'gurt', 'cart', 'vos_srv']
     libraries += ['bio', 'dl', 'uuid', 'pthread', 'abt']
     libraries += ['hwloc', 'pmemobj', 'protobuf-c', 'isal']
