@@ -68,16 +68,16 @@ vos_meta_rwv(struct umem_store *store, struct umem_store_iod *iod, d_sg_list_t *
 		return 0;
 	}
 
-    //Yuanguo:
-    //  - iod 描述spdk blob上的一块或多块区间(iod->io_nr块)；每一块通过一个 struct umem_store_region 对象描述；
-    //  - 函数vos_iod2bsgl()把iod->io_nr个struct umem_store_region对象 "一对一翻译" 成struct bio_iov对象 (结果存放于bsgl.bs_iovs)；
-    //
-    // struct umem_store_region对象: 描述storage (spdk blob)上的region(地址与size)；
-    //
-    // struct bio_iov对象是IO(DMA操作)需要的参数形态：
-    //        void		     *bi_buf;        --> 指向DMA region (对于flush操作，将来会把数据写到这里，再进行DMA)
-    //        size_t		 bi_data_len;    --> IO的size；
-    //        bio_addr_t	 bi_addr;        --> storage (spdk blob)上的地址；
+	//Yuanguo:
+	//  - iod 描述spdk blob上的一块或多块区间(iod->io_nr块)；每一块通过一个 struct umem_store_region 对象描述；
+	//  - 函数vos_iod2bsgl()把iod->io_nr个struct umem_store_region对象 "一对一翻译" 成struct bio_iov对象 (结果存放于bsgl.bs_iovs)；
+	//
+	// struct umem_store_region对象: 描述storage (spdk blob)上的region(地址与size)；
+	//
+	// struct bio_iov对象是IO(DMA操作)需要的参数形态：
+	//        void		     *bi_buf;        --> 指向DMA region (对于flush操作，将来会把数据写到这里，再进行DMA)
+	//        size_t		 bi_data_len;    --> IO的size；
+	//        bio_addr_t	 bi_addr;        --> storage (spdk blob)上的地址；
 	if (iod->io_nr == 1) {
 		bsgl.bs_iovs = &local_biov;
 		bsgl.bs_nr = 1;
@@ -88,22 +88,22 @@ vos_meta_rwv(struct umem_store *store, struct umem_store_iod *iod, d_sg_list_t *
 	}
 	vos_iod2bsgl(store, iod, &bsgl);
 
-    //Yuanguo: 注意，现在struct bio_iov对象的`bi_buf`还都为NULL；
-    //  对于flush(BIO_IOD_TYPE_UPDATE):
-    //          bio_writev ->
-    //          bio_rwv ->
-    //                1. bio_iod_prep -> iod_prep_internal -> iod_map_iovs -> dma_map_one   //赋值bi_buf，指向DMA region;
-    //                2. bio_iod_copy   //把数据从heap rgions (sgl) 拷贝到DMA regions;
-    //                3. bio_iod_post   //调用dma_rw(), 发起DMA，并release DMA buffers;
-    //  对于read (BIO_IOD_TYPE_FETCH):
-    //          bio_readv ->
-    //          bio_rwv ->
-    //                1. bio_iod_prep -> iod_prep_internal
-    //                                        a. iod_map_iovs -> dma_map_one   //赋值bi_buf，指向DMA region;
-    //                                        b. 调用dma_rw(), 发起DMA；
-    //                                        c. 等待完成；
-    //                2. bio_iod_copy   //把数据从DMA regions拷贝到heap rgions (sgl);
-    //                3. bio_iod_post   //release DMA buffers;
+	//Yuanguo: 注意，现在struct bio_iov对象的`bi_buf`还都为NULL；
+	//  对于flush(BIO_IOD_TYPE_UPDATE):
+	//          bio_writev ->
+	//          bio_rwv ->
+	//                1. bio_iod_prep -> iod_prep_internal -> iod_map_iovs -> dma_map_one   //赋值bi_buf，指向DMA region;
+	//                2. bio_iod_copy   //把数据从heap rgions (sgl) 拷贝到DMA regions;
+	//                3. bio_iod_post   //调用dma_rw(), 发起DMA，并release DMA buffers;
+	//  对于read (BIO_IOD_TYPE_FETCH):
+	//          bio_readv ->
+	//          bio_rwv ->
+	//                1. bio_iod_prep -> iod_prep_internal
+	//                                        a. iod_map_iovs -> dma_map_one   //赋值bi_buf，指向DMA region;
+	//                                        b. 调用dma_rw(), 发起DMA；
+	//                                        c. 等待完成；
+	//                2. bio_iod_copy   //把数据从DMA regions拷贝到heap rgions (sgl);
+	//                3. bio_iod_post   //release DMA buffers;
 	if (update)
 		rc = bio_writev(bio_mc2ioc(store->stor_priv, SMD_DEV_TYPE_META), &bsgl, sgl);
 	else
@@ -153,14 +153,14 @@ vos_meta_load_fn(void *arg)
 	struct meta_load_control *mlc = mla->mla_control;
 
 	D_ASSERT(mla != NULL);
-    //Yuanguo: iod 描述spdk blob上的一块或多块区间！
-    //         sr_addr从blob header之后开始算，见vos_iod2bsgl函数，翻译时加上blob header的size (stor_hdr_blks * stor_blk_size, 1*4k)
+	//Yuanguo: iod 描述spdk blob上的一块或多块区间！
+	//         sr_addr从blob header之后开始算，见vos_iod2bsgl函数，翻译时加上blob header的size (stor_hdr_blks * stor_blk_size, 1*4k)
 	iod.io_nr             = 1;
 	iod.io_regions        = &iod.io_region;
 	iod.io_region.sr_addr = mla->mla_off;
 	iod.io_region.sr_size = mla->mla_read_size;
 
-    //Yuanguo: sgl 描述内存(mmap映射的)上的一块或多块区间！
+	//Yuanguo: sgl 描述内存(mmap映射的)上的一块或多块区间！
 	sgl.sg_iovs   = &iov;
 	sgl.sg_nr     = 1;
 	sgl.sg_nr_out = 0;
@@ -229,16 +229,16 @@ static inline int
 vos_meta_load(struct umem_store *store, char *start)
 {
 	uint64_t		 read_size;
-    //Yuanguo:
-    //  对于MD-on-SSD场景
-    //     store->stor_size是文件大小 - blob-header-size(4k) (注意不是struct dav_phdr的4k)
-    //     就是说，store->stor_size包含struct dav_phdr的4k空间；
-    //     那个blob header在哪呢？
+	//Yuanguo:
+	//  对于MD-on-SSD场景
+	//     store->stor_size是文件大小 - blob-header-size(4k) (注意不是struct dav_phdr的4k)
+	//     就是说，store->stor_size包含struct dav_phdr的4k空间；
+	//     那个blob header在哪呢？
 	uint64_t		 remain_size = store->stor_size;
 	daos_off_t		 off = 0;
 	int			 rc = 0;
-    //Yuanguo: 下面的逻辑，用golang的思想去理解，就是启动多个routine，每个routine load一块数据；
-    //         meta_load_control和meta_load_arg用来控制routine的并发，以及传递参数给routine。
+	//Yuanguo: 下面的逻辑，用golang的思想去理解，就是启动多个routine，每个routine load一块数据；
+	//         meta_load_control和meta_load_arg用来控制routine的并发，以及传递参数给routine。
 	struct meta_load_arg	*mla;
 	struct meta_load_control mlc;
 
@@ -260,7 +260,7 @@ vos_meta_load(struct umem_store *store, char *start)
 	}
 
 	while (remain_size) {
-        //Yuanguo: 一个routine读取1MiB的数据；
+		//Yuanguo: 一个routine读取1MiB的数据；
 		read_size =
 		    (remain_size > META_READ_BATCH_SIZE) ? META_READ_BATCH_SIZE : remain_size;
 
@@ -269,11 +269,11 @@ vos_meta_load(struct umem_store *store, char *start)
 			rc = -DER_NOMEM;
 			break;
 		}
-        //Yuanguo:
-        //    mla_off       : spdk meta blob内source的偏移；
-        //                    从blob header之后开始算，见vos_iod2bsgl函数，翻译时加上blob header的size (stor_hdr_blks * stor_blk_size, 1*4k)
-        //    mla_start     : mmap空间内destination的地址；
-        //    mla_read_size : 数据长度；
+		//Yuanguo:
+		//    mla_off       : spdk meta blob内source的偏移；
+		//                    从blob header之后开始算，见vos_iod2bsgl函数，翻译时加上blob header的size (stor_hdr_blks * stor_blk_size, 1*4k)
+		//    mla_start     : mmap空间内destination的地址；
+		//    mla_read_size : 数据长度；
 		mla->mla_off = off;
 		mla->mla_read_size = read_size;
 		mla->mla_start = start;
@@ -281,7 +281,7 @@ vos_meta_load(struct umem_store *store, char *start)
 		mla->mla_control = &mlc;
 
 		mlc.mlc_inflights++;
-        //Yuanguo: 类比golang可以理解为 go vos_meta_load_fn(mal);
+		//Yuanguo: 类比golang可以理解为 go vos_meta_load_fn(mal);
 		rc = vos_exec(vos_meta_load_fn, (void *)mla);
 		if (rc || mlc.mlc_rc) {
 			if (rc) {
@@ -336,49 +336,49 @@ vos_meta_flush_prep(struct umem_store *store, struct umem_store_iod *iod, daos_h
 		return -DER_NOMEM;
 
 	bsgl = bio_iod_sgl(biod, 0);
-  //Yuanguo:
-  // - iod->io_regions是一个列表，有iod->io_nr项，每一项描述spdk meta blob上的一个region；
-  //   对于flush来说，它们是IO的destinations;
-  // - struct umem_checkpoint_data的cd_sg_list也是一个列表，和iod->io_regions一一对应，
-  //   它们描述的是heap regions；对于flush来说，这些heap regions是IO的sources;
-  //   (这里还用不到它们，vos_meta_flush_copy的时候才用到，cd_sg_list作为参数`sgl`传给它)
-  //
-  // struct bio_desc对象是bio的核心，它的bd_sgls是一个"列表的数组"，我们只考虑单个列表的情况，
-  // 即`bd_sgls[0]`是一个列表，也就是这里的`bsgl`指向的列表；它的项数和sources/destinations
-  // 项数一样(一一对应)；每一项包含IO操作的DMA region 和 meta blob上的region；
-  //
-  //  struct umem_checkpoint_data的cd_sg_list                              iod->io_regions
-  //              (heap regions)                (DMA regions)               (meta blob)
-  //
-  //         +---------------------+      +---------------------+       +---------------------+
-  //         |      region0        |      |                     |       |                     |
-  //         +---------------------+      +---------------------+       +---------------------+
-  //
-  //         +---------------------+      +---------------------+       +---------------------+
-  //         |                     |      |                     |       |                     |
-  //         |      region1        |      |                     |       |                     |
-  //         |                     |      |                     |       |                     |
-  //         +---------------------+      +---------------------+       +---------------------+
-  //
-  //         +---------------------+      +---------------------+       +---------------------+
-  //         |      region2        |      |                     |       |                     |
-  //         +---------------------+      +---------------------+       +---------------------+
-  //
-  // `bd_sgls[0]/bsgl`里的元素是struct bio_iov对象:
-  //      void*        bi_buf        ---> 指向DMA region；
-  //      bio_addr_t	 bi_addr       ---> 指向meta blob内的区间；
-  //      size_t       bi_data_len
-  //
-  // 这里初始化`bd_sgls[0]/bsgl`，即分配一个struct bio_iov对象数组，个数是iod->io_nr；
+	//Yuanguo:
+	// - iod->io_regions是一个列表，有iod->io_nr项，每一项描述spdk meta blob上的一个region；
+	//   对于flush来说，它们是IO的destinations;
+	// - struct umem_checkpoint_data的cd_sg_list也是一个列表，和iod->io_regions一一对应，
+	//   它们描述的是heap regions；对于flush来说，这些heap regions是IO的sources;
+	//   (这里还用不到它们，vos_meta_flush_copy的时候才用到，cd_sg_list作为参数`sgl`传给它)
+	//
+	// struct bio_desc对象是bio的核心，它的bd_sgls是一个"列表的数组"，我们只考虑单个列表的情况，
+	// 即`bd_sgls[0]`是一个列表，也就是这里的`bsgl`指向的列表；它的项数和sources/destinations
+	// 项数一样(一一对应)；每一项包含IO操作的DMA region 和 meta blob上的region；
+	//
+	//  struct umem_checkpoint_data的cd_sg_list                              iod->io_regions
+	//              (heap regions)                (DMA regions)               (meta blob)
+	//
+	//         +---------------------+      +---------------------+       +---------------------+
+	//         |      region0        |      |                     |       |                     |
+	//         +---------------------+      +---------------------+       +---------------------+
+	//
+	//         +---------------------+      +---------------------+       +---------------------+
+	//         |                     |      |                     |       |                     |
+	//         |      region1        |      |                     |       |                     |
+	//         |                     |      |                     |       |                     |
+	//         +---------------------+      +---------------------+       +---------------------+
+	//
+	//         +---------------------+      +---------------------+       +---------------------+
+	//         |      region2        |      |                     |       |                     |
+	//         +---------------------+      +---------------------+       +---------------------+
+	//
+	// `bd_sgls[0]/bsgl`里的元素是struct bio_iov对象:
+	//      void*        bi_buf        ---> 指向DMA region；
+	//      bio_addr_t	 bi_addr       ---> 指向meta blob内的区间；
+	//      size_t       bi_data_len
+	//
+	// 这里初始化`bd_sgls[0]/bsgl`，即分配一个struct bio_iov对象数组，个数是iod->io_nr；
 	rc = bio_sgl_init(bsgl, iod->io_nr);
 	if (rc)
 		goto free;
 
-  //Yuanguo: 把destinations地址(meta blob上的region地址)转换成bio_iov对象需要的形式，存到bsgl的各项(struct bio_iov)的bi_addr；
+	//Yuanguo: 把destinations地址(meta blob上的region地址)转换成bio_iov对象需要的形式，存到bsgl的各项(struct bio_iov)的bi_addr；
 	vos_iod2bsgl(store, iod, bsgl);
 
-  //Yuanguo: 准备DMA region，设置到bio_iov对象的bi_buf；
-  //  (sources数据(heap中的regions) 在vos_meta_flush_copy中才用的上)
+	//Yuanguo: 准备DMA region，设置到bio_iov对象的bi_buf；
+	//  (sources数据(heap中的regions) 在vos_meta_flush_copy中才用的上)
 	rc = bio_iod_try_prep(biod, BIO_CHK_TYPE_LOCAL, NULL, 0);
 	if (rc) {
 		DL_CDEBUG(rc == -DER_AGAIN, DB_TRACE, DLOG_ERR, rc, "Failed to prepare DMA buffer");
@@ -410,8 +410,8 @@ vos_meta_flush_copy(daos_handle_t fh, d_sg_list_t *sgl)
 	struct bio_desc	*biod = (struct bio_desc *)fh.cookie;
 
 	D_ASSERT(sgl->sg_nr > 0);
-    //Yuanguo: 参数'1'表示只有1个列表；
-    //  但列表有多个项，每个项是一个struct bio_iov对象，表示一个region的IO(source到destination的flush);
+	//Yuanguo: 参数'1'表示只有1个列表；
+	//  但列表有多个项，每个项是一个struct bio_iov对象，表示一个region的IO(source到destination的flush);
 	return bio_iod_copy(biod, sgl, 1);
 }
 
@@ -514,16 +514,16 @@ vos_wal_reserve(struct umem_store *store, uint64_t *tx_id)
 	 */
 	bio_wal_query(store->stor_priv, &wal_info);
 
-    //Yuanguo: 检查wal是不是过大，从而触发checkpoint
-    //   vos_pool:  ./src/pool/srv_pool_chkpt.c : update_cb()
-    //   rbd_pool:  src/rdb/rdb.c               : rdb_chkpt_update()
+	//Yuanguo: 检查wal是不是过大，从而触发checkpoint
+	//   vos_pool:  ./src/pool/srv_pool_chkpt.c : update_cb()
+	//   rbd_pool:  src/rdb/rdb.c               : rdb_chkpt_update()
 	pool->vp_update_cb(pool->vp_chkpt_arg, wal_info.wi_commit_id, wal_info.wi_used_blks,
 			   wal_info.wi_tot_blks);
 
 reserve:
 	D_ASSERT(store && store->stor_priv != NULL);
 	vwm = (struct vos_wal_metrics *)store->stor_stats;
-    //Yuanguo: 预留transaction id (tx_id)，实际上是在wal中预留空间；
+	//Yuanguo: 预留transaction id (tx_id)，实际上是在wal中预留位置(tx_id代表的是位置)；
 	rc = bio_wal_reserve(store->stor_priv, tx_id, (vwm != NULL) ? &ws : NULL);
 	if (rc == 0 && vwm != NULL)
 		d_tm_set_gauge(vwm->vwm_wal_waiters, ws.ws_waiters);
@@ -581,9 +581,9 @@ vos_wal_commit(struct umem_store *store, struct umem_wal_tx *wal_tx, void *data_
 	 */
 	bio_wal_query(store->stor_priv, &wal_info);
 
-    //Yuanguo: 检查wal是不是过大，从而触发checkpoint
-    //   vos_pool:  ./src/pool/srv_pool_chkpt.c : update_cb()
-    //   rbd_pool:  src/rdb/rdb.c               : rdb_chkpt_update()
+	//Yuanguo: 检查wal是不是过大，从而触发checkpoint
+	//   vos_pool:  ./src/pool/srv_pool_chkpt.c : update_cb()
+	//   rbd_pool:  src/rdb/rdb.c               : rdb_chkpt_update()
 	pool->vp_update_cb(pool->vp_chkpt_arg, wal_info.wi_commit_id, wal_info.wi_used_blks,
 			   wal_info.wi_tot_blks);
 
@@ -857,7 +857,7 @@ vos_pmemobj_create(const char *path, uuid_t pool_id, const char *layout,
 
 	*ph = NULL;
 	/* always use PMEM mode for SMD */
-    //Yuanguo: 对于MD-on-SSD，store.store_type = DAOS_MD_BMEM
+	//Yuanguo: 对于MD-on-SSD，store.store_type = DAOS_MD_BMEM
 	store.store_type = umempobj_get_backend_type();
 	if (flags & VOS_POF_SYSDB) {
 		store.store_type = DAOS_MD_PMEM;
@@ -868,7 +868,7 @@ vos_pmemobj_create(const char *path, uuid_t pool_id, const char *layout,
 	if (!bio_nvme_configured(SMD_DEV_TYPE_MAX) || xs_ctxt == NULL)
 		goto umem_create;
 
-    //Yuanguo: 通过stat(path)文件，获取scm_sz
+	//Yuanguo: 通过stat(path)文件，获取scm_sz
 	if (!scm_sz) {
 		struct stat lstat;
 
@@ -882,7 +882,7 @@ vos_pmemobj_create(const char *path, uuid_t pool_id, const char *layout,
 		"meta_sz: %zu, nvme_sz: %zu wal_sz:%zu\n",
 		xs_ctxt, DP_UUID(pool_id), meta_sz, nvme_sz, wal_sz);
 
-    //Yuanguo: 创建data/meta/wal spdk-blob
+	//Yuanguo: 创建data/meta/wal spdk-blob
 	rc = bio_mc_create(xs_ctxt, pool_id, meta_sz, wal_sz, nvme_sz, mc_flags);
 	if (rc != 0) {
 		D_ERROR("Failed to create BIO meta context for xs:%p pool:"DF_UUID". "DF_RC"\n",
@@ -902,13 +902,13 @@ vos_pmemobj_create(const char *path, uuid_t pool_id, const char *layout,
 		return rc;
 	}
 
-    //Yuanguo:
-    //  - 对于MD-on-SSD
-    //       scm_sz               : 0
-    //       meta_sz              : 文件/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0的size；
-    //       store.stor_size      : meta_sz - 4k. 即meta_sz扣除header-size(默认是1个block,4k)；
-    //       store.stor_blk_size  : 默认4k. 见bio_mc_create() --> meta_format()
-    //       store.stor_hdr_blks  : 默认1. 见bio_mc_create() --> meta_format()
+	//Yuanguo:
+	//  - 对于MD-on-SSD
+	//       scm_sz               : 0
+	//       meta_sz              : 文件/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0的size；
+	//       store.stor_size      : meta_sz - 4k. 即meta_sz扣除header-size(默认是1个block,4k)；
+	//       store.stor_blk_size  : 默认4k. 见bio_mc_create() --> meta_format()
+	//       store.stor_hdr_blks  : 默认1. 见bio_mc_create() --> meta_format()
 	bio_meta_get_attr(mc, &store.stor_size, &store.stor_blk_size, &store.stor_hdr_blks);
 	store.stor_priv = mc;
 	store.stor_ops = &vos_store_ops;
@@ -1276,12 +1276,12 @@ vos_pool_create_ex(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_
 		return rc;
 	}
 
-    //Yuanguo:
-    //  对于persistent memory(包括MD-on-SSD，它是模拟的persistent memory)，机器重启之后，内存上存的数据在哪呢？
-    //  要访问内存上的数据，就需要一个root，通过这个root可达重启之前的所有内存数据(有点类似与Java虚拟
-    //  机管理内存)。这个root存在于“已知的固定的位置”，相对于persistent memory的起始地址(起始地址每次
-    //  重启可能mmap到不同地址)
-    //  root处存储的结构体类型是应用程序开发者设计的，对于DAOS vos pool，是struct vos_pool_df类型；
+	//Yuanguo:
+	//  对于persistent memory(包括MD-on-SSD，它是模拟的persistent memory)，机器重启之后，内存上存的数据在哪呢？
+	//  要访问内存上的数据，就需要一个root，通过这个root可达重启之前的所有内存数据(有点类似与Java虚拟
+	//  机管理内存)。这个root存在于“已知的固定的位置”，相对于persistent memory的起始地址(起始地址每次
+	//  重启可能mmap到不同地址)
+	//  root处存储的结构体类型是应用程序开发者设计的，对于DAOS vos pool，是struct vos_pool_df类型；
 	pool_df = vos_pool_pop2df(ph);
 
 	/* If the file is fallocated separately we need the fallocated size
@@ -1299,51 +1299,51 @@ vos_pool_create_ex(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_
 	uma.uma_id = umempobj_backend_type2class_id(ph->up_store.store_type);
 	uma.uma_pool = ph;
 
-    //Yuanguo:
-    //  全局数组umem_class_defined定义了一些内存class (pmem, bmem, ...)；可以理解为C++的class(包含成员函数)
-    //  这里根据class id (uma.uma_id)，以及数据成员，实例化一个struct umem_instance (可以理解为C++对象)；
-    //  它(umem)描述了本vos pool的内存池(heap)信息；
+	//Yuanguo:
+	//  全局数组umem_class_defined定义了一些内存class (pmem, bmem, ...)；可以理解为C++的class(包含成员函数)
+	//  这里根据class id (uma.uma_id)，以及数据成员，实例化一个struct umem_instance (可以理解为C++对象)；
+	//  它(umem)描述了本vos pool的内存池(heap)信息；
 	rc = umem_class_init(&uma, &umem);
 	if (rc != 0)
 		goto close;
 
-    //Yuanguo: 通过transaction修改持久化内存(包括MD-on-SSD):
-    //
-    //       step-1   :  创建transaction;
-    //       step-2   :  对要修改的ranges打snapshot，保存在transaction中，生成undo log;
-    //       step-3   :  修改ranges;
-    //       step-4.a :  commit: 生成redo log，并持久化；
-    //       step-4.b :  abort;
-    //
-    // MD-on-SSD容易理解，但为什么SCM也需要这样的操作呢？
-    // 因为SCM本身并不是transactional的，PMDK的基础库libpmem/libpmem2也不是transactional的；是libpmemobj库实现
-    // 的事物机制，实现方式也和MD-on-SSD一样：redo/undo log
-    // 其实MD-on-SSD事物机制(以及heap layout, slab等很大部分)是从libpmemobj拷贝的；
+	//Yuanguo: 通过transaction修改持久化内存(包括MD-on-SSD):
+	//
+	//       step-1   :  创建transaction;
+	//       step-2   :  对要修改的ranges打snapshot，保存在transaction中，生成undo log;
+	//       step-3   :  修改ranges;
+	//       step-4.a :  commit: 生成redo log，并持久化；
+	//       step-4.b :  abort;
+	//
+	// MD-on-SSD容易理解，但为什么SCM也需要这样的操作呢？
+	// 因为SCM本身并不是transactional的，PMDK的基础库libpmem/libpmem2也不是transactional的；是libpmemobj库实现
+	// 的事物机制，实现方式也和MD-on-SSD一样：redo/undo log
+	// 其实MD-on-SSD事物机制(以及heap layout, slab等很大部分)是从libpmemobj拷贝的；
 
-    //Yuanguo: step-1: 创建transaction;
-    //  - pmem: pmem_tx_begin()
-    //  - bmem: bmem_tx_begin()
+	//Yuanguo: step-1: 创建transaction;
+	//  - pmem: pmem_tx_begin()
+	//  - bmem: bmem_tx_begin()
 	rc = umem_tx_begin(&umem, NULL);
 	if (rc != 0)
 		goto close;
 
-    //Yuanguo: step-2: 对要修改的ranges打snapshot，保存在transaction中，生成undo log;
-    //  Takes a "snapshot" of the given memory region and saves it in the undo log.
-    //  The application is then free to directly modify the object in that memory
-    //  range.
-    //  In case of failure or abort, all the changes within this range will
-    //  be rolled-back automatically.
-    //  这里的range就是`pool_df`占的区域；
-    //
-    //  - pmem: pmem_tx_add_ptr()
-    //  - bmem: bmem_tx_add_ptr()
+	//Yuanguo: step-2: 对要修改的ranges打snapshot，保存在transaction中，生成undo log;
+	//  Takes a "snapshot" of the given memory region and saves it in the undo log.
+	//  The application is then free to directly modify the object in that memory
+	//  range.
+	//  In case of failure or abort, all the changes within this range will
+	//  be rolled-back automatically.
+	//  这里的range就是`pool_df`占的区域；
+	//
+	//  - pmem: pmem_tx_add_ptr()
+	//  - bmem: bmem_tx_add_ptr()
 	rc = umem_tx_add_ptr(&umem, pool_df, sizeof(*pool_df));
 	if (rc != 0)
 		goto end;
 
-    //Yuanguo: step-3: 修改ranges;
+	//Yuanguo: step-3: 修改ranges;
 	memset(pool_df, 0, sizeof(*pool_df));
-    //Yuanguo: 创建container btree (container table)
+	//Yuanguo: 创建container btree (container table)
 	rc = dbtree_create_inplace(VOS_BTR_CONT_TABLE, 0, VOS_CONT_ORDER,
 				   &uma, &pool_df->pd_cont_root, &hdl);
 	if (rc != 0)
@@ -1367,9 +1367,9 @@ end:
 	 * only when there is no memory, either due
 	 * to loss of power or no more memory in pool
 	 */
-    //Yuanguo:
-    //  step-4.a: commit: 生成redo log，并持久化；
-    //  step-4.b: abort;
+	//Yuanguo:
+	//  step-4.a: commit: 生成redo log，并持久化；
+	//  step-4.b: abort;
 	if (rc == 0)
 		rc = umem_tx_commit(&umem);
 	else
@@ -1395,23 +1395,23 @@ end:
 		vea_compat |= VEA_COMPAT_FEATURE_BITMAP;
 
 	/* Format SPDK blob*/
-    //Yuanguo: 初始化 NVMe空间(spdk data blob) 管理器；
-    //  - The Versioned Block Allocator is used by VOS for managing blocks on NVMe SSD, it's basically an extent based block allocator specially designed for DAOS.
-    //    为什么叫VEA而不是VBA? 是Versioned Extent Allocator的缩写吗？
-    //  - The blocks allocated by VEA are used to store single value or array value in VOS.
-    //  - Since the address and size from each allocation is tracked in VOS index trees, the VEA allocation metadata tracks only free extents in a btree;
-    //  - more importantly, this allocation metadata is stored on SCM along with the VOS index trees, so that block allocation and index updating could be easily made
-    //    into single PMDK transaction, at the same time, the performance would be much better than storing the metadata on NVMe SSD.
-    //
-    // 如上所述，SCM (包括MD-on-SSD)中记录两类索引:
-    //  - VOS index;
-    //  - free extents;
-    //
-    // 分配data blob (NVMe)空间，写入key-value的value，在SCM中记录value的索引(VOS index)，从free extents中扣除；这些操作如何保证原子性呢？
-    //  1. 先在DRAM中记录分配的data blob空间 (transient reservation);
-    //  2. 通过RMDA往分配的data blob空间写入数据(key-value的value);
-    //  3. 通过同一个transaction更新VOS index和free extents;
-    // 就是比较常见的"delayed atomicity"方式；
+	//Yuanguo: 初始化 NVMe空间(spdk data blob) 管理器；
+	//  - The Versioned Block Allocator is used by VOS for managing blocks on NVMe SSD, it's basically an extent based block allocator specially designed for DAOS.
+	//    为什么叫VEA而不是VBA? 是Versioned Extent Allocator的缩写吗？
+	//  - The blocks allocated by VEA are used to store single value or array value in VOS.
+	//  - Since the address and size from each allocation is tracked in VOS index trees, the VEA allocation metadata tracks only free extents in a btree;
+	//  - more importantly, this allocation metadata is stored on SCM along with the VOS index trees, so that block allocation and index updating could be easily made
+	//    into single PMDK transaction, at the same time, the performance would be much better than storing the metadata on NVMe SSD.
+	//
+	// 如上所述，SCM (包括MD-on-SSD)中记录两类索引:
+	//  - VOS index;
+	//  - free extents;
+	//
+	// 分配data blob (NVMe)空间，写入key-value的value，在SCM中记录value的索引(VOS index)，从free extents中扣除；这些操作如何保证原子性呢？
+	//  1. 先在DRAM中记录分配的data blob空间 (transient reservation);
+	//  2. 通过RMDA往分配的data blob空间写入数据(key-value的value);
+	//  3. 通过同一个transaction更新VOS index和free extents;
+	// 就是比较常见的"delayed atomicity"方式；
 	rc = vea_format(&umem, vos_txd_get(flags & VOS_POF_SYSDB), &pool_df->pd_vea_df,
 			VOS_BLK_SZ, VOS_BLOB_HDR_BLKS, nvme_sz, vos_blob_format_cb,
 			&blob_hdr, false, vea_compat);

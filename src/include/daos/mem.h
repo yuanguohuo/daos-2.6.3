@@ -381,6 +381,9 @@ typedef struct {
 	 * \param ptr [IN]	Directly accessible memory pointer.
 	 * \param size	[IN]	size to be tracked by the transaction.
 	 */
+	//Yuanguo:
+	//  for pmem: pmem_tx_add_ptr
+	//  for bmem: bmem_tx_add_ptr
 	int		 (*mo_tx_add_ptr)(struct umem_instance *umm,
 					  void *ptr, size_t size);
 	/** abort memory transaction */

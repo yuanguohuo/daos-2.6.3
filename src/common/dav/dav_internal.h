@@ -72,9 +72,13 @@ typedef struct dav_obj {
     //Yuanguo: do_fd: do_path文件的描述符；
 	int				 do_fd;
 	int				 nested_tx;
-    //Yuanguo: transaction的内存表示；
-    //  对于MD-on-SSD: do_utx->utx_private是一个指向struct dav_tx对象的指针；对象中包含一个struct umem_action的链表；
-    //                 do_utx->utx_id是transaction id;
+	//Yuanguo:
+	//  do_utx指向mem transaction的内存表示；
+	//      - 对于MD-on-SSD: do_utx->utx_private是一个指向struct dav_tx对象的指针；对象中包含一个struct umem_action的链表；
+	//        do_utx->utx_id是transaction id;
+	//      - 对于PMEM: ??
+	//Yuanguo:
+	//  一个struct dav_obj，即一个memory pool上，同一时间点，只有一个transaction (do_utx);
 	struct umem_wal_tx		*do_utx;
     //Yuanguo:  *do_store = {
     //                        .stor_blk_size=4k

@@ -190,6 +190,11 @@ dav_wal_tx_reserve(struct dav_obj *hdl, uint64_t *id)
 {
 	int rc;
 
+	//Yuanguo:
+	//  当前是MD-on-SSD场景（因为只有MD-on-SSD才需要wal）
+	//  对于vos，hdl->do_store->stor_ops指向的是vos_pool.c中的vos_store_ops;
+	//  其中so_wal_reserv = vos_wal_reserve，预留transaction id；实际上是在wal (wal blob on NVMe)上预留位置，
+	//  因为transaction id对应着wal上的一个位置；
 	rc = hdl->do_store->stor_ops->so_wal_reserv(hdl->do_store, id);
 	/* REVISIT:
 	 * Remove this assert once callers of dav_free() and dav_memcpy_persist()

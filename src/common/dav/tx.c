@@ -55,18 +55,24 @@ struct tx {
 	enum dav_tx_stage stage;
 	int last_errnum;
 
-    //Yuanguo:
-    // struct txd {
-    // 	  struct tx_data *slh_first;
-    // } tx_entries;
+	//Yuanguo:
+	// struct txd {
+	// 	  struct tx_data *slh_first;
+	// } tx_entries;
 	DAV_SLIST_HEAD(txd, tx_data) tx_entries;
 
-    //Yuanguo:
-    //  使用一个avl-tree保存current transaction修改的heap ranges的原状态，就是这些ranges的snapshot；
-    //  以便在transaction abort时回滚；就是undo log;
-    //  详细逻辑见 dav_tx_add_common() 函数;
+	//Yuanguo:
+	//  使用一个avl-tree保存current transaction修改的heap ranges的原状态，就是这些ranges的snapshot；
+	//  以便在transaction abort时回滚；就是undo log;
+	//  详细逻辑见 dav_tx_add_common() 函数;
 	struct ravl *ranges;
 
+	//Yuanguo:
+	// struct {
+	// 	struct dav_action *buffer;
+	// 	size_t size;
+	// 	size_t capacity;
+	// } actions;
 	VEC(, struct dav_action) actions;
 
 	dav_tx_callback stage_callback;
@@ -554,12 +560,16 @@ dav_tx_begin(dav_obj_t *pop, jmp_buf env, ...)
 		struct umem_wal_tx *utx = NULL;
 
 		DAV_DBG("");
+		//Yuanguo: 预留transaction id；实际上是在wal (wal blob on NVMe)上预留位置，
+		//  因为transaction id对应着wal上的一个位置；
 		err = dav_wal_tx_reserve(pop, &wal_id);
 		if (err) {
 			D_ERROR("so_wal_reserv failed, "DF_RC"\n", DP_RC(err));
 			goto err_abort;
 		}
 
+		//Yuanguo: 若当前内存池(dav_obj_t对象表示MD-on-SSD的内存池)上没有transaction，
+		//  则创建transaction实例(struct umem_wal_tx);
 		if (pop->do_utx == NULL) {
 			utx = dav_umem_wtx_new(pop);
 			if (utx == NULL) {
@@ -567,8 +577,10 @@ dav_tx_begin(dav_obj_t *pop, jmp_buf env, ...)
 				goto err_abort;
 			}
 		}
+		//Yuanguo: 初始化transaction的id；
 		pop->do_utx->utx_id = wal_id;
 
+		//Yuanguo: 一个vos，即一个xstream/线程，有一个thread local的struct tx对象；
 		tx = get_tx();
 
 		VALGRIND_START_TX;
@@ -579,6 +591,10 @@ dav_tx_begin(dav_obj_t *pop, jmp_buf env, ...)
 		VEC_INIT(&tx->actions);
 		DAV_SLIST_INIT(&tx->tx_entries);
 
+		//Yuanguo:
+		//  使用一个avl-tree保存current transaction修改的heap ranges的原状态，就是这些ranges的snapshot；
+		//  以便在transaction abort时回滚；就是undo log;
+		//  详细逻辑见 dav_tx_add_common() 函数;
 		tx->ranges = ravl_new_sized(tx_range_def_cmp,
 			sizeof(struct tx_range_def));
 		tx->first_snapshot = 1;
