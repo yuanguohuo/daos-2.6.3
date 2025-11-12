@@ -27,6 +27,10 @@ struct pl_map_dict {
 };
 
 /** array of defined placement maps */
+//Yuanguo:
+//  用Python class/object 的思想去理解：这些是placement class (class也是对象，即pl_map_dict的对象)
+//  class对象定义了object方法列表(pd_ops), class的name；
+//  placement object有一个指针指向方法列表，struct pl_map 的 pl_ops 字段；
 static struct pl_map_dict pl_maps[] = {
 	{
 		.pd_type        = PL_TYPE_RING,
@@ -67,6 +71,8 @@ pl_map_create_inited(struct pool_map *pool_map, struct pl_map_init_attr *mia,
 
 	D_DEBUG(DB_PL, "Create a %s placement map\n", dict->pd_name);
 
+	//Yuanguo: dict->pd_ops->o_create = jump_map_create;
+	//  Ring Placement Map 已不可用，只有 Jump Placement Map 可用；
 	rc = dict->pd_ops->o_create(pool_map, mia, &map);
 	if (rc != 0)
 		return rc;
@@ -123,6 +129,11 @@ pl_obj_place(struct pl_map *map, uint16_t layout_gl_version, struct daos_obj_md 
 	D_ASSERT(map->pl_ops != NULL);
 	D_ASSERT(map->pl_ops->o_obj_place != NULL);
 	D_ASSERT(layout_gl_version < MAX_OBJ_LAYOUT_VERSION);
+	//Yuanguo:
+	//  - Ring Placement Map已不可用: It can not currently be used as it does not support several of the newer API
+	//    methods required by DAOS - specifically those for server reintegration, drain, and addition
+	//  - 所以只剩Jump Placement Map;
+	//故map->pl_ops->o_obj_place函数指针指向 jump_map_obj_place() 函数；
 	return map->pl_ops->o_obj_place(map, layout_gl_version, md, mode, shard_md, layout_pp);
 }
 
@@ -290,6 +301,8 @@ pl_obj_shard2grp_index(struct daos_obj_shard_md *shard_md,
 /** serialize operations on pl_htable */
 static pthread_rwlock_t		pl_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 /** hash table for placement maps */
+//Yuanguo:
+//  初始化见daos_init() --> pl_init()
 static struct d_hash_table	pl_htable;
 
 /**
@@ -546,6 +559,8 @@ pl_map_query(uuid_t po_uuid, struct pl_map_attr *attr)
 	if (!map)
 		return -DER_ENOENT;
 
+	//Yuanguo: map->pl_ops->o_query 指向 jump_map_query 函数；
+	//  因为 Ring Placement Map 不可用，只有 Jump Placement Map 可用；
 	if (map->pl_ops->o_query != NULL)
 		rc = map->pl_ops->o_query(map, attr);
 	else

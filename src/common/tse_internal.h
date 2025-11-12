@@ -29,12 +29,20 @@ struct tse_task_private {
 	d_list_t			 dtp_task_list;
 
 	/* links to scheduler */
+	//Yuanguo: 当前task状态不同，可能在scheduler(struct tse_sched_private)的不同的链表里；
+	//  dsp_sleeping_list
+	//  dsp_init_list
+	//  dsp_running_list
+	//  dsp_complete_list
 	d_list_t			 dtp_list;
 
 	/* time to start running this task */
 	uint64_t			 dtp_wakeup_time;
 
 	/* list of tasks that depend on this task */
+	//Yuanguo: 例如3副本的object update 是一个task(obj_task)；每个副本是一个task(shard_task)
+	//  则obj_task depends on shard_task; 所以，把obj_task添加到shard_task的dtp_dep_list(通过
+	//  struct tse_task_link，其tl_task指向obj_task，其tl_link链接到shard_task的dtp_dep_list)
 	d_list_t			 dtp_dep_list;
 
 	/* daos prepare task callback list */
@@ -74,6 +82,32 @@ struct tse_task_private {
 	 * The sum of dtp_stack_top and dtp_embed_top should not exceed
 	 * TSE_TASK_ARG_LEN.
 	 */
+	//Yuanguo:
+	//        dtp_buf space of struct tse_task_private
+	//     +============================================+  <--------------------- dtp->dtp_buf
+	//     |                                            |         |
+	//     |                                            |         |
+	//     |           struct daos_task_args            |    dtp->dtp_embed_top
+	//     |                                            |         |
+	//     |                                            |         |
+	//     +============================================+  <---------------------
+	//     | low addr                                   |
+	//     |                                            |
+	//     |                                            |
+	//     |                                            |
+	//     |                                            |
+	//     |                                            |
+	//     |                                            |
+	//     |                    ^                       |
+	//     |                    |                       |
+	//     |               stack grows                  |
+	//     |                    |                       |
+	//     | high addr          |                       |
+	//     |--------------------------------------------|  <---------------------
+	//     |++++++++++++++++++++++++++++++++++++++++++++|          |
+	//     |++++++++++++++ used stack space ++++++++++++|    dtp->dtp_stack_top 已使用的栈空间大小
+	//     |++++++++++++++++++++++++++++++++++++++++++++|          |
+	//     +============================================+  <--------------------- dtp->dtp_buf + sizeof(dtp->dtp_buf)
 	uint16_t			 dtp_stack_top;
 	uint16_t			 dtp_embed_top;
 	/* generation of the task, +1 every time when task re-init or add dependent task */

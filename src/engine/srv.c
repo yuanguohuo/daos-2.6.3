@@ -97,6 +97,38 @@ unsigned int	dss_sys_xs_nr = DAOS_TGT0_OFFSET + DRPC_XS_NR;
  */
 bool		dss_helper_pool;
 
+//Yuanguo:
+//  配置文件 /etc/daos/daos_server.yml：
+//      targets: 18             # number of I/O service threads per-engine
+//      nr_xs_helpers: 4        # count of I/O offload threads per engine
+//
+//  进程
+//      /usr/bin/daos_engine -t 18 -x 4 ...
+//
+//  这种情况下：
+//      dss_tgt_nr            = 18
+//      dss_tgt_offload_xs_nr = 4
+//      dss_helper_pool       = true   // 因为 4%18 != 0，即4个helper线程没法平均分给18个target，所以只能做成一个"共享池"即"helper pool"
+//      dss_sys_xs_nr         = DAOS_TGT0_OFFSET + DRPC_XS_NR = 3
+//
+//  注：helper 和 offload 是同一个意思：辅助xstream，main-xstream把一些任务offload到辅助xstream
+//
+//  xs_id     ctx_id   dx_tgt_id  dx_name     dx_comm  dx_main_xs  dx_iofw
+// -----------------------------------------------------------------------
+//   0          0        -1      daos_sys_0     1       0            0
+//   1          1        -1      daos_sys_1     1       0            0
+//   2          -1       -1      daos_sys_2     0       0
+// -----------------------------------------------------------------------
+//   3          2        0       daos_io_0      1       1            0
+//   4          3        1       daos_io_1      1       1            0
+//   ...                 ...      ...           ...     ...          ...
+//   20         19       17      daos_io_17     1       1            0
+// -----------------------------------------------------------------------
+//   21         20       -1      daos_off_21    1       0            1
+//   22         21       -1      daos_off_22    1       0            1
+//   23         22       -1      daos_off_23    1       0            1
+//   24         23       -1      daos_off_24    1       0            1
+
 /** Bypass for the nvme health check */
 bool		dss_nvme_bypass_health_check;
 
@@ -764,11 +796,26 @@ dss_start_one_xstream(hwloc_cpuset_t cpus, int tag, int xs_id)
 	 * The 2nd offload XS(if exists) does not need RPC communication
 	 * as it is only for EC/checksum/compress offloading.
 	 */
-    //Yuanguo:
-    //  - 如果helper数(配置项nr_xs_helpers)刚好是target数(配置项targets)的整数倍，那么
-    //    就把helper平均分给target；每个target有独占的helper，不共享，也就是非"池化"；
-    //    dss_helper_pool = false；
-    //  - 否则，所有helper形成一个pool，target共享这个pool，所以dss_helper_pool=true;
+	//Yuanguo:
+	//  - 如果helper数(配置项nr_xs_helpers)刚好是target数(配置项targets)的整数倍，那么
+	//    就把helper平均分给target；每个target有独占的helper，不共享，也就是非"池化"；
+	//    dss_helper_pool = false；
+	//  - 否则，所有helper形成一个pool，target共享这个pool，所以dss_helper_pool=true;
+	//Yuanguo:
+	//  配置文件 /etc/daos/daos_server.yml：
+	//      targets: 18             # number of I/O service threads per-engine
+	//      nr_xs_helpers: 4        # count of I/O offload threads per engine
+	//
+	//  进程
+	//      /usr/bin/daos_engine -t 18 -x 4 ...
+	//
+	//  这种情况下：
+	//      dss_tgt_nr            = 18
+	//      dss_tgt_offload_xs_nr = 4
+	//      dss_helper_pool       = true   // 因为 4%18 != 0，即4个helper线程没法平均分给18个target，所以只能做成一个"共享池"即"helper pool"
+	//      dss_sys_xs_nr         = DAOS_TGT0_OFFSET + DRPC_XS_NR = 3
+	//
+	//  注：helper 和 offload 是同一个意思：辅助xstream，main-xstream把一些任务offload到辅助xstream
 	if (dss_helper_pool) {
 		comm =  (xs_id == 0) || /* DSS_XS_SYS */
 			(xs_id == 1) || /* DSS_XS_SWIM */
@@ -805,6 +852,7 @@ dss_start_one_xstream(hwloc_cpuset_t cpus, int tag, int xs_id)
 		dx->dx_main_xs	= (xs_id >= dss_sys_xs_nr) && (xs_offset == 0);
 	}
 	/* See the DSS_XS_IOFW case in sched_ult2xs. */
+	//Yuanguo: 按上面的例子，只有那行helper/offload xstram 才会 dx_iofw = true;
 	dx->dx_iofw = xs_id >= dss_sys_xs_nr && (!dx->dx_main_xs || dss_tgt_offload_xs_nr == 0);
 	dx->dx_dsc_started = false;
 
@@ -812,6 +860,22 @@ dss_start_one_xstream(hwloc_cpuset_t cpus, int tag, int xs_id)
 	 * Generate name for each xstreams so that they can be easily identified
 	 * and monitored independently (e.g. via ps(1))
 	 */
+	//Yuanguo: 按上面的例子
+	//  xs_id     ctx_id   dx_tgt_id  dx_name     dx_comm  dx_main_xs  dx_iofw
+	// -----------------------------------------------------------------------
+	//   0          0        -1      daos_sys_0     1       0            0
+	//   1          1        -1      daos_sys_1     1       0            0
+	//   2          -1       -1      daos_sys_2     0       0
+	// -----------------------------------------------------------------------
+	//   3          2        0       daos_io_0      1       1            0
+	//   4          3        1       daos_io_1      1       1            0
+	//   ...                 ...      ...           ...     ...          ...
+	//   20         19       17      daos_io_17     1       1            0
+	// -----------------------------------------------------------------------
+	//   21         20       -1      daos_off_21    1       0            1
+	//   22         21       -1      daos_off_22    1       0            1
+	//   23         22       -1      daos_off_23    1       0            1
+	//   24         23       -1      daos_off_24    1       0            1
 	dx->dx_tgt_id = dss_xs2tgt(xs_id);
 	if (xs_id < dss_sys_xs_nr) {
 		/** system xtreams are named daos_sys_$num */
@@ -1010,8 +1074,10 @@ dss_start_xs_id(int tag, int xs_id)
 	D_DEBUG(DB_TRACE, "start xs_id called for %d.\n", xs_id);
 	/* if we are NUMA aware, use the NUMA information */
 	if (dss_numa) {
-        //Yuanguo: 正常情况下，daos_server启动daos_engine时，通过-p选项指定了dss_numa_node
+		//Yuanguo: 正常情况（服务器启用numa，且在/etc/daos/daos_server.yml中根据numa node配置engine），会进入此分支；
+		//  且daos_server启动daos_engine时，通过-p选项指定了dss_numa_node，故不等于-1
 		if (dss_numa_node == -1) {
+			//Yuanguo: 所以，正常情况(如上)，不会进入此分支；
 			tgt = dss_xs2tgt(xs_id);
 			if (xs_id == 1) {
 				/** Put swim on first core of numa 1, core 0 */
@@ -1033,17 +1099,18 @@ dss_start_xs_id(int tag, int xs_id)
 			if (xs_id != 0)
 				clear = true;
 		} else {
+			//Yuanguo: 所以，正常情况(如上)，进入此分支；
 			ninfo = &dss_numa[dss_numa_node];
 			if (xs_id > 1 || (xs_id == 0 && dss_core_nr > dss_tgt_nr))
 				clear = true;
 		}
 
-        // Yuanguo: 正常情况下，daos_server启动daos_engine时，通过-p选项指定了dss_numa_node，并且在
-        //   server_init() -->
-        //   dss_topo_init()
-        // 中已经初始化了各个numa node (CPU socket)的core map；例如：
-        //   numa node 0 (ninfo->ni_idx = 0)有core 0, 1, 2, ..., 23
-        //   numa node 1 (ninfo->ni_idx = 1)有core 24, 25, 26, ..., 47
+		// Yuanguo: 正常情况下，daos_server启动daos_engine时，通过-p选项指定了dss_numa_node，并且在
+		//   server_init() -->
+		//   dss_topo_init()
+		// 中已经初始化了各个numa node (CPU socket)的core map；例如：
+		//   numa node 0 (ninfo->ni_idx = 0)有core 0, 1, 2, ..., 23
+		//   numa node 1 (ninfo->ni_idx = 1)有core 24, 25, 26, ..., 47
 		idx = hwloc_bitmap_first(ninfo->ni_coremap);
 		if (idx == -1) {
 			D_ERROR("No core available for XS: %d\n", xs_id);
@@ -1073,7 +1140,7 @@ dss_start_xs_id(int tag, int xs_id)
 		idx = (xs_core_offset + dss_core_offset) % dss_core_nr;
 	}
 
-    //Yuanguo: 为本target选择了CPU core `idx`，通过hwloc库获取这个CPU core的信息
+	//Yuanguo: 为本xtream选择了CPU core `idx`，通过hwloc库获取这个CPU core的信息
 	obj = hwloc_get_obj_by_depth(dss_topo, dss_core_depth, idx);
 	if (obj == NULL) {
 		D_PRINT("Null core returned by hwloc\n");
@@ -1161,7 +1228,41 @@ dss_xstreams_init(void)
 
 	xstream_data.xd_xs_nr = DSS_XS_NR_TOTAL;
 	tags                  = DAOS_SERVER_TAG - DAOS_TGT_TAG;
+
+	//Yuanguo:
+	//  配置文件 /etc/daos/daos_server.yml：
+	//      targets: 18             # number of I/O service threads per-engine
+	//      nr_xs_helpers: 4        # count of I/O offload threads per engine
+	//
+	//  进程
+	//      /usr/bin/daos_engine -t 18 -x 4 ...
+	//
+	//  这种情况下：
+	//      dss_tgt_nr            = 18
+	//      dss_tgt_offload_xs_nr = 4
+	//      dss_helper_pool       = true   // 因为 4%18 != 0，即4个helper线程没法平均分给18个target，所以只能做成一个"共享池"即"helper pool"
+	//      dss_sys_xs_nr         = DAOS_TGT0_OFFSET + DRPC_XS_NR = 3
+	//
+	//  注：helper 和 offload 是同一个意思：辅助xstream，main-xstream把一些任务offload到辅助xstream
+	//
+	//  xs_id     ctx_id   dx_tgt_id  dx_name     dx_comm  dx_main_xs  dx_iofw
+	// -----------------------------------------------------------------------
+	//   0          0        -1      daos_sys_0     1       0            0
+	//   1          1        -1      daos_sys_1     1       0            0
+	//   2          -1       -1      daos_sys_2     0       0
+	// -----------------------------------------------------------------------
+	//   3          2        0       daos_io_0      1       1            0
+	//   4          3        1       daos_io_1      1       1            0
+	//   ...                 ...      ...           ...     ...          ...
+	//   20         19       17      daos_io_17     1       1            0
+	// -----------------------------------------------------------------------
+	//   21         20       -1      daos_off_21    1       0            1
+	//   22         21       -1      daos_off_22    1       0            1
+	//   23         22       -1      daos_off_23    1       0            1
+	//   24         23       -1      daos_off_24    1       0            1
+
 	/* start system service XS */
+	//Yuanguo: 启动 daos_sys_0, daos_sys_1, daos_sys_2
 	for (i = 0; i < dss_sys_xs_nr; i++) {
 		xs_id = i;
 		rc    = dss_start_xs_id(tags, xs_id);
@@ -1171,7 +1272,8 @@ dss_xstreams_init(void)
 	}
 
 	/* start main IO service XS */
-    //Yuanguo: main IO service XS就是target XStream;
+	//Yuanguo: main IO service XS就是target XStream;
+	//  启动 daos_io_0, daos_io_1, ..., daos_io_17
 	for (i = 0; i < dss_tgt_nr; i++) {
 		xs_id = DSS_MAIN_XS_ID(i);
 		rc    = dss_start_xs_id(DAOS_SERVER_TAG, xs_id);
@@ -1182,6 +1284,7 @@ dss_xstreams_init(void)
 	/* start offload XS if any */
 	if (dss_tgt_offload_xs_nr > 0) {
 		if (dss_helper_pool) {
+			//Yuanguo: 启动 daos_off_21, daos_off_22, daos_off_23, daos_off_24
 			for (i = 0; i < dss_tgt_offload_xs_nr; i++) {
 				xs_id = dss_sys_xs_nr + dss_tgt_nr + i;
 				rc    = dss_start_xs_id(DAOS_OFF_TAG, xs_id);
@@ -1492,8 +1595,8 @@ dss_srv_init(void)
 	}
 	xstream_data.xd_init_step = XD_INIT_TLS_INIT;
 
-    //Yuanguo: MD-on-SSD情况下，sys_db在/var/daos/config/daos_control/engine1/daos_sys/
-    // 否则，在SCM中；
+	//Yuanguo: MD-on-SSD情况下，sys_db在/var/daos/config/daos_control/engine1/daos_sys/
+	// 否则，在SCM中；
 	rc = dss_sys_db_init();
 	if (rc != 0) {
 		D_ERROR("Failed to initialize local DB: "DF_RC"\n", DP_RC(rc));
@@ -1517,9 +1620,9 @@ dss_srv_init(void)
 	D_ASSERT(rc == 0);
 
 	/* start up drpc listener */
-    //Yuanguo: 主线程(非xstream，daos_server启动的daos_engine)，完成上述初始化，
-    // 现在监听 /var/run/daos_server/daos_engine_{主线程id}.sock；
-    // 这个unix socket用于和daos_server进程通信，用于management；
+	//Yuanguo: 主线程(非xstream，daos_server启动的daos_engine进程的主线程)，完成上述初始化之后
+	// 现在监听 /var/run/daos_server/daos_engine_{主线程id}.sock；
+	// 这个unix socket用于和daos_server进程通信，用于management；
 	rc = drpc_listener_init();
 	if (rc != 0) {
 		D_ERROR("Failed to start dRPC listener: "DF_RC"\n", DP_RC(rc));

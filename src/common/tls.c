@@ -15,9 +15,53 @@ pthread_mutex_t                daos_module_keys_lock                 = PTHREAD_M
 
 static __thread bool           dc_tls_thread_init;
 
+//Yuanguo: 关于pthread_key_t的用法(以dss_tls_key为例):
+//  - 它必须通过系统调用pthread_key_create()初始化；使用完，通过系统调用pthread_key_delete()销毁；
+//  - 它是一个全局变量，即一个进程一份；
+//  - 但通过它，实现thread-specific，如下：
+//      - 系统调用pthread_setspecific(dss_tls_key, const void *value); 为“calling thread”的dss_tls_key设置一个value；
+//        注意：虽然dss_tls_key是进程全局的，但设置的value却是“calling thread”自己的；也就是说，不同thread都可以调用
+//        这个函数设置自己thread-specific的value；
+//           thread-A:  pthread_setspecific(dss_tls_key, val_A);
+//           thread-B:  pthread_setspecific(dss_tls_key, val_B);
+//           ...
+//        针对dss_tls_key，系统为每个thread维护一个value;
+//      - 系统调用pthread_getspecific(dss_tls_key);的功能显而易见，返回“calling thread”自己的那个value:
+//           thread-A:  pthread_getspecific(dss_tls_key);返回val_A;
+//           thread-B:  pthread_getspecific(dss_tls_key);返回val_B;
+//           ...
+//  - 总之，虽然pthread_key_t dss_tls_key是一个全局变量，但它背后确像一个map<thread_id, void*>;
+
+//Yuanguo: 注意和 "__thread"的区别(例如上面的static __thread bool dc_tls_thread_init;)
+//  - __thread 是GCC编译器提供的一个扩展关键字，用于声明**线程局部存储（Thread-Local Storage, TLS）**的变量
+//  - __thread 标记的变量，不是一个“全局变量”，而是“线程内全局”,即Thread-Local；
+//  - 支持GCC扩展的环境下、高频访问、编译期确定的简单数据用__thread方式；
+//  - 需要跨平台，低频访问，有复杂生命周期数据使用pthread_setspecific/pthread_getspecific方式；
+//  - 这里dc_tls_thread_init(__thread)和dc_tls_key配合使用；
+
+//Yuanguo: dss_tls_key用于server端；dc_tls_key用于client端；
+//  它们不可能在同一个进程中，为什么不用同一个变量呢？
 static pthread_key_t           dss_tls_key;
 static pthread_key_t           dc_tls_key;
 
+//Yuanguo:
+//        dss_tls_key -----> +-------------------------------------+           struct daos_thread_local_storage
+//              thread-A     | struct daos_thread_local_storage *  | -----> +------------------------------------+
+//                           +-------------------------------------+        |  uint32_t dtls_tag;                |
+//              thread-B     | struct daos_thread_local_storage *  |        |  void   **dtls_values; -----+      |
+//                           +-------------------------------------+        +-----------------------------|------+
+//              ......       | struct daos_thread_local_storage *  |                                      |
+//                           +-------------------------------------+               +----------------------+
+//                                                                                 |
+//                                                                                 V
+//                                                                                 +-----+-----+-----+-----+
+//                                                                                 |void*|void*|void*| ... |DAOS_MODULE_KEYS_NR个
+//                                                                                 +-----+-----+-----+-----+
+//                                                                                    |     |     |
+//                                                                                    |     |     V
+//                                                                                    |     V    ...
+//                                                                                    V   通过daos_module_keys[1]->dmk_init初始化；
+//                                                                                 通过daos_module_keys[0]->dmk_init初始化；
 void
 daos_register_key(struct daos_module_key *key)
 {

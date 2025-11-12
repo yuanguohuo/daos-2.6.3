@@ -203,10 +203,18 @@ daos_init(void)
 		D_GOTO(out_agent, rc);
 
 	/** get and cache attach info of default system */
+	//Yuanguo: connect /var/run/daos_agent/daos_agent.sock, send rpc request, parse response;
+	//  初始化全局变量：
+	//        static struct dc_mgmt_sys_info info_g;
+	//        static Mgmt__GetAttachInfoResp *resp_g;
+	//  它们是DAOS集群的一些信息；
 	rc = dc_mgmt_cache_attach_info(NULL);
 	if (rc != 0)
 		D_GOTO(out_job, rc);
 
+	//Yuanguo: 初始化全局变量daos_crt_init_opt，并返回它的指针；
+	//  下面dc_mgmt_net_cfg_init()对它进一步配置(transport provider, interface等)
+	//  最后，daos_eq_lib_init()使用它来initialize CRT transport layer;
 	crt_info = daos_crt_init_opt_get(false, 1);
 	/**
 	 * get CaRT configuration (see mgmtModule.handleGetAttachInfo for the

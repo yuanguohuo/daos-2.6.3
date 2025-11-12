@@ -21,6 +21,10 @@ struct jm_obj_placement {
 	struct pool_domain	 *jmop_root;
 	unsigned int		  jmop_grp_size;
 	unsigned int		  jmop_grp_nr;
+	//Yuanguo:
+	//  jmop_fdom_lvl : fault domain level, 通常是 PO_COMP_TP_NODE
+	//  jmop_dom_nr   : fault domain数，例如jmop_fdom_lvl=PO_COMP_TP_NODE，则jmop_dom_nr是node数；
+	//  jmop_pd_nr    : performance domain level，在without performance domain的情况下，值为0;
 	pool_comp_type_t	  jmop_fdom_lvl;
 	uint32_t		  jmop_dom_nr;
 	/* #PDs to-be-used for the obj */
@@ -41,7 +45,12 @@ struct jm_obj_placement {
  */
 struct pl_jump_map {
 	/** placement map interface */
+	//Yuanguo: 父类 -- 通过组合实现类似于继承的效果；
 	struct pl_map		jmp_map;
+	//Yuanguo: 和struct jm_obj_placement 的字段一样
+	//  jmp_redundant_dom (jmop_fdom_lvl) : fault domain level, 通常是 PO_COMP_TP_NODE
+	//  jmp_domain_nr     (jmop_dom_nr)   : fault domain数，例如jmop_fdom_lvl=PO_COMP_TP_NODE，则jmop_dom_nr是node数；
+	//  jmp_pd_nr         (jmop_pd_nr)    : performance domain level，在without performance domain的情况下，值为0;
 	/** Number of performance domains (can be zero) */
 	unsigned int		jmp_pd_nr;
 	/* Total size of domain type specified during map creation */

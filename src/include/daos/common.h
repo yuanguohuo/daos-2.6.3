@@ -353,6 +353,7 @@ daos_gettime_coarse(void)
 
 /** Function table for combsort and binary search */
 typedef struct {
+	//Yuanguo: 排序时使用
 	void    (*so_swap)(void *array, int a, int b);
 	/**
 	 * For ascending order:
@@ -360,8 +361,10 @@ typedef struct {
 	 * 1	array[a] > array[b]
 	 * -1	array[a] < array[b]
 	 */
+	//Yuanguo: 排序时使用
 	int     (*so_cmp)(void *array, int a, int b);
 	/** for binary search, returned value is the same as so_cmp() */
+	//Yuanguo: 查找时使用
 	int	(*so_cmp_key)(void *array, int i, uint64_t key);
 } daos_sort_ops_t;
 

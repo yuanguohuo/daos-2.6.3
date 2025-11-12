@@ -1118,6 +1118,7 @@ dc_obj_shard_rw(struct dc_obj_shard *shard, enum obj_rpc_opc opc,
 	if ((int)tgt_ep.ep_rank < 0)
 		D_GOTO(out, rc = (int)tgt_ep.ep_rank);
 
+	//Yuanguo: 生成RCP调用的请求`req`；
 	rc = obj_req_create(daos_task2ctx(task), &tgt_ep, opc, &req);
 	D_DEBUG(DB_TRACE, "rpc %p opc:%d "DF_UOID" "DF_KEY" rank:%d tag:%d eph "
 		DF_U64"\n", req, opc, DP_UOID(shard->do_id), DP_KEY(dkey),
@@ -1128,6 +1129,7 @@ dc_obj_shard_rw(struct dc_obj_shard *shard, enum obj_rpc_opc opc,
 	if (DAOS_FAIL_CHECK(DAOS_SHARD_OBJ_FAIL))
 		D_GOTO(out_req, rc = -DER_INVAL);
 
+	//Yuanguo: orw 是 req 中的 input 参数；下面开始准备 input 参数；
 	orw = crt_req_get(req);
 	D_ASSERT(orw != NULL);
 
@@ -1199,6 +1201,10 @@ dc_obj_shard_rw(struct dc_obj_shard *shard, enum obj_rpc_opc opc,
 		tgt_ep.ep_tag, auxi->epoch.oe_value, DP_DTI(&orw->orw_dti),
 		orw->orw_start_shard, orw->orw_map_ver);
 
+	//Yuanguo: orw->orw_bulks.ca_arrays:ca_count 和 orw->orw_sgls.ca_arrays:ca_count 二者之一 指向内存buffer
+	//  取决于 args->bulks 是否初始化；
+	//    - args->bulks 的初始化见 shard_rw_prep(): shard_arg->bulks = obj_auxi->bulks;
+	//    - obj_auxi->bulks 的初始化见 dc_obj_fetch_task()/dc_obj_update() --> obj_rw_bulk_prep()
 	if (args->bulks != NULL) {
 		orw->orw_sgls.ca_count = 0;
 		orw->orw_sgls.ca_arrays = NULL;
@@ -1224,6 +1230,7 @@ dc_obj_shard_rw(struct dc_obj_shard *shard, enum obj_rpc_opc opc,
 		orw->orw_bulks.ca_arrays = NULL;
 	}
 
+	//Yuanguo: rw_args 是 completion 回调函数 dc_rw_cb 的参数;
 	crt_req_addref(req);
 	rw_args.rpc = req;
 	rw_args.hdlp = (daos_handle_t *)pool;
@@ -1258,6 +1265,7 @@ dc_obj_shard_rw(struct dc_obj_shard *shard, enum obj_rpc_opc opc,
 	if (DAOS_FAIL_CHECK(DAOS_SHARD_OBJ_RW_CRT_ERROR))
 		D_GOTO(out_args, rc = -DER_HG);
 
+	//Yuanguo: 把completion 回调函数 dc_rw_cb 的指针及其参数的指针，注册到 struct tse_task_private 的 dtp_comp_cb_list 中；
 	rc = tse_task_register_comp_cb(task, dc_rw_cb, &rw_args,
 				       sizeof(rw_args));
 	if (rc != 0)
@@ -1275,6 +1283,7 @@ dc_obj_shard_rw(struct dc_obj_shard *shard, enum obj_rpc_opc opc,
 				D_ERROR("crt_req_set_timeout error: %d\n", rc);
 		    }
 
+		//Yuanguo: 实际发起RPC
 		rc = daos_rpc_send(req, task);
 	}
 

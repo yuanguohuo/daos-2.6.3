@@ -75,6 +75,12 @@ enum {
  * If there are multiple elements have the same key, it returns the first
  * appearance.
  */
+//Yuanguo:
+//  - 有相等元素：返回第1个相等的(从前向后遍历第1个)；
+//  - 无相等元素：
+//        - FIND_OPC_EQ：返回-1
+//        - FIND_OPC_LE：返回小于key中最大的(若有小于key的)或者-1(若都大于key)；
+//        - FIND_OPC_GE：返回大于key中最小的(若有大于key的)或者-1(若都小于key)；
 static int
 array_bin_search(void *array, unsigned int len, uint64_t key, int opc,
 		 daos_sort_ops_t *ops)
@@ -121,6 +127,11 @@ array_bin_search(void *array, unsigned int len, uint64_t key, int opc,
 		}
 	}
 
+	//Yuanguo: 现在rc == 0，即 cur 元素与 key 相等
+	//  - FIND_OPC_LE: 往前找，直到 cur-1 元素和 key 不相等，则返回cur，即第一个相等的；
+	//  - FIND_OPC_GE: 往前找，直到 cur-1 元素和 key 不相等，则返回cur，即第一个相等的；
+	//  - FIND_OPC_EQ: 往前找，直到 cur-1 元素和 key 不相等，则返回cur，即第一个相等的；
+	//三种情况都一样：返回第1个相等的 (数组从前向后遍历第1个)；
 	for (; cur > 0; cur--) {
 		rc = ops->so_cmp_key(array, cur - 1, key);
 		if (rc != 0)

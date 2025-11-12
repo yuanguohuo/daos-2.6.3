@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <daos/agent.h>
 
+//Yuanguo: 默认是/var/run/daos_agent/daos_agent.sock
 char *dc_agent_sockpath;
 
 int

@@ -79,6 +79,7 @@ daos_eq_lib_init(crt_init_options_t *crt_info)
 		D_GOTO(unlock, rc = 0);
 	}
 
+	//Yuanguo: 初始化CRT transport layer;
 	rc = crt_init_opt(NULL, 0, crt_info);
 	if (rc != 0) {
 		D_ERROR("failed to initialize crt: "DF_RC"\n", DP_RC(rc));
@@ -262,6 +263,11 @@ daos_eq_handle(struct daos_eq_private *eqx, daos_handle_t *h)
 	daos_hhash_link_key(&eqx->eqx_hlink, &h->cookie);
 }
 
+//Yuanguo:
+//  - 把event的状态设置为DAOS_EVS_RUNNING;
+//  - 若有parent，则递增parent的evx_nchild_running；然后直接返回，不连到event queue的running链表(将来parent连到event queue，它就不必连了?)
+//  - 否则，没有parent，若有event queue，则把event连到event queue的running链表；
+// 注：thread-specific event没有parent也没有event queue；
 static void
 daos_event_launch_locked(struct daos_eq_private *eqx,
 			 struct daos_event_private *evx)
@@ -420,6 +426,9 @@ daos_event_launch(struct daos_event *ev)
 	struct daos_eq_private		*eqx = NULL;
 	int				  rc = 0;
 
+	//Yuanguo: DAOS_EVS_READY是event的初始状态，见daos_event_init()；
+	//  只有DAOS_EVS_READY的event才能launch；
+	//  thread-specific event每执行完一个task还会回到DAOS_EVS_READY状态，处理下一个task;
 	if (atomic_load(&evx->evx_status) != DAOS_EVS_READY) {
 		D_ERROR("Event status should be INIT: %d\n", evx->evx_status);
 		return -DER_NO_PERM;
@@ -454,6 +463,8 @@ daos_event_launch(struct daos_event *ev)
 	 * If all child events completed before a barrier parent was launched,
 	 * complete the parent.
 	 */
+	//Yuanguo: barrier event(parent)应该没有实际的工作，只是界限前面的children events完成；
+	//  所以，children events都完成了，barrier event(parent)也就完成了；
 	if (evx->is_barrier && evx->evx_nchild > 0 &&
 	    evx->evx_nchild == evx->evx_nchild_comp) {
 		D_ASSERT(evx->evx_nchild_running == 0);
@@ -539,6 +550,8 @@ ev_progress_cb(void *arg)
 	struct daos_eq_private		*eqx = epa->eqx;
 	int				rc;
 
+	//Yuanguo: 推动event所属的scheduler执行它的task；在本线程内处理sheduler的各个列表，细节见：
+	//  tse_sched_progress() --> tse_sched_run()
 	tse_sched_progress(evx->evx_sched);
 
 	if (daos_handle_is_inval(evx->evx_eqh))
@@ -1301,6 +1314,8 @@ daos_event_priv_wait()
 
 	/* Wait on the event to complete */
 	while (atomic_load(&evx->evx_status) != DAOS_EVS_READY) {
+		//Yuanguo: ev_progress_cb推动event所属的scheduler执行它的task；在本线程内处理sheduler的各个列表，细节见：
+		//  tse_sched_progress() --> tse_sched_run()
 		rc = crt_progress_cond(evx->evx_ctx, ev_prog_timeout, ev_progress_cb, &epa);
 
 		/** progress succeeded, loop can exit if event completed */

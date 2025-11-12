@@ -49,6 +49,10 @@ struct daos_event_private {
 	d_list_t		evx_link;
 	/** children list */
 	d_list_t		evx_child;
+	//Yuanguo: 要想launch一个parent event，要满足它的children都已经被launch(running或completed)，即
+	//  evx_nchild == evx_nchild_running + evx_nchild_comp；
+	//  否则，evx_nchild > evx_nchild_running + evx_nchild_comp，则不允许launch parent event;
+	//  见daos_event_launch()函数；
 	unsigned int		evx_nchild;
 	unsigned int		evx_nchild_running;
 	unsigned int		evx_nchild_comp;
@@ -67,6 +71,9 @@ struct daos_event_private {
 
 	tse_sched_t		*evx_sched;
 	/** Lock for events that are not in an EQ, including the thread private event */
+	//Yuanguo: 线程私有的event被线程上所有task使用，所以要加锁；event queue中的event不需要，evx_lock也不初始化；
+	//  daos_event_init(): 初始化evx_lock (对于线程私有的event)
+	//  daos_event_launch(): 锁evx_lock(对于线程私有的event)
 	pthread_mutex_t		evx_lock;
 };
 

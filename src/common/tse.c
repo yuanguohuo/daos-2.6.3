@@ -68,6 +68,7 @@ tse_sched_init(tse_sched_t *sched, tse_sched_comp_cb_t comp_cb,
 	return 0;
 }
 
+//Yuanguo: 向上取整到8的倍数；
 static inline uint32_t
 tse_task_buf_size(int size)
 {
@@ -80,6 +81,32 @@ tse_task_buf_size(int size)
  * way doesn't work well for public use.
  * We should make this simpler now and more generic as the comment below.
  */
+//Yuanguo:
+//        dtp_buf space of struct tse_task_private
+//     +============================================+  <--------------------- dtp->dtp_buf
+//     |                                            |         |
+//     |                                            |         |
+//     |           struct daos_task_args            |    dtp->dtp_embed_top
+//     |                                            |         |
+//     |                                            |         |
+//     +============================================+  <---------------------
+//     | low addr                                   |
+//     |                                            |
+//     |                                            |
+//     |                                            |
+//     |                                            |
+//     |                                            |
+//     |                                            |
+//     |                    ^                       |
+//     |                    |                       |
+//     |               stack grows                  |
+//     |                    |                       |
+//     | high addr          |                       |
+//     |--------------------------------------------|  <---------------------
+//     |++++++++++++++++++++++++++++++++++++++++++++|          |
+//     |++++++++++++++ used stack space ++++++++++++|    dtp->dtp_stack_top 已使用的栈空间大小
+//     |++++++++++++++++++++++++++++++++++++++++++++|          |
+//     +============================================+  <--------------------- dtp->dtp_buf + sizeof(dtp->dtp_buf)
 void *
 tse_task_buf_embedded(tse_task_t *task, int size)
 {
@@ -88,6 +115,7 @@ tse_task_buf_embedded(tse_task_t *task, int size)
 
 	/** Let's assume dtp_buf is always enough at the moment */
 	/** MSC - should malloc if size requested is bigger */
+	//Yuanguo: 向上取整到8的倍数；
 	size = tse_task_buf_size(size);
 	D_ASSERT(size < UINT16_MAX);
 	avail_size = sizeof(dtp->dtp_buf) - dtp->dtp_stack_top;
@@ -101,6 +129,8 @@ tse_task_buf_embedded(tse_task_t *task, int size)
 	return (void *)dtp->dtp_buf;
 }
 
+//Yuanguo: 虽然函数名叫push, 其实是在stack(struct tse_task_private的dtp_buf[TSE_TASK_ARG_LEN]空间)
+//  上分配一块大小为size的内存，返回其指针；
 void *
 tse_task_stack_push(tse_task_t *task, uint32_t size)
 {
@@ -116,6 +146,37 @@ tse_task_stack_push(tse_task_t *task, uint32_t size)
 		   size, avail_size, sizeof(dtp->dtp_buf),
 		   dtp->dtp_stack_top, dtp->dtp_embed_top);
 
+	//Yuanguo: 假设
+	//  - 此时stack已使用100字节，即dtp_stack_top=100
+	//  - 目标要分配size = 16字节；
+	//
+	//  1. 更新dtp_stack_top=116;
+	//  2. 从栈底(dtp->dtp_buf + sizeof(dtp->dtp_buf))减去116；
+	//        dtp_buf space of struct tse_task_private
+	//     +============================================+  <---------------------  dtp->dtp_buf
+	//     |                                            |         |
+	//     |                                            |         |
+	//     |           struct daos_task_args            |    dtp->dtp_embed_top
+	//     |                                            |         |
+	//     |                                            |         |
+	//     +============================================+  <---------------------
+	//     | low addr                                   |
+	//     |                                            |
+	//     |                                            |
+	//     |                                            |
+	//     |                                            |
+	//     |                    ^                       |
+	//     |                    |                       |
+	//     |               stack grows                  |
+	//     |                    |                       |
+	//     | high addr          |                       |
+	//     |--------------------------------------------|  <--------------------- pushed_ptr
+	//     |            新分配的16字节空间              |         16
+	//     |--------------------------------------------|  <---------------------
+	//     |++++++++++++++++++++++++++++++++++++++++++++|
+	//     |++++++++++++++ used stack space ++++++++++++|         100  已使用的栈空间大小
+	//     |++++++++++++++++++++++++++++++++++++++++++++|
+	//     +============================================+  <--------------------- dtp->dtp_buf + sizeof(dtp->dtp_buf)
 	dtp->dtp_stack_top += size;
 	pushed_ptr = dtp->dtp_buf + sizeof(dtp->dtp_buf) - dtp->dtp_stack_top;
 	D_ASSERT((dtp->dtp_stack_top + dtp->dtp_embed_top) <=
@@ -479,6 +540,8 @@ tse_task_prep_callback(tse_task_t *task)
 		D_FREE(dtc);
 		new_gen = dtp_generation_get(dtp);
 		/** Task was re-initialized; */
+		//Yuanguo: dtp->dtp_generation的注释说: +1 every time when task re-init or add dependent task
+		//  所以，new_gen != gen 说明中间执行的是re-init;
 		if (!atomic_load(&dtp->dtp_running) && new_gen != gen)
 			ret = false;
 	}
@@ -535,6 +598,19 @@ tse_task_complete_callback(tse_task_t *task)
  * list, and then executes all the body functions of all tasks with no
  * dependencies in the scheduler's init list.
  */
+//Yuanguo:
+//  dsp代表一个scheduler，它有以下4个list，用于维护不同状态的tasks
+//      - dsp_sleeping_list
+//      - dsp_init_list
+//      - dsp_running_list
+//      - dsp_complete_list
+//  本函数
+//      1. 把dsp_sleeping_list中，dtp_wakeup_time已到的tasks移到dsp_init_list;
+//      2. 把dsp_init_list中没有依赖(dtp_dep_cnt == 0)的task已到临时列表`list`;
+//      3. 遍历`list`，对其中的每个task
+//            - 移到dsp_running_list;
+//            - 调用task(struct tse_task_private)dtp_prep_cb_list中的所有callback；
+//            - 调用task(struct tse_task_private)的dtp_func，即task的body function;
 static int
 tse_sched_process_init(struct tse_sched_private *dsp)
 {
@@ -605,6 +681,8 @@ tse_sched_process_init(struct tse_sched_private *dsp)
  * Check the task in the complete list, dependent task status check, schedule status update etc. The
  * task will be moved to fini list after this.
  **/
+//Yuanguo: 本函数主要处理依赖当前task(`task`)的其它task；
+//  例如，当前task(`task`)完成了，依赖它的其它task的依赖计数应该减1;
 static int
 tse_task_post_process(tse_task_t *task)
 {
@@ -616,6 +694,7 @@ tse_task_post_process(tse_task_t *task)
 	D_MUTEX_LOCK(&dsp->dsp_lock);
 
 	/* set scheduler result */
+	//Yuanguo: ds_result == 0 代表成功？若已经失败(不为0)则不必再更新；
 	if (tse_priv2sched(dsp)->ds_result == 0)
 		tse_priv2sched(dsp)->ds_result = task->dt_result;
 
@@ -635,16 +714,27 @@ tse_task_post_process(tse_task_t *task)
 		D_FREE(tlink);
 
 		/* propagate dep task's failure */
+		//Yuanguo: task_tmp/dtp_tmp是依赖当前task (`task`)的task;
+		//  它还没有失败，并且它要求传播`task`的结果，则把`task`的结果传播给它；
 		if (task_tmp->dt_result == 0 && !dtp_tmp->dtp_no_propagate)
 			task_tmp->dt_result = task->dt_result;
 
 		dsp_tmp = dtp_tmp->dtp_sched;
 		diff_sched = dsp != dsp_tmp;
 
+		//Yuanguo: task_tmp/dtp_tmp是依赖当前task(`task`)的task;
+		//  它属于一个不同的scheduler;
 		if (diff_sched) {
 			D_MUTEX_UNLOCK(&dsp->dsp_lock);
 			D_MUTEX_LOCK(&dsp_tmp->dsp_lock);
 		}
+    //Yuanguo: task_tmp/dtp_tmp是依赖当前task(`task`)的task;
+    //  它可能依赖多个task，通过dtp_dep_cnt计数；
+    //  当前task是其中之一，当前task完成了，所以把计数减1；
+    //  若减1之后 task_tmp/dtp_tmp的dtp_dep_cnt计数为0，说明所有的依赖都已经ready，可以进入running列表了；
+    //  但有一种情况，就是task_tmp/dtp_tmp已经在running列表中了，这种情况是：
+    //      task_tmp/dtp_tmp在运行中创建了当前task(`task`)，也就是当前task(`task`)是task_tmp/dtp_tmp的subtask;
+    //      所有subtask完成之后，task_tmp/dtp_tmp的计数就为0了，所以task_tmp/dtp_tmp也应该完成了；
 		/* see if the dependent task is ready to be scheduled */
 		D_ASSERT(dtp_tmp->dtp_dep_cnt > 0);
 		dtp_tmp->dtp_dep_cnt--;
@@ -696,6 +786,17 @@ tse_task_post_process(tse_task_t *task)
 	return rc;
 }
 
+//Yuanguo:
+//  dsp代表一个scheduler，它有以下4个list，用于维护不同状态的tasks
+//      - dsp_sleeping_list
+//      - dsp_init_list
+//      - dsp_running_list
+//      - dsp_complete_list
+//  本函数
+//      1. 把dsp_complete_list移到临时列表`comp_list`;
+//      2. 遍历临时列表`comp_list`，对其中的每个task，处理依赖它的其它task，
+//         例如，依赖它的其它task的依赖计数应该减1;
+//         见tse_task_post_process()函数；
 int
 tse_sched_process_complete(struct tse_sched_private *dsp)
 {
@@ -707,6 +808,7 @@ tse_sched_process_complete(struct tse_sched_private *dsp)
 	/* pick tasks from complete_list */
 	D_INIT_LIST_HEAD(&comp_list);
 	D_MUTEX_LOCK(&dsp->dsp_lock);
+	//Yuanguo: 把dsp->dsp_complete_list里的所有task移到comp_list；dsp->dsp_complete_list被清空(重新初始化);
 	d_list_splice_init(&dsp->dsp_complete_list, &comp_list);
 	D_MUTEX_UNLOCK(&dsp->dsp_lock);
 
@@ -723,6 +825,7 @@ tse_sched_process_complete(struct tse_sched_private *dsp)
 	return processed;
 }
 
+//Yuanguo: scheduler的task是否都已完成；
 bool
 tse_sched_check_complete(tse_sched_t *sched)
 {
@@ -752,6 +855,7 @@ tse_sched_run(tse_sched_t *sched)
 		processed += tse_sched_process_init(dsp);
 		processed += tse_sched_process_complete(dsp);
 		completed = tse_sched_check_complete(sched);
+		//Yuanguo: 若scheduler的所有task都已完成，或者上面没有处理任何一个task（说明所有task都没有ready，例如有依赖），则退出；
 		if (completed || processed == 0)
 			break;
 	};
@@ -962,6 +1066,12 @@ tse_task_create(tse_task_func_t task_func, tse_sched_t *sched, void *priv,
 	D_INIT_LIST_HEAD(&dtp->dtp_prep_cb_list);
 
 	dtp->dtp_refcnt   = 1;
+	//Yuanguo:
+	//  - DAOS_OPC_OBJ_OPEN: dc_obj_open
+	//  - DAOS_OPC_OBJ_UPDATE: dc_obj_update_task
+	//  - DAOS_OPC_OBJ_FETCH: dc_obj_fetch_task
+	//  - DAOS_OPC_OBJ_LIST_DKEY: dc_obj_list_dkey
+	//  - DAOS_OPC_OBJ_LIST_AKEY: dc_obj_list_akey
 	dtp->dtp_func	  = task_func;
 	dtp->dtp_priv	  = priv;
 	dtp->dtp_sched	  = dsp;
@@ -1013,12 +1123,17 @@ tse_task_schedule_with_delay(tse_task_t *task, bool instant, uint64_t delay)
 	bool				ready;
 	int				rc = 0;
 
+	//Yuanguo: 若instant为true，则一定要求：dtp->dtp_func && delay == 0
 	D_ASSERT(!instant || (dtp->dtp_func && delay == 0));
 
 	/* Add task to scheduler */
 	D_MUTEX_LOCK(&dsp->dsp_lock);
+	//Yuanguo: tse_sched_process_init()中调用tse_task_prep_callback()，若有prep callback，则逐个触发，
+	//  并从dtp_prep_cb_list中删除；
 	ready = (dtp->dtp_dep_cnt == 0 && d_list_empty(&dtp->dtp_prep_cb_list));
 	if ((dtp->dtp_func == NULL || instant) && ready) {
+		//Yuanguo: Case-A, 调用者要求立即执行(instant为true)，并且就绪(ready为true)，
+		//  所以，直接加入scheduler的dsp_running_list;
 		/** If task has no body function, mark it as running */
 		dsp->dsp_inflight++;
 		dtp->dtp_running = 1;
@@ -1029,10 +1144,14 @@ tse_task_schedule_with_delay(tse_task_t *task, bool instant, uint64_t delay)
 		if (instant)
 			tse_task_addref_locked(dtp);
 	} else if (delay == 0) {
+		//Yuanguo: Case-B, 不要求立即执行或者没有ready，但delay=0, 则加入scheduler的dsp_init_list;
+		//  scheduler不用从它的dsp_sleeping_list 移到 dsp_init_list
 		/** Otherwise, scheduler will process it from init list */
 		dtp->dtp_wakeup_time = 0;
 		d_list_add_tail(&dtp->dtp_list, &dsp->dsp_init_list);
 	} else {
+		//Yuanguo: Case-C, delay>0, 则加入scheduler的dsp_sleeping_list；
+		//  scheduler执行时，检查是否到delay的时间，若到了，则移到dsp_init_list
 		/* A delay is requested; insert into the sleeping list. */
 		dtp->dtp_wakeup_time = daos_getutime() + delay;
 		tse_task_insert_sleeping(dtp, dsp);
@@ -1042,11 +1161,22 @@ tse_task_schedule_with_delay(tse_task_t *task, bool instant, uint64_t delay)
 	D_MUTEX_UNLOCK(&dsp->dsp_lock);
 
 	/** if caller wants to run the task instantly, call the task body function now. */
+	//Yuanguo: 一定符合上面Case-A，故已经在scheduler的dsp_running_list中；
 	if (instant && ready) {
 		/** result of task should be set in dt_result and checked by caller. */
+		//Yuanguo: dtp->dtp_func
+		//  - DAOS_OPC_OBJ_OPEN: dc_obj_open
+		//  - DAOS_OPC_OBJ_UPDATE: dc_obj_update_task
+		//  - DAOS_OPC_OBJ_FETCH: dc_obj_fetch_task
+		//  - DAOS_OPC_OBJ_LIST_DKEY: dc_obj_list_dkey
+		//  - DAOS_OPC_OBJ_LIST_AKEY: dc_obj_list_akey
 		dtp->dtp_func(task);
 		tse_task_decref(task);
 	}
+
+	//Yuanguo: 综上，无论是Case-A, Case-B, Case-C的哪一种，task都已经进入scheduler的某个list中；
+	//  scheduler什么时候执行它呢？其中Case-A已经开始执行；Case-B和Case-C见:
+	//  tse_sched_progress() --> tse_sched_run()
 	return rc;
 }
 

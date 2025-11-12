@@ -232,6 +232,9 @@ __get_target_v1(struct pool_domain *root_pos, struct pool_domain *curr_pd,
 		avail_doms = get_num_domains(curr_dom, allow_version, gen_mode, fdom_lvl);
 
 		/* If choosing target (lowest fault domain level) */
+		//Yuanguo: curr_dom 是 lowest fault domain level, 例如是一个node (PO_COMP_TP_NODE)
+		// 要在1个node里最多选择一个target (不能2个target落在同一个node上，这样1个node故障影响多片数据)
+		// 所以，直接选择target，不管中间层(例如rank)；类似于ceph crush算法的choose_leaf
 		if (curr_dom->do_comp.co_type == fdom_lvl) {
 			uint32_t        fail_num = 0;
 			uint32_t        tgt_idx;
@@ -266,6 +269,8 @@ __get_target_v1(struct pool_domain *root_pos, struct pool_domain *curr_pd,
 						      gen_mode);
 				/* Get target id to check if target used */
 				tgt_idx = *target - root_pos->do_targets;
+				//Yuanguo: d_hash_jump得到一个target，若此target已在tgts_used中，则尝试下一个！
+				//  当然，在父节点的范围内：遇到最后一个，要回绕到第一个 (见上面selected_tgt = selected_tgt % avail_doms)
 				selected_tgt++;
 			} while (isset(tgts_used, tgt_idx));
 
@@ -273,6 +278,8 @@ __get_target_v1(struct pool_domain *root_pos, struct pool_domain *curr_pd,
 			D_DEBUG(DB_PL, "selected tgt %d\n", tgt_idx);
 			D_ASSERTF(isclr(dom_full, (uint32_t)(curr_dom - root_pos)),
 				  "selected_tgt %u\n", (uint32_t)(curr_dom - root_pos));
+
+			//Yuanguo: 选完tgt_idx之后，当前domain变为full，则递归向上，找到一个not-full的domain;
 			range_set = tgt_isset_range(root_pos->do_targets, tgts_used,
 						    start_tgt, end_tgt, allow_version, gen_mode);
 			if (range_set) {

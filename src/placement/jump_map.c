@@ -620,6 +620,7 @@ get_object_layout(struct pl_jump_map *jmap, uint32_t layout_ver, struct pl_obj_l
 	D_INIT_LIST_HEAD(&remap_list);
 	D_INIT_LIST_HEAD(&dgu_remap_list);
 
+	//Yuanguo: 减的结果就是domain个数 (root, node, rank 总和)，为什么加1呢？
 	dom_size = (struct pool_domain *)(root->do_targets) - (root) + 1;
 	dom_array_size = dom_size/NBBY + 1;
 	if (dom_array_size > LOCAL_DOM_ARRAY_SIZE) {
@@ -650,6 +651,25 @@ get_object_layout(struct pl_jump_map *jmap, uint32_t layout_ver, struct pl_obj_l
 
 	fdom_lvl = pool_map_failure_domain_level(jmap->jmp_map.pl_poolmap, jmop->jmop_fdom_lvl);
 	D_ASSERT(fdom_lvl > 0);
+
+	//Yuanguo:
+	//  例如
+	//    - daos_obj_generate_oid(..., cid=OC_RP_3GX, ...)
+	//    - DAOS集群有3个node, 每个node有2个rank(共6个runk)，每个rank有12个target (共72个target);
+	//
+	//  则会生成如下oid
+	//
+	//      daos_obj_id_t::hi
+	//         1B        1B           2B                         4B
+	//      +--------+--------+-----------------+-----------------------------------+
+	//      |  type  | redun  |     nr_grps     | ############ user filled #########|
+	//      |   0    |  9     |      22         | ..................................|
+	//      +--------+--------+-----------------+-----------------------------------+
+	//      high-addr                                                        low-addr
+	//
+	//   jmop->jmop_grp_nr   = 22   因为 72/3 = 24，预留2个group，所以是22；
+	//   jmop->jmop_grp_size = 3    因为3副本；
+
 	for (i = 0, k = 0; i < jmop->jmop_grp_nr; i++) {
 		struct dom_grp_used  *remap_grp_used = NULL;
 
@@ -670,6 +690,7 @@ get_object_layout(struct pl_jump_map *jmap, uint32_t layout_ver, struct pl_obj_l
 			target = NULL;
 			domain = NULL;
 			if (spec_oid && i == 0 && j == 0) {
+				//Yuanguo: 不会进入此分支；srank (special class)
 				/**
 				 * If the object class is a special class then
 				 * the first shard must be picked specially.
@@ -873,13 +894,31 @@ jump_map_create(struct pool_map *poolmap, struct pl_map_init_attr *mia,
 		goto ERR;
 	}
 
+	//Yuanguo:
+	//  - without performance domain
+	//    mia->ia_jump_map.domain 是 PO_COMP_TP_NODE
 	jmap->jmp_redundant_dom = mia->ia_jump_map.domain;
 
+	//Yuanguo:
+	//  - without performance domain
+	//    poolmap是3个domain layer (target不算)
+	//           root       PO_COMP_TP_ROOT
+	//           node       PO_COMP_TP_NODE
+	//           rank       PO_COMP_TP_RANK
+	//           target     PO_COMP_TP_TARGET
+	//    没有PO_COMP_TP_GRP层，所以这里rc=0; doms没有改变；
 	rc = pool_map_find_domain(poolmap, PO_COMP_TP_GRP, PO_COMP_ID_ALL, &doms);
 	if (rc < 0)
 		goto ERR;
+	//Yuanguo:
+	//  - without performance domain
+	//    jmap->jmp_pd_nr = 0  表示没有 performance domain
 	jmap->jmp_pd_nr = rc;
 
+	//Yuanguo:
+	//  - without performance domain
+	//    mia->ia_jump_map.domain 是 PO_COMP_TP_NODE；
+	//  故这里找到的是node列表；rc是node数；
 	rc = pool_map_find_domain(poolmap, mia->ia_jump_map.domain, PO_COMP_ID_ALL, &doms);
 	if (rc <= 0) {
 		rc = (rc == 0) ? -DER_INVAL : rc;

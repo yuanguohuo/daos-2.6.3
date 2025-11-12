@@ -367,10 +367,11 @@ btr_ops(struct btr_context *tcx)
  * \param priv		Private information from user
  * \param tcxp		Returned context.
  */
-//Yuanguo: 创建一个btree context (btr_context)，其中包含的btree instance (tc_tins成员):
-//  - 可能是空的，即tc_tins.ti_root为NULL；
-//  - 也可能是loaded from root_off；
-//视root_off和root而定 (若它俩都不为null，则两者该是匹配的: 一个是内存表示，一个是PMem pool内的偏移);
+//Yuanguo: 创建一个btree context (btr_context);
+//  - 如果 root != NULL :  tcx->tc_tins.ti_root = root
+//  - 如果 root == NULL :
+//      - 如果 root_off != BTR_ROOT_NULL: SCM内的地址，则 tcx->tc_tins.ti_root = 等价内存指针；
+//      - 如果 root_off == BTR_ROOT_NULL: 则 tcx->tc_tins.ti_root = null；
 static int
 btr_context_create(umem_off_t root_off, struct btr_root *root,
 		   unsigned int tree_class, uint64_t tree_feats,
@@ -395,6 +396,7 @@ btr_context_create(umem_off_t root_off, struct btr_root *root,
 	}
 
 	root = tcx->tc_tins.ti_root;
+	//Yuanguo: root->tr_class == 0 表示 new tree;
 	if (root == NULL || root->tr_class == 0) { /* tree creation */
 		tcx->tc_class		= tree_class;
 		tcx->tc_feats		= tree_feats;
@@ -2675,6 +2677,11 @@ btr_upsert(struct btr_context *tcx, dbtree_probe_opc_t probe_opc,
 static int
 btr_tx_begin(struct btr_context *tcx)
 {
+	//Yuanguo:
+	//  - VMEM类型的mem instance (struct umem_instance) 的 mo_tx_add 成员函数为 NULL，所以 umem_has_tx() 和 btr_has_tx() 函数
+	//    都返回 false：表示修改这样的 memory / btree 不需要transaction;
+	//    struct vos_container 的 Active DTX tree (vc_dtx_active_hdl) 和 Committed DTX tree (vc_dtx_committed_hdl) 都是 VMEM tree;
+	//  - PMEM/BMEM 需要 transaction
 	if (!btr_has_tx(tcx))
 		return 0;
 
@@ -4710,7 +4717,7 @@ static struct btr_class btr_class_registered[BTR_TYPE_MAX];
  * Initialize a tree instance from a registered tree class.
  */
 //Yuanguo: 以C++的角度看，
-//  - 本函数构造(不包括分配内存)struct btr_instance对象*tins；
+//  - 本函数构造(不包括分配内存)struct btr_instance对象*tins；注意：不是 init class (函数名) 而是 init object!
 //  - btr_class_registered[tree_class]是class实例，其中包含成员函数列表；
 static int
 btr_class_init(umem_off_t root_off, struct btr_root *root,

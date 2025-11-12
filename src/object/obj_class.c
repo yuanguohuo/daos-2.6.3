@@ -181,6 +181,10 @@ daos_oclass_names_list(size_t size, char *str)
 }
 
 /** Return the redundancy group size of @oc_attr */
+//Yuanguo: 本函数计算存储一个dkey需要的target数，即grp_size (group size)
+//  oc_attr->ca_resil是弹性方式，DAOS_RES_REPL 或 DAOS_RES_EC
+//      - DAOS_RES_REPL : number of replicas
+//      - DAOS_RES_EC   : ec_k + ec_p   (data数+parity数)
 unsigned int
 daos_oclass_grp_size(struct daos_oclass_attr *oc_attr)
 {
@@ -243,12 +247,19 @@ daos_oclass_grp_nr(struct daos_oclass_attr *oc_attr, struct daos_obj_md *md)
  * Though let's keep reserve targets to be less than 30% of the total
  * targets.
  */
+//Yuanguo: 用户指定daos_oclass_id_t为 *GX, 代表使用MAX_NUM_GROUPS (DAOS_OBJ_GRP_MAX)，
+//  但不能使用集群中所有的targets，而是要预留一些；这样当一些target故障时，才有地方迁移；
+//  本函数计算预留的group数；
 static uint32_t
 reserve_grp_by_rf(uint32_t target_nr, uint32_t grp_size, uint32_t rf)
 {
 	return min(((target_nr * 3) / 10) / grp_size, rf);
 }
 
+//Yuanguo: 例如调用 daos_obj_generate_oid(..., cid=OC_RP_3GX, ...)
+//  oc_id = 0x0900ffff
+//      - 0x09     : redun OR_RP_3
+//      - 0xffff   : OC_RP_3GX末尾的X，代表最大nr_grps，即MAX_NUM_GROUPS (DAOS_OBJ_GRP_MAX)
 int
 daos_oclass_fit_max(daos_oclass_id_t oc_id, int domain_nr, int target_nr, enum daos_obj_redun *ord,
 		    uint32_t *nr, uint32_t rf_factor)
@@ -284,7 +295,12 @@ daos_oclass_fit_max(daos_oclass_id_t oc_id, int domain_nr, int target_nr, enum d
 		goto out;
 	}
 
+	//Yuanguo:
+	//  - DAOS_RES_REPL : number of replicas
+	//  - DAOS_RES_EC   : ec_k + ec_p   (data数+parity数)
 	grp_size = daos_oclass_grp_size(&ca);
+	//Yuanguo: 用户指定对象的daos_oclass_id_t为 *GX, 代表使用MAX_NUM_GROUPS (DAOS_OBJ_GRP_MAX)
+	//  这里根据集群的target数以及grp_size来计算真正使用的nr_grps;
 	if (ca.ca_grp_nr == DAOS_OBJ_GRP_MAX) {
 		uint32_t reserve_grp = reserve_grp_by_rf(target_nr, grp_size, rf_factor);
 
@@ -678,6 +694,11 @@ static daos_sort_ops_t	oc_resil_sort_ops = {
  * not try to match oc_redun if ID is not less than OC_S1, number
  * of groups will be parsed from oc_id rather than array for this case.
  */
+//Yuanguo: 参数oc_id:   redun << 24 | nr_grps
+//        1B        1B       2B
+//     +-------+-------+---------------+
+//     | redun |   0   |    nr_grps    |
+//     +-------+-------+---------------+
 static struct daos_obj_class *
 oclass_ident2cl(daos_oclass_id_t oc_id, uint32_t *nr_grps)
 {
@@ -686,6 +707,7 @@ oclass_ident2cl(daos_oclass_id_t oc_id, uint32_t *nr_grps)
 	if (oc_id == OC_UNKNOWN)
 		return NULL;
 
+	//Yuanguo: 首先，试图通过oc_id来查找；
 	idx = daos_array_find(oc_ident_array, oc_ident_array_sz, oc_id,
 			      &oc_ident_sort_ops);
 	if (idx >= 0) {
@@ -695,17 +717,30 @@ oclass_ident2cl(daos_oclass_id_t oc_id, uint32_t *nr_grps)
 		return oc_ident_array[idx];
 	}
 
+	//Yuanguo: 通过oc_id查找失败，但oc_id又没有redun字段，返回NULL;
+	//  有些oclass没有redun字段；
+	//  若有redun字段，一定满足：oc_id >= (OR_RP_1 << OC_REDUN_SHIFT)
 	if (oc_id < (OR_RP_1 << OC_REDUN_SHIFT))
 		return NULL;
 
+	//Yuanguo: 通过redun来查找；
+	//  OC_RP_3G1, OC_RP_3G2, ..., OC_RP_3GX redun 相同(都是OR_RP_3=9)，找到是谁呢？
+	//  答：找到的是数组oc_ident_array中，从前到后，第一个满足 redun == daos_oclass_id2redun(oc_id) 的！
+	//      见array_bin_search(opc=FIND_OPC_EQ) 函数末尾处，把返回index往前移动！
+	//  所以，返回OC_RP_3G1，即redun相等，nr_grps最小的；
 	idx = daos_array_find(oc_ident_array, oc_ident_array_sz, oc_id,
 			      &oc_redun_sort_ops);
 	if (idx < 0)
 		return NULL;
 
 	if (nr_grps) {
+		//Yuanguo: 如前注释所说，idx是redun相等的oclass；
+		//  生成一个不带nr_grps的oc id, 它却 >= oc_id, 说明oc_id是非法的：要么oc_id的nr_grps为0；要么查找有bug；
+		//  返回NULL;
 		if ((oc_ident_array[idx]->oc_redun << OC_REDUN_SHIFT) >= oc_id)
 			return NULL;
+
+		//Yuanguo: oc_id中包含redun和nr_grps，把redun部分减掉，得到nr_grps部分！
 		*nr_grps = oc_id -
 			(oc_ident_array[idx]->oc_redun << OC_REDUN_SHIFT);
 	}

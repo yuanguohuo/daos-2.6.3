@@ -146,6 +146,8 @@ struct daos_obj_md {
 	/* Fault domain level - PO_COMP_TP_RANK, or PO_COMP_TP_RANK. If it is zero then will
 	 * use pl_map's default value PL_DEFAULT_DOMAIN (PO_COMP_TP_RANK).
 	 */
+	//Yuanguo: 若为0，则默认PL_DEFAULT_DOMAIN (PO_COMP_TP_NODE)；上面的注释是错误的；
+	//  通常为PO_COMP_TP_NODE
 	uint32_t		omd_fdom_lvl;
 	/* Performance domain affinity */
 	uint32_t		omd_pda;

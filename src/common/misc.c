@@ -639,6 +639,7 @@ daos_hhash_link_delete(struct d_hlink *hlink)
  * \return		the pointer to crt_init_options_t
  */
 static crt_init_options_t daos_crt_init_opt;
+//Yuanguo: 初始化全局变量daos_crt_init_opt，并返回它的指针；
 crt_init_options_t *
 daos_crt_init_opt_get(bool server, int ctx_nr)
 {

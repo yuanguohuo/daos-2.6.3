@@ -50,6 +50,15 @@ obj_ioc2ec_ss(struct obj_io_context *ioc)
  * from the client given dispatch targets information that does
  * NOT contains the original leader information.
  */
+//Yuanguo:
+//  返回 DTX 的 participants；
+//      - 若 p_tgts 中只有当前 target (leader)，返回 *p_mbs 为 NULL;
+//      - 否则，返回 *p_mbs 包含所有 targets，包括当前 target (leader)；
+//  注意：不一致，只有1个时不包含；不止1个时又包含！
+//
+//  同时：
+//      - 修改 p_tgts 和 tgt_cnt，移除当前 target (leader)
+//  注意：这个是一致的；
 static int
 obj_gen_dtx_mbs(uint32_t flags, uint32_t *tgt_cnt, struct daos_shard_tgt **p_tgts,
 		struct dtx_memberships **p_mbs)
@@ -90,6 +99,8 @@ obj_gen_dtx_mbs(uint32_t flags, uint32_t *tgt_cnt, struct daos_shard_tgt **p_tgt
 
 	D_ASSERT(j > 0);
 
+	//Yuanguo: 跳过 DAOS_TGT_IGNORE 的target 之后，只剩一个，是当前 target (leader)；
+	//  则返回 *p_mbs 为 NULL;
 	if (j == 1) {
 		D_FREE(mbs);
 		*tgt_cnt = 0;
@@ -97,12 +108,14 @@ obj_gen_dtx_mbs(uint32_t flags, uint32_t *tgt_cnt, struct daos_shard_tgt **p_tgt
 		goto out;
 	}
 
+	//Yuanguo: 不止1个时，dm_tgt_cnt包含当前 target (leader);
 	mbs->dm_tgt_cnt = j;
 	mbs->dm_grp_cnt = 1;
 	mbs->dm_data_size = size;
 	mbs->dm_flags = DMF_CONTAIN_LEADER;
 
 	--(*tgt_cnt);
+	//Yuanguo: 跳过第一个，一定是当前 target (leader) ?
 	*p_tgts = ++tgts;
 
 	if (!(flags & ORF_EC))
@@ -1948,6 +1961,9 @@ obj_get_iods_offs(daos_unit_oid_t uoid, struct obj_iod_array *iod_array,
 	 */
 	if (!daos_oclass_is_ec(oca) ||
 	    (iod_array->oia_iod_nr < 2 && iod_array->oia_oiods == NULL)) {
+		//Yuanguo:
+		//  1. rep (非EC)
+		//  2. 虽然是EC，但 iod_array->oia_iod_nr < 2 && iod_array->oia_oiods == NULL
 		*iods = iod_array->oia_iods;
 		*offs = iod_array->oia_offs;
 		*skips = NULL;
@@ -2926,9 +2942,13 @@ ds_obj_rw_handler(crt_rpc_t *rpc)
 			rc = dtx_end(dth, ioc.ioc_coc, rc);
 		}
 
+		//Yuanguo: fetch 操作，这里 out;
 		D_GOTO(out, rc);
 	}
 
+	//Yuanguo: update 操作 ...
+
+	//Yuanguo: 要分发的 targets 是 client 指定的，不是daos_engine自己算的；
 	tgts = orw->orw_shard_tgts.ca_arrays;
 	tgt_cnt = orw->orw_shard_tgts.ca_count;
 
@@ -2993,6 +3013,31 @@ again:
 	 * RPC to non-leaders. Then the non-leader replicas can commit
 	 * them before real modifications to avoid availability issues.
 	 */
+	//Yuanguo: DAOS Two-Phase Commit (DTX)
+	//  - When an application wants to modify (update or punch) a multiple replicated object or EC object,
+	//    the client sends the modification RPC to the leader shard;
+	//  - The leader dispatches the RPC to the other related shards, and each shard makes its modification
+	//    in parallel. Bulk transfers are not forwarded by the leader but rather transferred directly from the client.
+	//    Yuanguo: 所以，小的IO还是leader转发的？
+	//  - Before modifications are made, a local transaction, called 'DTX', is started on each related shard (both
+	//    leader and non-leaders) with a client generated DTX identifier that is unique for the modification within
+	//    the container.
+	//  - All the modifications in a DTX are logged in the DTX transaction table and back references to the table are
+	//    kept in related modified record.
+	//  - After local modifications are done, each non-leader marks the DTX state as 'prepared' and replies to the leader.
+	//  - The leader sets the DTX state to 'committable' as soon as it has completed its modifications and has received
+	//    successful replies from all non-leaders. If any shard(s) fail to execute the modification, it will reply to the
+	//    leader with failure, and the leader will globally abort the DTX.
+	//  - Once the DTX is set by the leader to 'committable' or 'aborted', it replies to the client with the appropriate
+	//    status.
+	//  - The client may consider a modification complete as soon as it receives a successful (Yuanguo: committable) reply
+	//    from the leader, regardless of whether the DTX is actually 'committed' or not.
+	//  - It is the responsibility of the leader to commit the 'committable' DTX asynchronously. This can happen if
+	//        - the 'committable' count or DTX age exceed some thresholds,
+	//        - or the DTX is piggybacked via other dispatched RPCs due to potential conflict with subsequent modifications.
+	//
+	// 单词"piggyback"的意思是"背负式装运"，这里是指，让当前 RPC “背负装运” 以前的 committable DTX (和当前DTX无关)，有点像“搭便车”，
+	// 也像raft中，一个 RPC 顺便把前面的op commit了；
 	D_FREE(dti_cos);
 	dti_cos_cnt = dtx_cos_get_piggyback(ioc.ioc_coc, &orw->orw_oid, orw->orw_dkey_hash,
 					    DTX_THRESHOLD_COUNT, &dti_cos);

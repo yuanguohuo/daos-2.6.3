@@ -28,6 +28,19 @@ extern "C" {
 /** Number of reserved bits in object id for object metadata */
 #define OID_FMT_META_BITS	16
 
+//Yuanguo:
+//  OID_FMT_TYPE_SHIFT    56
+//  OID_FMT_CLASS_SHIFT   48
+//  OID_FMT_META_SHIFT    32
+//
+//  OID_FMT_TYPE_MAX      0x00000000000000FF
+//  OID_FMT_CLASS_MAX     0x00000000000000FF
+//  OID_FMT_META_MAX      0x000000000000FFFF
+//
+//  OID_FMT_TYPE_MASK     0xFF00000000000000
+//  OID_FMT_CLASS_MASK    0x00FF000000000000
+//  OID_FMT_META_MASK     0x0000FFFF00000000
+
 /** Bit shift for object type in object id */
 #define OID_FMT_TYPE_SHIFT	(64 - OID_FMT_TYPE_BITS)
 /** Bit shift for object class id in object id */
@@ -485,6 +498,18 @@ typedef struct {
 static enum daos_obj_redun
 daos_obj_id2ord(daos_obj_id_t oid)
 {
+	//Yuanguo:
+	//  daos_obj_id_t::hi
+	//     1B        1B           2B                         4B
+	//  +--------+--------+-----------------+-----------------------------------+
+	//  |  type  | redun  |     nr_grps     | ############ user filled #########|
+	//  +--------+--------+-----------------+-----------------------------------+
+	//  high-addr                                                        low-addr
+	//
+	//  OID_FMT_CLASS_MASK    0x00FF000000000000
+	//  OID_FMT_CLASS_SHIFT   48
+	//
+	// 返回 redun 字节
 	return (enum daos_obj_redun)((oid.hi & OID_FMT_CLASS_MASK) >> OID_FMT_CLASS_SHIFT);
 }
 
@@ -495,8 +520,27 @@ daos_obj_id2class(daos_obj_id_t oid)
 	uint32_t nr_grps;
 
 	ord = daos_obj_id2ord(oid);
+
+	//Yuanguo:
+	//  daos_obj_id_t::hi
+	//     1B        1B           2B                         4B
+	//  +--------+--------+-----------------+-----------------------------------+
+	//  |  type  | redun  |     nr_grps     | ############ user filled #########|
+	//  +--------+--------+-----------------+-----------------------------------+
+	//  high-addr                                                        low-addr
+	//
+	//  OID_FMT_META_MASK     0x0000FFFF00000000
+	//  OID_FMT_META_SHIFT    32
+	//  返回 nr_grps 双字节
 	nr_grps = (oid.hi & OID_FMT_META_MASK) >> OID_FMT_META_SHIFT;
 
+	//Yuanguo:
+	//  结果 ord << 24 | nr_grps
+	//
+	//        1B        1B       2B
+	//     +-------+-------+---------------+
+	//     | redun |   0   |    nr_grps    |
+	//     +-------+-------+---------------+
 	return (ord << OC_REDUN_SHIFT) | nr_grps;
 }
 

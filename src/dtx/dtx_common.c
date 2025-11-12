@@ -1176,6 +1176,7 @@ dtx_leader_begin(daos_handle_t coh, struct dtx_id *dti, struct dtx_epoch *epoch,
 	int				 rc;
 	int				 i;
 
+	//Yuanguo: tgt_cnt 不包含 leader 自己；
 	D_ALLOC(dlh, sizeof(*dlh) + sizeof(struct dtx_sub_status) * tgt_cnt);
 	if (dlh == NULL)
 		D_GOTO(out, rc = -DER_NOMEM);
@@ -2150,6 +2151,8 @@ dtx_leader_exec_ops_chore(struct dss_chore *chore, bool is_reentrance)
 			continue;
 		}
 
+		//Yuanguo: 对于 update 操作，dtx_chore->func = obj_tgt_update，见
+		//  ds_obj_rw_handler() --> dtx_leader_exec_ops()
 		rc = dtx_chore->func(dlh, dtx_chore->func_arg, dtx_chore->i, dtx_sub_comp_cb);
 		if (rc != 0) {
 			if (sub->dss_comp == 0)
@@ -2198,10 +2201,16 @@ dtx_leader_exec_ops(struct dtx_leader_handle *dlh, dtx_sub_func_t func,
 	int			local_rc = 0;
 	int			remote_rc = 0;
 
+	//Yuanguo: 对于 update 操作，func = obj_tgt_update，见ds_obj_rw_handler()
 	dtx_chore.func = func;
 	dtx_chore.func_arg = func_arg;
 	dtx_chore.dlh = dlh;
 
+	//Yuanguo: 对于 update 操作，dtx_leader_exec_ops_chore 对各个non-leader
+	//  target 调用 func = obj_tgt_update；如下:
+	//    - dtx_chore 被 offload 到一个 helper xstream，所以dtx_leader_exec_ops_chore
+	//      在 helper xstream 中执行；
+	//    - leader 自己会在当前 xstream 中执行 func (obj_tgt_update)；
 	dtx_chore.chore.cho_func     = dtx_leader_exec_ops_chore;
 	dtx_chore.chore.cho_priority = 0;
 
@@ -2241,6 +2250,7 @@ again1:
 again2:
 	dtx_chore.chore.cho_credits = dlh->dlh_forward_cnt;
 	dtx_chore.chore.cho_hint    = NULL;
+	//Yuanguo: 把 dtx_chore 任务 offload 到一个helper xstream上；就是 producer-consumer 模型！
 	rc                          = dss_chore_register(&dtx_chore.chore);
 	if (rc != 0) {
 		if (rc != -DER_AGAIN) {
@@ -2293,6 +2303,9 @@ again2:
 
 exec:
 	/* Execute the local operation only for once. */
+	//Yuanguo: 前面已把 "远程操作任务(chore)" offload 到一个helper xtream上了，即在helper xtream上执行；
+	//  现在并发地在本地执行；
+	//Yuanguo: 对于 update 操作，func = obj_tgt_update，见ds_obj_rw_handler()
 	if (dlh->dlh_forward_idx == 0)
 		local_rc = func(dlh, func_arg, -1, NULL);
 

@@ -827,6 +827,8 @@ obj_grp_leader_get(struct dc_object *obj, int grp_idx, uint64_t dkey_hash,
  */
 #define		OBJ_FETCH_LEADER_INTERVAL	2
 
+//Yuanguo: hash是dkey的hash；见 obj_update_shards_get() -> obj_dkey2grpmemb() -> obj_dkey2grpidx()
+//  dkey (distribution key) 决定数据的分布;
 int
 obj_dkey2grpidx(struct dc_object *obj, uint64_t hash, unsigned int map_ver)
 {
@@ -855,6 +857,7 @@ obj_dkey2grpidx(struct dc_object *obj, uint64_t hash, unsigned int map_ver)
 
 	D_ASSERT(obj->cob_shards_nr >= grp_size);
 
+	//Yuanguo: 返回一个[0, obj->cob_shards_nr / grp_size) 的数；
 	grp_idx = obj_pl_grp_idx(obj->cob_layout_version, hash,
 				 obj->cob_shards_nr / grp_size);
 	D_RWLOCK_UNLOCK(&obj->cob_lock);
@@ -1149,6 +1152,14 @@ obj_req_tgts_dump(struct obj_req_tgts *req_tgts)
 /* Forward leader information. */
 #define OBJ_TGT_FLAG_FW_LEADER_INFO	(1U << 2)
 
+//Yuanguo:
+// 假设
+//    - start_shard = 51 : 从第51个shard开始
+//    - shard_cnt   = 3  : 需要3个shard
+//    - grp_nr      = 1  : 这3个shrad属于1个grp
+// 所以grp_size = shard_cnt/grp_nr = 3/1 = 3，即object是3副本；
+// 本函数计算从start_shard (51)开始，shard_cnt(3)个 shard 对应的3个
+// targets，保存于 obj_auxi->req_tgts.ort_shard_tgts (struct obj_auxi_args::req_tgts.ort_shard_tgts) 中；
 static int
 obj_shards_2_fwtgts(struct dc_object *obj, uint32_t map_ver, uint8_t *bit_map,
 		    uint32_t start_shard, uint32_t shard_cnt, uint32_t grp_nr,
@@ -1195,6 +1206,7 @@ obj_shards_2_fwtgts(struct dc_object *obj, uint32_t map_ver, uint8_t *bit_map,
 	}
 
 	if (obj_auxi->spec_shard) {
+		//Yuanguo: 正常update 3副本对象，shard_cnt == 3，不会到这
 		D_ASSERT(grp_nr == 1);
 		D_ASSERT(shard_cnt == 1);
 		D_ASSERT(bit_map == NIL_BITMAP);
@@ -2100,6 +2112,7 @@ obj_rw_bulk_prep(struct dc_object *obj, daos_iod_t *iods, d_sg_list_t *sgls,
 	/* inline fetch needs to pack sgls buffer into RPC so uses it to check
 	 * if need bulk transferring.
 	 */
+	//Yuanguo: dc_obj_shard_rw() 中会检测 bulks 是否初始化
 	sgls_size = daos_sgls_packed_size(sgls, nr, NULL);
 	if (sgls_size >= DAOS_BULK_LIMIT ||
 	    (obj_is_ec(obj) && !obj_auxi->reasb_req.orr_single_tgt)) {
@@ -2447,6 +2460,8 @@ obj_req_valid(tse_task_t *task, void *args, int opc, struct dtx_epoch *epoch,
 	daos_handle_t		th = DAOS_HDL_INVAL;
 	int			rc = 0;
 
+	//Yuanguo: 虽然函数名叫push, 其实是在stack(struct tse_task_private的dtp_buf[TSE_TASK_ARG_LEN]空间)
+	//  上分配一块大小为size的内存，返回其指针；
 	obj_auxi = tse_task_stack_push(task, sizeof(*obj_auxi));
 
 	switch (opc) {
@@ -2926,6 +2941,7 @@ shard_io(tse_task_t *task, struct shard_auxi_args *shard_auxi)
 		fw_cnt = 0;
 	}
 
+	//Yuanguo: 对于daos obj update/fetch, shard_io_cb = dc_obj_shard_rw
 	rc = shard_auxi->shard_io_cb(obj_shard, obj_auxi->opc, shard_auxi,
 				     fw_shard_tgts, fw_cnt, task);
 	return rc;
@@ -3014,6 +3030,10 @@ obj_req_fanout(struct dc_object *obj, struct obj_auxi_args *obj_auxi,
 	int			 rc = 0;
 
 	tgt = req_tgts->ort_shard_tgts;
+	//Yuanguo: (猜测)
+	//    - 若 ort_srv_disp == true:  由服务端dispatch，所以1个group只需发请求给1个target;
+	//    - 若 ort_srv_disp == fasle: 由cli端dispatch，所以要发请求给所有group的所有target;
+	// 正常情况是前者，update一个dkey的话，req_tgts->ort_grp_nr为1，只需发请求给一个target;
 	tgts_nr = req_tgts->ort_srv_disp ? req_tgts->ort_grp_nr :
 		  req_tgts->ort_grp_nr * req_tgts->ort_grp_size;
 
@@ -3117,7 +3137,9 @@ obj_req_fanout(struct dc_object *obj, struct obj_auxi_args *obj_auxi,
 		shard_auxi->grp_idx = 0;
 		shard_auxi->start_shard = req_tgts->ort_start_shard;
 		shard_auxi->obj_auxi = obj_auxi;
+		//Yuanguo: 对于daos obj update/fetch, io_cb = dc_obj_shard_rw
 		shard_auxi->shard_io_cb = io_cb;
+		//Yuanguo: 对于daos obj update/fetch, io_prep_cb = shard_rw_prep
 		rc = io_prep_cb(shard_auxi, obj, obj_auxi, shard_auxi->grp_idx);
 		if (rc)
 			goto out_task;
@@ -3150,13 +3172,18 @@ obj_req_fanout(struct dc_object *obj, struct obj_auxi_args *obj_auxi,
 				      (i / req_tgts->ort_grp_size);
 		shard_auxi->start_shard = req_tgts->ort_start_shard;
 		shard_auxi->obj_auxi = obj_auxi;
+		//Yuanguo: 对于daos obj update/fetch, io_cb = dc_obj_shard_rw
 		shard_auxi->shard_io_cb = io_cb;
+		//Yuanguo: 对于daos obj update/fetch, io_prep_cb = shard_rw_prep
 		rc = io_prep_cb(shard_auxi, obj, obj_auxi, shard_auxi->grp_idx);
 		if (rc) {
 			obj_task_complete(shard_task, rc);
 			goto out_task;
 		}
 
+		//Yuanguo: 3副本的object update 是一个task(obj_task)；每个副本是一个task(shard_task)
+		//  则obj_task depends on shard_task; 所以，把obj_task添加到shard_task的dtp_dep_list(通过
+		//  struct tse_task_link，其tl_task指向obj_task，其tl_link链接到shard_task的dtp_dep_list)
 		rc = tse_task_register_deps(obj_task, 1, &shard_task);
 		if (rc != 0) {
 			obj_task_complete(shard_task, rc);
@@ -4466,6 +4493,20 @@ obj_size_fetch_cb(const struct dc_object *obj, struct obj_auxi_args *obj_auxi)
  * handling, such as crt_bulk_create/daos_iov_left() always use iov_buf_len.
  * For that case, we duplicate the sgls and make its iov_buf_len = iov_len.
  */
+//Yuanguo:
+//  以DAOS update操作为例，
+//    - args->sgls保存的是user传来的数据(多个列表d_sg_list_t，每个d_sg_list_t包含多个iov)
+//    - args->iods和args->sgls一一对应，描述每个d_sg_list_t的总大小(iod_size)，以及这些数据的目的地；
+//  但是，args->sgls中的iov可能为空，也可能iov_buf_len > iov_len (空间大于数据长度)，这可能引起一些问题。
+//  所以，本函数对它们进行整理：
+//    - 去除空的iov；
+//    - 让iov_buf_len = iov_len;
+//  整理后的结果，
+//    - 替换args->sgls
+//    - 保存在obj_auxi->rw_args.sgls_dup中(防止retry时再次整理?)
+//    - 原始结构保存在obj_auxi->reasb_req.orr_usgls 中；
+//
+//  注：不拷贝数据，只是重新组织数据的指针、长度信息(iov)；
 static int
 obj_sgls_dup(struct obj_auxi_args *obj_auxi, daos_obj_update_t *args, bool update)
 {
@@ -4497,6 +4538,8 @@ obj_sgls_dup(struct obj_auxi_args *obj_auxi, daos_obj_update_t *args, bool updat
 				 * iov. Since lower layers don't support this,
 				 * let's remove them when we duplicate.
 				 */
+				//Yuanguo: 已知dup=true了，为什么不break，而是continue呢？
+				//  因为还需统计args->sgls[i]中有多少有效iov，即count;
 				dup = true;
 				continue;
 			}
@@ -4504,6 +4547,7 @@ obj_sgls_dup(struct obj_auxi_args *obj_auxi, daos_obj_update_t *args, bool updat
 				dup = true;
 			count++;
 		}
+		//Yuanguo: args->sgls[i]中没有有效iov (count为0)，但描述信息args->iods[i]显示size不为0；显然是非法请求；
 		if (count == 0 && iod->iod_size != DAOS_REC_ANY) {
 			DL_ERROR(-DER_INVAL, "invalid args, sgl contained only 0 length entries");
 			return -DER_INVAL;
@@ -4517,6 +4561,7 @@ obj_sgls_dup(struct obj_auxi_args *obj_auxi, daos_obj_update_t *args, bool updat
 		return -DER_NOMEM;
 
 	for (i = 0; i < args->nr; i++) {
+		//Yuanguo: d_sg_list_t内的空iov被移除，但d_sg_list_t一对一拷贝(假如一个d_sg_list_t中没有任何有效iov，也会保留)；
 		sg_dup = &sgls_dup[i];
 		sg = &sgls[i];
 		rc = d_sgl_init(sg_dup, sg->sg_nr);
@@ -4728,6 +4773,9 @@ obj_comp_cb(tse_task_t *task, void *data)
 	}
 
 	/* Check if the pool map needs to refresh */
+	//Yuanguo: 类似于ceph中osdmap的传播；
+	//  前面obj_comp_cb_internal() --> obj_shard_comp_cb() 中，已把从所有shard的返回中发现的最大的
+	//  map version记录到obj_auxi->map_ver_reply中；
 	if (obj_auxi->map_ver_reply > obj_auxi->map_ver_req ||
 	    daos_crt_network_error(task->dt_result) ||
 	    task->dt_result == -DER_STALE || task->dt_result == -DER_TIMEDOUT ||
@@ -5022,6 +5070,11 @@ obj_task_init_common(tse_task_t *task, int opc, uint32_t map_ver,
  * Init obj_auxi_arg for this object task.
  * Register the completion cb for obj IO request
  */
+//Yuanguo:
+//  - 在task的stack上分配一个struct obj_auxi_args，并初始化它；之前dc_obj_update_task --> obj_req_valid() 中也曾
+//    在task的stack上分配过struct obj_auxi_args，不过函数结束的时候释放了;
+//    这里分配的没有释放，直到obj_comp_cb()中才释放(tse_task_stack_pop())；
+//  - 给task注册一个completion callback，即函数obj_comp_cb();
 static int
 obj_task_init(tse_task_t *task, int opc, uint32_t map_ver, daos_handle_t th,
 	      struct obj_auxi_args **auxi, struct dc_object *obj)
@@ -5769,6 +5822,11 @@ dc_obj_update(tse_task_t *task, struct dtx_epoch *epoch, uint32_t map_ver,
 	uint32_t		shard_cnt;
 	int			rc;
 
+	//Yuanguo:
+	//  - 在task的stack上分配一个struct obj_auxi_args，并初始化它；之前dc_obj_update_task --> obj_req_valid() 中也曾
+	//    在task的stack上分配过struct obj_auxi_args，不过函数结束的时候释放了;
+	//    这里分配的没有释放，直到obj_comp_cb()中才释放(tse_task_stack_pop())；
+	//  - 给task注册一个completion callback，即函数obj_comp_cb();
 	rc = obj_task_init(task, DAOS_OBJ_RPC_UPDATE, map_ver, args->th,
 			   &obj_auxi, obj);
 	if (rc != 0) {
@@ -5792,6 +5850,8 @@ dc_obj_update(tse_task_t *task, struct dtx_epoch *epoch, uint32_t map_ver,
 		return dc_tx_convert(obj, DAOS_OBJ_RPC_UPDATE, task);
 	}
 
+	//Yuanguo: dkey的全名是distribution key，控制数据的分布(即数据placement)；
+	//  所以这里使用args->dkey作为hash参数
 	obj_auxi->dkey_hash = obj_dkey2hash(obj->cob_md.omd_id, args->dkey);
 	obj_auxi->iod_nr = args->nr;
 	if (obj_is_ec(obj)) {
@@ -5814,6 +5874,18 @@ dc_obj_update(tse_task_t *task, struct dtx_epoch *epoch, uint32_t map_ver,
 		obj_io_set_new_shard_task(obj_auxi);
 	}
 
+	//Yuanguo:
+	//  一个3副本的object，可能分布在多个target (也叫shard) 上，比如100个；
+	//    - shard是起始shard的index;
+	//    - shard_cnt是对象的grp_size: 对于replicated object就是副本数; 对于EC object是e_k + e_p;
+	//
+	//  shard index到底是在哪里的index呢？
+	//    - user要update object (本函数)，就要先open object (见daos_obj_open api)，在open的时候，会调用
+	//              src/object/cli_obj.c : obj_layout_create() 函数
+	//    - 那里会根据object的oclass以及cluster的target数，为object计算放置信息，例如100个shard (target)，
+	//      组成一个数组
+	//              obj->cob_shards.do_shards[]
+	//    - 就是这个数组的index；
 	rc = obj_update_shards_get(obj, args, map_ver, obj_auxi, &shard, &shard_cnt);
 	if (rc != 0) {
 		D_ERROR(DF_OID" get update shards failure %d\n", DP_OID(obj->cob_md.omd_id), rc);
@@ -5823,6 +5895,14 @@ dc_obj_update(tse_task_t *task, struct dtx_epoch *epoch, uint32_t map_ver,
 	if (args->flags & DAOS_COND_MASK)
 		obj_auxi->cond_modify = 1;
 
+	//Yuanguo:
+	// 假设
+	//    - shard=51    : 从第51个shard开始
+	//    - shard_cnt=3 : 需要3个shard
+	//    - 1 (grp_nr)  : 这3个shrad属于1个grp;
+	// 所以grp_size = shard_cnt/grp_nr = 3/1 = 3，即object是3副本；
+	// 本函数计算从shard (51)开始，shard_cnt(3)个 shard 对应的3个
+	// targets，保存于 obj_auxi->req_tgts.ort_shard_tgts (struct obj_auxi_args::req_tgts.ort_shard_tgts) 中；
 	rc = obj_shards_2_fwtgts(obj, map_ver, tgt_bitmap, shard, shard_cnt, 1,
 				 OBJ_TGT_FLAG_FW_LEADER_INFO, obj_auxi);
 	if (rc != 0)
@@ -5868,6 +5948,7 @@ out_task:
 int
 dc_obj_update_task(tse_task_t *task)
 {
+	//Yuanguo: 关于args的初始化见 daos_obj_update () --> dc_obj_update_task_create()
 	daos_obj_update_t	*args = dc_task_get_args(task);
 	struct dc_object	*obj = NULL;
 	struct dtx_epoch	 epoch = {0};
@@ -7397,6 +7478,31 @@ daos_dc_obj2id(void *ptr, daos_unit_oid_t *id)
  * Real latest & greatest implementation of container create.
  * Used by anyone including the daos_obj.h header file.
  */
+//Yuanguo: 用户调用此函数生成oid;
+//  param oid: 既是输入参数也是输出参数.
+//      - 输入：oid->lo 和 oid->hi 的低32位
+//      - 输出：oid->hi 的高32位
+//        daos_obj_id_t::hi
+//           1B        1B           2B                         4B
+//        +--------+--------+-----------------+-----------------------------------+
+//        |  type  | redun  |     nr_grps     | ############ user filled #########|
+//        +--------+--------+-----------------+-----------------------------------+
+//        high-addr                                                        low-addr
+//
+//  param cid: 输入参数，32 位：
+//           1B        1B       2B
+//        +-------+-------+---------------+
+//        | redun |   0   |    nr_grps    |
+//        +-------+-------+---------------+
+//        high-addr                low-addr
+//
+//        cid用于填充oid->hi的redun和nr_grps，但不是直接拷贝：
+//        例如，当client指定cid=*GX时，X代表使用最多的groups,
+//        本函数会计算实际能够使用的gropus：
+//            target数 / grp_size - 预留的group数
+//        见daos_oclass_fit_max()函数
+//
+//  param type: 填充oid->hi的type;
 int
 daos_obj_generate_oid(daos_handle_t coh, daos_obj_id_t *oid,
 		       enum daos_otype_t type, daos_oclass_id_t cid,

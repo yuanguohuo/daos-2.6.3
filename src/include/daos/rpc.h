@@ -187,6 +187,15 @@ daos_rpc_tag(int req_type, int tgt_idx)
  * \retval	0 if registration succeeds
  * \retval	negative errno if registration fails.
  */
+//Yuanguo:
+//  - 服务端调用此函数：传入
+//          cli_count = 支持的operations数；
+//          handlers = operations的处理函数；
+//          见 src/engine/module.c : dss_module_init_one()
+//  - 客户端调用此函数：传入
+//          cli_count = 支持的operations数；
+//          handlers = NULL; handlers是服务端处理rpc请求的函数；
+//          见 src/object/cli_mod.c : dc_obj_init()
 static inline int
 daos_rpc_register(struct crt_proto_format *proto_fmt, uint32_t cli_count,
 		  struct daos_rpc_handler *handlers, int mod_id)

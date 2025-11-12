@@ -71,6 +71,17 @@ dc_task_create(tse_task_func_t func, tse_sched_t *sched, daos_event_t *ev,
 	args = task_ptr2args(task);
 	args->ta_magic = DAOS_TASK_MAGIC;
 	if (ev) {
+		//Yuanguo:
+		//  - 现在，把函数指针`task_comp_event`添加到task (struct tse_task_private)的 
+		//    dtp_comp_cb_list列表；
+		//  - 当task完成的时候，调用tse_task_complete() --> tse_task_complete_callback()
+		//    遍历dtp_comp_cb_list列表，并逐个回调；
+		// task_comp_event函数被调用，它的重要任务是设置event的状态：若一切OK，把event设置为
+		// DAOS_EVS_COMPLETED状态
+		// DAOS_EVS_COMPLETED后来又推进到DAOS_EVS_READY，这是ev_progress_cb()或eq_progress_cb()完成的；
+		// DAOS_EVS_READY是event的初始状态，见daos_event_init()函数；也只有处于DAOS_EVS_READY的event
+		// 才能launch执行task，见daos_event_launch()函数；
+		// thread-specific event会多次DAOS_EVS_READY->DAOS_EVS_RUNNING->DAOS_EVS_COMPLETED->DAOS_EVS_READY...
 		/** register a comp cb on the task to complete the event */
 		rc = tse_task_register_comp_cb(task, task_comp_event, NULL, 0);
 		if (rc != 0)
@@ -103,6 +114,8 @@ dc_task_schedule(tse_task_t *task, bool instant)
 
 	ev = task_ptr2args(task)->ta_ev;
 	if (ev) {
+		//Yuanguo: 主要是处理event的状态，例如设置为DAOS_EVS_RUNNING，连接到关联event queue的running
+		//  链表(若有关联的event queue，thread-specific event没有)
 		rc = daos_event_launch(ev);
 		if (rc) {
 			tse_task_complete(task, rc);
@@ -111,6 +124,15 @@ dc_task_schedule(tse_task_t *task, bool instant)
 		}
 	}
 
+	//Yuanguo: 把task放入scheduler的某个list中；
+	//  scheduler什么时候执行它呢？假设dtp->dtp_func != NULL
+	//      - Case-A (ready且instant==true)：直接加入scheduler的dsp_running_list中，并触发dtp->dtp_func;
+	//      - Case-B (没有ready或者instant==false，但delay==0)：加入scheduler的dsp_init_list;
+	//      - Case-C (delay > 0): 加入scheduler的dsp_sleeping_list；
+	//  对于Case-B和Case-C， tse_sched_progress() --> tse_sched_run()；
+	//  很多地方会触发tse_sched_progress()，例如对于thread-specific private event，下面的daos_event_priv_wait()就会触发；
+	//  对于一个DAOS update操作(daos_obj_update)，假设它使用thread-specific private event，这里就会调用它的dtp->dtp_func，
+	//  即dc_obj_update_task()函数；
 	rc = tse_task_schedule(task, instant);
 	if (rc) {
 		/** user is responsible for completing event with error */

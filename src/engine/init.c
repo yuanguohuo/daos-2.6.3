@@ -85,6 +85,9 @@ bool                    dss_forward_neighbor;
 /** Cached numa information */
 struct dss_numa_info   *dss_numa;
 /** Number of active numa nodes, multi-socket mode only */
+//Yuanguo: 正常情况下，一个 numa node 启一个daos_engine，故 dss_numa_nr=1 不变！
+//     /usr/bin/daos_engine ... -p 1 ...
+// 虽然系统是multi socket的，但当前 daos_engine 知道自己已绑定到固定一个socket (numa node)；
 int                     dss_numa_nr = 1;
 /** Module facility bitmask */
 static uint64_t		dss_mod_facs;
@@ -391,22 +394,22 @@ dss_topo_init(void)
 	 * maintain mode consistency between engines where one sets it to 0.
 	 */
 	if (dss_core_offset == -1) {
-        //Yuanguo: daos_server自动维护daos_engine的情况下，daos_server会指定dss_numa_node(-p选项)
-        //     /usr/bin/daos_engine
-        //            -g daos_server
-        //            -t 18
-        //            -x 4
-        //            -T 2
-        //            -p 1
-        //            -I 1
-        //            -r 19456
-        //            -H 2
-        //            -d /var/run/daos_server
-        //            -n /var/daos/config/daos_control/engine1/daos_nvme.conf
-        //            -s /mnt/daos1
-        //
-        // 所以，这里multi_socket=false。虽然系统是multi socket的，但当前daos_engine
-        // 知道自己已绑定到固定一个socket (numa node)；
+		//Yuanguo: daos_server自动维护daos_engine的情况下，daos_server会指定dss_numa_node(-p选项)
+		//     /usr/bin/daos_engine
+		//            -g daos_server
+		//            -t 18
+		//            -x 4
+		//            -T 2
+		//            -p 1
+		//            -I 1
+		//            -r 19456
+		//            -H 2
+		//            -d /var/run/daos_server
+		//            -n /var/daos/config/daos_control/engine1/daos_nvme.conf
+		//            -s /mnt/daos1
+		//
+		// 所以，这里multi_socket=false。虽然系统是multi socket的，但当前daos_engine
+		// 知道自己已绑定到固定一个socket (numa node)；
 		dss_core_offset = 0;
 		if (dss_multi_socket_check(tgt_oversub, numa_node_nr))
 			multi_socket = true;
@@ -466,6 +469,7 @@ dss_topo_init(void)
 		}
 	}
 
+	//Yuanguo: 正常情况下，一个 numa node 启一个daos_engine，不会使用 multi_socket；故 dss_numa_nr=1 不变！
 	if (multi_socket) {
 		/** In this mode, we simply save the topology for later use but
 		 * still use all of the cores.

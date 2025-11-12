@@ -443,6 +443,16 @@ vos_cont_open(daos_handle_t poh, uuid_t co_uuid, daos_handle_t *coh)
 	memset(&uma, 0, sizeof(uma));
 	uma.uma_id = UMEM_CLASS_VMEM;
 
+	//Yuanguo: cont->vc_dtx_array 是一个 struct lru_array，可以看作是一个缓存，有单subarray和多subarray 2种情况：
+	//  - 单subarray：la_flags 不含 LRU_FLAG_EVICT_MANUAL，会自动淘汰最冷的；
+	//  - 多subarray：la_flags 包含 LRU_FLAG_EVICT_MANUAL，不会自动淘汰，需要使用者 manually evict! 
+	//                和 lru 没关系，相当于一个 "mem-pool".
+	//
+	//  cont->vc_dtx_array是后者，即相当于一个"mem-pool"
+	//    - mem-pool的capacity ：DTX_ARRAY_LEN = 1 << 20 = 1MiB
+	//    - subarray数         ：DTX_ARRAY_NR  = 1 << 11 = 2048
+	//    - 每个subarray的长度 ：DTX_ARRAY_LEN  / DTX_ARRAY_NR = 512
+	//    - entry-size         ：sizeof(struct vos_dtx_act_ent)
 	rc = lrua_array_alloc(&cont->vc_dtx_array, DTX_ARRAY_LEN, DTX_ARRAY_NR,
 			      sizeof(struct vos_dtx_act_ent),
 			      LRU_FLAG_REUSE_UNIQUE, &lru_cont_cbs,
@@ -452,6 +462,13 @@ vos_cont_open(daos_handle_t poh, uuid_t co_uuid, daos_handle_t *coh)
 			DP_RC(rc));
 		D_GOTO(exit, rc);
 	}
+
+	//Yuanguo: container vc_dtx_active_btr 和 vc_dtx_committed_btr 都是 VMEM tree；
+	//  - VMEM 就是 DRAM: umm_ops.mo_tx_alloc = vmem_alloc = calloc/malloc; umm_ops.mo_tx_free = vmem_free = free;
+	//  - vmem_alloc 的返回值和 vmem_free 的参数都是 umem_off_t 类型，也就是相对于某个基地址的偏移；所以，那个基地址(umm_base)应该是0;
+	//  - VMEM类型的mem instance (struct umem_instance) 的 umm_pool 应该为 null, 因为直接从 system heap 上分配!
+	//  - VMEM类型的mem instance (struct umem_instance) 的 mo_tx_add 成员函数为 NULL，所以 umem_has_tx() 和 btr_has_tx() 函数
+	//    都返回 false：表示修改这样的 memory / btree 不需要transaction (修改 PMEM/BMEM 则需要 transaction)
 
 	rc = dbtree_create_inplace_ex(VOS_BTR_DTX_ACT_TABLE, 0,
 				      DTX_BTREE_ORDER, &uma,

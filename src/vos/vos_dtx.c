@@ -89,6 +89,7 @@ dtx_umoff_flag2type(umem_off_t umoff)
 	return 0;
 }
 
+//Yuanguo: 在 dth->dth_share_tbd_list 中insert一条记录，记录`dae`这个 DTX 处于 inprogress 状态
 static int
 dtx_inprogress(struct vos_dtx_act_ent *dae, struct dtx_handle *dth,
 	       bool hit_again, bool retry, int pos)
@@ -1052,6 +1053,13 @@ out:
 	return rc;
 }
 
+//Yuanguo: 本函数做2件事
+//  - 从 cont->vc_dtx_array 内存池分配一个 struct vos_dtx_act_ent 对象；
+//  - 把key-value: [tx-id ==> struct vos_dtx_act_ent 对象的地址] 记入conf->vc_dtx_active_hdl (Active DTX tree)
+//注意：
+//  1. 对象本身在内存池 conf->vc_dtx_array 中，记入 Active DTX tree 的是其指针；
+//  2. 由于 cont->vc_dtx_array 是多subarray的，不会自动淘汰，所以记录的指针是有效的；
+//  3. conf->vc_dtx_array 和 conf->vc_dtx_active_hdl (Active DTX tree) 都在 DRAM 中；
 static int
 vos_dtx_alloc(struct umem_instance *umm, struct dtx_handle *dth)
 {
@@ -1065,8 +1073,35 @@ vos_dtx_alloc(struct umem_instance *umm, struct dtx_handle *dth)
 	cont = vos_hdl2cont(dth->dth_coh);
 	D_ASSERT(cont != NULL);
 
+	//Yuanguo: cont->vc_dtx_array 是一个 struct lru_array，可以看作是一个缓存，有单subarray和多subarray 2种情况：
+	//  - 单subarray：la_flags 不含 LRU_FLAG_EVICT_MANUAL，会自动淘汰最冷的；
+	//  - 多subarray：la_flags 包含 LRU_FLAG_EVICT_MANUAL，不会自动淘汰，需要使用者 manually evict! 
+	//                和 lru 没关系，相当于一个 "mem-pool".
+	//
+	// cont->vc_dtx_array是多subarray！见函数 vos_cont_open() --> lrua_array_alloc()
+	//    subarray数         ：DTX_ARRAY_NR = 2048
+	//    每个subarray的长度 ：DTX_ARRAY_LEN  / DTX_ARRAY_NR = 512
+	//    entry-size         ：sizeof(struct vos_dtx_act_ent)
+	//
+	// 这里lrua_allocx()
+	//   1. 从cont->vc_dtx_array中的某一个subarray分配一个struct vos_dtx_act_ent对象，返回
+	//         - 其index (输出参数idx)    ：其中包含subarray号和subarray内index；
+	//         - entry的指针(输出参数dae) ：指向array内的struct vos_dtx_act_ent对象空间；
+	//   2. 把dth->dth_epoch记录到对应entry上。entry包含真实负载数据(struct vos_dtx_act_ent)和一些辅助信息，由struct lru_entry表示，
+	//      记录到struct lru_entry::le_key字段上；
+	//
+	// 因为多subarray情况下不会自动淘汰，所以index(输出参数idx)和entry 一一对应，所以，只要拿到idx，一定能找到entry；
+	// 因为不会淘汰，持有dae也足够用？不! 删除时还是需要idx:
+	//    - 下面 DAE_LID(dae) = idx + DTX_LID_RESERVED 还是保留了idx; 
+	//    - 若后面失败，要删除，调用dtx_evict_lid()就会使用idx;
+	//
+	//Yuanguo: 这时 dae (struct vos_dtx_act_ent) 是在 DRAM 上；它的成员 dae_base 以后会持久化到 SCM !
 	rc = lrua_allocx(cont->vc_dtx_array, &idx, dth->dth_epoch, &dae, &dth->dth_local_stub);
 	if (rc != 0) {
+		//Yuanguo: 如上所述，多subarray情况下，lru_array不会自动淘汰，可能full；
+		//  也就是说，一个container (有一个vc_dtx_array) 的 active DTX 最多是 DTX_ARRAY_LEN 个！
+		//  超过了，需要等待 其中一些DTX commit！
+
 		/* The array is full, need to commit some transactions first */
 		if (rc == -DER_BUSY)
 			rc = -DER_INPROGRESS;
@@ -1108,6 +1143,13 @@ vos_dtx_alloc(struct umem_instance *umm, struct dtx_handle *dth)
 
 	d_iov_set(&kiov, &DAE_XID(dae), sizeof(DAE_XID(dae)));
 	d_iov_set(&riov, dae, sizeof(*dae));
+	//Yuanguo:
+	//  把key-value:
+	//        dtx-id ==> dae 的地址和长度(组成riov)     //注意空间在conf->vc_dtx_array中；
+	//  记入cont->vc_dtx_active_hdl (Active DTX tree)
+	//
+	//  cont->vc_dtx_active_hdl 是一个在 VMEM (DRAM) 中的 btree；
+	//  cont->vc_dtx_array 也在 DRARM 中；
 	rc = dbtree_upsert(cont->vc_dtx_active_hdl, BTR_PROBE_EQ,
 			   DAOS_INTENT_UPDATE, &kiov, &riov, NULL);
 	if (rc == 0) {
@@ -3129,6 +3171,9 @@ vos_dtx_attach(struct dtx_handle *dth, bool persistent, bool exist)
 		if (exist) {
 			d_iov_set(&kiov, &dth->dth_xid, sizeof(dth->dth_xid));
 			d_iov_set(&riov, NULL, 0);
+			//Yuanguo: 在container的active DTX tree (cont->vc_dtx_active_hdl) 中查询以dth->dth_xid为key的记录，
+			//  结果是struct vos_dtx_act_ent 的地址和长度 (即d_iov_t riov)；
+			//  实际空间在 conf->vc_dtx_array 中，见vos_dtx_alloc();
 			rc = dbtree_lookup(cont->vc_dtx_active_hdl, &kiov, &riov);
 			if (rc != 0)
 				goto out;
@@ -3152,6 +3197,10 @@ vos_dtx_attach(struct dtx_handle *dth, bool persistent, bool exist)
 		tx = true;
 	}
 
+	//Yuanguo:
+	//  - 从 cont->vc_dtx_array 内存池分配一个 struct vos_dtx_act_ent 对象；
+	//  - 把key-value: [tx-id ==> struct vos_dtx_act_ent 对象的地址] 记入conf->vc_dtx_active_hdl (Active DTX tree)
+	//注意：conf->vc_dtx_array 和 conf->vc_dtx_active_hdl (Active DTX tree) 都在 DRAM 中；
 	if (dth->dth_ent == NULL)
 		rc = vos_dtx_alloc(umm, dth);
 

@@ -228,19 +228,27 @@ enum {
  * It is put here because it's almost used by everyone.
  */
 //Yuanguo: 摘自文档
-//  The upper 32 bits are used to encodes the object type, and key types
+//  The upper 32 bits are used to encode the object type, and key types
 //  while the lower 96 bits are a user defined identifier that must be
 //  unique to the container.
 //
 //  oid->hi的低32bit以及oid->lo(64bit)共96bit是用户设置的；
 //  DAOS使用oid->hi的高32bit来记录object的一些特性；
 //
-//  oid->hi 的结构是这样的:
+//  daos_obj_id_t::hi
 //     1B        1B           2B                         4B
-//  +--------+--------+--------+--------+--------+--------+--------+--------+
+//  +--------+--------+-----------------+-----------------------------------+
 //  |  type  | redun  |     nr_grps     | ############ user filled #########|
-//  +--------+--------+--------+--------+--------+--------+--------+--------+
-//  high                                                                   low
+//  +--------+--------+-----------------+-----------------------------------+
+//  high-addr                                                        low-addr
+//
+//  daos_obj_id_t::lo
+//                                     8B
+//  +-----------------------------------------------------------------------+
+//  |############################# user filled #############################|
+//  +-----------------------------------------------------------------------+
+//  high-addr                                                        low-addr
+//
 //  见daos_obj_set_oid()函数；
 typedef struct {
 	/** least significant (low) bits of object ID */

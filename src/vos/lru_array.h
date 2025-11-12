@@ -46,12 +46,18 @@ struct lru_sub {
 	/** Index of first free entry */
 	uint32_t		 ls_free;
 	/** Index of this entry in the array */
+	//Yuanguo: this subarray 在 lru_array 中的 subarray 号，即在 lru_array::la_sub 数组中的index；
 	uint32_t		 ls_array_idx;
 	/** Padding */
 	uint32_t		 ls_pad;
 	/** Link in the array free/unused list.  If the subarray has no free
 	 *  entries, it is removed from either list so this field is unused.
 	 */
+	//Yuanguo:
+	//  若 this subarray 没有分配空间，ls_link 链接到 lru_array 的 la_unused_sub 列表；
+	//  若 this subarray 已分配空间
+	//     - 有 free entry: ls_link 链接到 lru_array 的 la_free_sub 列表；
+	//     - 无 free entry: ls_link 不链接到任何列表，见 lrua_remove_entry() 函数，当最后一个free entry被remove时 ...
 	d_list_t		 ls_link;
 	/** Allocated payload entries */
 	void			*ls_payload;
@@ -72,6 +78,18 @@ enum {
 	LRU_FLAG_REUSE_UNIQUE		= 2,
 };
 
+//Yuanguo: struct lru_array，可以看作是一个缓存，有单subarray和多subarray 2种情况：
+//  - 单subarray：la_flags 不含 LRU_FLAG_EVICT_MANUAL，会自动淘汰最冷的；
+//  - 多subarray：la_flags 包含 LRU_FLAG_EVICT_MANUAL，不会自动淘汰，需要使用者 manually evict! 
+//                和 lru 没关系，相当于一个 "mem-pool".
+//
+// 多subarray情况下不会自动淘汰，所以index和entry一一对应，只要持有index，一定能找到entry；
+// 因为不会淘汰，持有对象的指针也足够用？
+// 不! 删除时还是需要index!
+//
+// 注意：单subarray情况下，array full时，可能把user的entry淘汰了，user的index不再有效；
+//       所以 struct lru_entry::le_key 非常重要！user必须同时持有index和le_key，
+//       查询、删除时，都要通过比较le_key来确定index指向的对象是不是他的!
 struct lru_array {
 	/** Number of indices */
 	uint32_t		 la_count;
@@ -88,8 +106,15 @@ struct lru_array {
 	/** First level mask */
 	uint32_t		 la_idx_mask;
 	/** Subarrays with free entries */
+	//Yuanguo：包含free entry 的 subarray 的列表；
+	//  多subarray的情况下(la_flags & LRU_FLAG_EVICT_MANUAL 不为0)，此列表中的 subarray 一定都有 free entry！
+	//  原因见lrua_remove_entry()函数的结尾处：
+	//       从 subarray 的 free 环摘除，且摘除完之后就没有free entry了，则把 subarray 从它所在的列表(la_free_sub)移除！
+	//  所以，只要还在 la_free_sub 中的subarray，一定有 free entry!
+	//  问：manual_find_free()中，遍历 la_free_sub 是否有必要？随便找一个 la_free_sub 中的subarray (例如第一个)，就会有free！除非 la_free_sub 为空！
 	d_list_t		 la_free_sub;
 	/** Unallocated subarrays */
+	//Yuanguo：为什么不叫 la_unallocated_sub ?
 	d_list_t		 la_unused_sub;
 	/** Callbacks for implementation */
 	struct lru_callbacks	 la_cbs;
@@ -100,9 +125,11 @@ struct lru_array {
 };
 
 /** Internal converter for real index to sub array index */
+//Yuanguo: 从 array 内 idx 得到 subarray 指针；
 #define lrua_idx2sub(array, idx)	\
 	(&(array)->la_sub[((idx) >> (array)->la_array_shift)])
 /** Internal converter for real index to entity index in sub array */
+//Yuanguo: 从 array 内 idx 得到 subarray 内 idx；
 #define lrua_idx2ent(array, idx) ((idx) & (array)->la_idx_mask)
 
 /** Internal API: Allocate one sub array */
@@ -112,6 +139,8 @@ lrua_array_alloc_one(struct lru_array *array, struct lru_sub *sub);
 /** Internal API: Evict the LRU, move it to MRU, invoke eviction callback,
  *  and return the index
  */
+//Yuanguo: 找一个free lru_entry，把`key`参数存到它的 le_key 上；
+//  注意，不是在 array 内 search key 相等的 entry;
 int
 lrua_find_free(struct lru_array *array, struct lru_entry **entry,
 	       uint32_t *idx, uint64_t key);
@@ -139,6 +168,16 @@ lrua_remove_entry(struct lru_array *array, struct lru_sub *sub, uint32_t *head,
 	 * If no free entries in the sub, then remove it from array free list (array->la_free_sub)
 	 * to avoid being searched when try to find free entry next time.
 	 */
+	//Yuanguo:
+	//   - head == &sub->ls_free  ： 当前是从 free 环摘除；
+	//   - *head == LRU_NO_IDX    ： 摘除之后 free 环为空；
+	//   - array->la_flags & LRU_FLAG_EVICT_MANUAL ：多subarray；
+	//
+	// subarray `sub` 不再包含free entry了，成了full subarry，所以把它从所属list (array->la_free_sub) 摘除；
+	// lrua_evictx() 执行相反的操作：当从一个full subarry删除一个entry，它有变得“包含free entry”了，需要加回
+	// array->la_free_sub 列表；
+	//
+	// 为什么要 array->la_flags & LRU_FLAG_EVICT_MANUAL (多subarray)呢？因为单subarray根本没有必要维护 la_free_sub/la_unused_sub 列表；
 	if (head == &sub->ls_free && *head == LRU_NO_IDX && array->la_flags & LRU_FLAG_EVICT_MANUAL)
 		d_list_del_init(&sub->ls_link);
 }
@@ -173,6 +212,9 @@ lrua_insert(struct lru_sub *sub, uint32_t *head, struct lru_entry *entry,
 }
 
 /** Internal API: Make the entry the mru */
+//Yuanguo: mru 就是 most recently used, 也就是 hotest，即 sub->ls_lru 的前一个；
+//                                 mru        sub->ls_lru
+//   ... ---> hot ---> hoter ---> hotest ---> coldest ---> colder ---> cold ---> ...
 static inline void
 lrua_move_to_mru(struct lru_array *array, struct lru_sub *sub,
 		 struct lru_entry *entry, uint32_t idx)
@@ -498,6 +540,7 @@ lrua_array_free(struct lru_array *array);
  * Frees up extraneous unused subarrays.   Only applies to arrays with more
  * than 1 sub array.
  */
+//Yuanguo: 把全 free 的 subarray 的空间释放掉，并加入 array->la_unused_sub (unallocated)列表；
 void
 lrua_array_aggregate(struct lru_array *array);
 

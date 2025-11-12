@@ -390,6 +390,11 @@ struct dss_module {
 	struct crt_proto_format		*sm_proto_fmt[2];
 	/* Array of the count of RPCs which are dedicated for client nodes only */
 	uint32_t			sm_cli_count[2];
+
+	//Yuanguo: 待确认
+	//  daos_rpc_handler: CART RPC, run on RDMA network, between libdaos (daos_client) and daos_engine
+	//  dss_drpc_handler: dRPC,     run on unix-socket,  between daos_server and daos_engine;
+
 	/* Array of RPC handler of these RPC, last entry of the array must be empty */
 	struct daos_rpc_handler		*sm_handlers[2];
 	/* dRPC handlers, for unix socket comm, last entry must be empty */

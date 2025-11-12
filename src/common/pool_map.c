@@ -62,13 +62,24 @@ struct pool_map {
 	/** refcount on the pool map */
 	int			 po_ref;
 	/** # domain layers */
+	//Yuanguo: root, node, rank -- 3个layer，不算target
 	unsigned int		 po_domain_layers;
 	/**
 	 * Sorters for the binary search of different domain types.
 	 * These sorters are in ascending order for binary search of sorters.
 	 */
+	//Yuanguo:
+	//  - without performance domain：延续pool_buf_parse()中的例子，po_domain_layers=3
+	//        po_domain_sorters[0] : [root]
+	//        po_domain_sorters[1] : [node0, node1, node2]按co_id排序；
+	//        po_domain_sorters[2] : [rank0, rank1, rank2, rank3, rank4, rank5]按co_id排序；
+	//  - with performance domain:
 	struct pool_comp_sorter	*po_domain_sorters;
 	/** sorter for binary search of target */
+	//Yuanguo:
+	//  - without performance domain：延续pool_buf_parse()中的例子，target数是108
+	//        po_target_sorter: [target0, target1, target2, ..., target107]按co_id排序；
+	//  - with performance domain:
 	struct pool_comp_sorter	 po_target_sorter;
 	/**
 	 * Tree root of all components.
@@ -79,6 +90,7 @@ struct pool_map {
 	 * number of currently failed pool components of each type
 	 * of component found in the pool
 	 */
+	//Yuanguo: po_domain_layers个元素；
 	struct pool_fail_comp	*po_comp_fail_cnts;
 	/* Current least in version from all UP/NEW targets. */
 	uint32_t		po_in_ver;
@@ -454,6 +466,186 @@ pool_buf_unpack(struct pool_buf *buf)
  * \param buf		[IN]	pool buffer to be parsed
  * \param tree_pp	[OUT]	the returned domain+target tree.
  */
+//Yuanguo: without performance domain
+//
+//  有3个server，每个server有2个rank (2个daos_engine)，每个daos_engine有18个target
+//
+//  [input] param buf 的 pb_comps 是一个struct pool_component对象的数组：
+//
+//          +------+------+------+------+------+------+------+------+------+------+------+------+------+------+------+     +------+
+//          |      |      |      |      |      |      |      |      |      |      |      |      |      |      |      | ... |      |
+//          +------+------+------+------+------+------+------+------+------+------+------+------+------+------+------+     +------+
+//          |   pb_domain_nr=3   | <----------- pb_node_nr=6 ------------> | <--------------- pb_target_nr=108 -----------------> |
+//          |   co_type=2(node)  |            co_type=1(rank)              |                  co_type=0(target)                   |
+//
+//          怀疑：结构体`struct pool_buf`中的成员变量名是过时的，
+//                分别叫 pb_node_nr, pb_rank_nr, pb_target_nr才好；
+//
+//  [output]
+//      ----------  +------------------------struct pool_domain------------------------+ tree[0]
+//                  |                                                                  |
+//                  |  .do_comp.co_type = 255 (root)                                   |
+//        root      |  .do_comp.co_nr   = 3 (3个co_type=2(node)的children)             |
+//                  |  .do_children  指向tree[1]，children是从tree[1]开始的3个对象     |
+//                  |  .do_target_nr = 108                                             |
+//                  |  .do_targets 指向targets[0]   从targets[0]开始的108个targets     |
+//                  |                                                                  |
+//      ----------  +------------------------------------------------------------------+
+//                  +------------------------struct pool_domain------------------------+ tree[1]
+//                  |                                                                  |
+//                  |  .do_comp.co_type = 2 (node)                                     |
+//                  |  .do_comp.co_nr   = 2 (2个co_type=1(rank)的children)             |
+//                  |  .do_children  指向tree[4]                                       |
+//                  |  .do_target_nr = 36                                              |
+//                  |  .do_targets 指向targets[0]   从targets[0]开始的36个targets      |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//                  +------------------------struct pool_domain------------------------+
+//                  |                                                                  |
+//                  |  .do_comp.co_type = 2 (node)                                     |
+//        node      |  .do_comp.co_nr   = 2 (2个co_type=1(rank)的children)             |
+//                  |  .do_children  指向tree[6]                                       |
+//                  |  .do_target_nr = 36                                              |
+//                  |  .do_targets 指向targets[36]  从targets[36]开始的36个targets     |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//                  +------------------------struct pool_domain------------------------+
+//                  |                                                                  |
+//                  |  .do_comp.co_type = 2 (node)                                     |
+//                  |  .do_comp.co_nr   = 2 (2个co_type=1(rank)的children)             |
+//                  |  .do_children  指向tree[8]                                       |
+//                  |  .do_target_nr = 36                                              |
+//                  |  .do_targets 指向targets[72]  从targets[72]开始的36个targets     |
+//                  |                                                                  |
+//      ----------  +------------------------------------------------------------------+
+//                  +------------------------struct pool_domain------------------------+ tree[4]
+//                  |                                                                  |
+//                  |  .do_comp.co_type = 1 (rank)                                     |
+//                  |  .do_comp.co_nr   = 0       用do_target_nr记children数           |
+//                  |  .do_children     = NULL    用do_targets指向children             |
+//                  |  .do_target_nr    = 18                                           |
+//                  |  .do_targets 指向targets[0]   从targets[0]开始的18个targets      |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//                  +------------------------struct pool_domain------------------------+
+//                  |                                                                  |
+//                  |  .do_comp.co_type = 1 (rank)                                     |
+//                  |  .do_comp.co_nr   = 0       用do_target_nr记children数           |
+//                  |  .do_children     = NULL    用do_targets指向children             |
+//                  |  .do_target_nr    = 18                                           |
+//                  |  .do_targets 指向targets[18]  从targets[18]开始的18个targets     |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//                  +------------------------struct pool_domain------------------------+ tree[6]
+//                  |                                                                  |
+//                  |  .do_comp.co_type = 1 (rank)                                     |
+//                  |  .do_comp.co_nr   = 0       用do_target_nr记children数           |
+//                  |  .do_children     = NULL    用do_targets指向children             |
+//                  |  .do_target_nr    = 18                                           |
+//                  |  .do_targets 指向targets[36]  从targets[36]开始的18个targets     |
+//                  |                                                                  |
+//        rank      +------------------------------------------------------------------+
+//                  +------------------------struct pool_domain------------------------+
+//                  |                                                                  |
+//                  |  .do_comp.co_type = 1 (rank)                                     |
+//                  |  .do_comp.co_nr   = 0       用do_target_nr记children数           |
+//                  |  .do_children     = NULL    用do_targets指向children             |
+//                  |  .do_target_nr    = 18                                           |
+//                  |  .do_targets 指向targets[54]  从targets[54]开始的18个targets     |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//                  +------------------------struct pool_domain------------------------+ tree[8]
+//                  |                                                                  |
+//                  |  .do_comp.co_type = 1 (rank)                                     |
+//                  |  .do_comp.co_nr   = 0       用do_target_nr记children数           |
+//                  |  .do_children     = NULL    用do_targets指向children             |
+//                  |  .do_target_nr    = 18                                           |
+//                  |  .do_targets 指向targets[72]  从targets[72]开始的18个targets     |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//                  +------------------------struct pool_domain------------------------+
+//                  |                                                                  |
+//                  |  .do_comp.co_type = 1 (rank)                                     |
+//                  |  .do_comp.co_nr   = 0       用do_target_nr记children数           |
+//                  |  .do_children     = NULL    用do_targets指向children             |
+//                  |  .do_target_nr    = 18                                           |
+//                  |  .do_targets 指向targets[90]  从targets[90]开始的18个targets     |
+//                  |                                                                  |
+//      ----------  +------------------------------------------------------------------+
+//                  +------------------------struct pool_target -----------------------+ targets[0]
+//                  |                                                                  |
+//                  |  .ta_comp.co_type = 0 (target)                                   |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//
+//                  |                                                                  |
+//                  |  ......                                                          |
+//                  |                                                                  |
+//
+//                  +------------------------struct pool_target -----------------------+ targets[18]
+//                  |                                                                  |
+//                  |  .ta_comp.co_type = 0 (target)                                   |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//
+//                  |                                                                  |
+//                  |  ......                                                          |
+//                  |                                                                  |
+//
+//                  +------------------------struct pool_target -----------------------+ targets[36]
+//                  |                                                                  |
+//                  |  .ta_comp.co_type = 0 (target)                                   |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//
+//                  |                                                                  |
+//       target     |  ......                                                          |
+//                  |                                                                  |
+//
+//                  +------------------------struct pool_target -----------------------+ targets[54]
+//                  |                                                                  |
+//                  |  .ta_comp.co_type = 0 (target)                                   |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//
+//                  |                                                                  |
+//                  |  ......                                                          |
+//                  |                                                                  |
+//
+//                  +------------------------struct pool_target -----------------------+ targets[72]
+//                  |                                                                  |
+//                  |  .ta_comp.co_type = 0 (target)                                   |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//
+//                  |                                                                  |
+//                  |  ......                                                          |
+//                  |                                                                  |
+//
+//                  +------------------------struct pool_target -----------------------+ targets[90]
+//                  |                                                                  |
+//                  |  .ta_comp.co_type = 0 (target)                                   |
+//                  |                                                                  |
+//                  +------------------------------------------------------------------+
+//
+//                  |                                                                  |
+//                  |  ......                                                          |
+//                  |                                                                  |
+//
+//                  +------------------------struct pool_target -----------------------+
+//                  |                                                                  |
+//                  |  .ta_comp.co_type = 0 (target)                                   |
+//                  |                                                                  |
+//      ----------  +------------------------------------------------------------------+
+//
+//  名词
+//      - domain: 非叶子节点(root, node, rank)都用struct pool_domain表示；
+//                但在本函数的代码中，pb_domain_nr是指root的children (node) 数量;
+//      - component: 以面向对象的角度看，component是所有节点(root, node, rank, target)的父类；
+//                C实现上，就是root, node，rank，target都包含一个struct pool_component (通过组合实现继承)；
+//      - target: tree的叶子节点，代表一个DAOS target;
+//
+//Yuanguo: with performance domain
 static int
 pool_buf_parse(struct pool_buf *buf, struct pool_domain **tree_pp)
 {
@@ -492,6 +684,17 @@ pool_buf_parse(struct pool_buf *buf, struct pool_domain **tree_pp)
 	if (tree == NULL)
 		return -DER_NOMEM;
 
+	//Yuanguo:
+	//  - without performance domain
+	//           tree[0]           tree[1,2,3]                  tree[4,5,6,7,8,9]         targets[0]...
+	//        +-----------+--------------------------+------------------------------------+---------------------------+
+	//        |  1个root  |    pb_domain_nr个node    |          pb_node_nr个rank          |        ......             |
+	//        +-----------+--------------------------+------------------------------------+---------------------------+
+	//        ^                                                                           ^
+	//        |                                                                           |
+	//      tree                                                                       targets
+	//
+	//  - with performance domain:
 	targets	= (struct pool_target *)&tree[buf->pb_domain_nr +
 					      buf->pb_node_nr + 1];
 	for (i = 0; i < buf->pb_target_nr; i++)
@@ -518,16 +721,37 @@ pool_buf_parse(struct pool_buf *buf, struct pool_domain **tree_pp)
 			D_DEBUG(DB_TRACE, "root do_child_nr %d, with performance domain\n",
 				parent->do_child_nr);
 		} else if (comp->co_type == PO_COMP_TP_NODE) {
+			//Yuanguo: parent是root，其children数是3 (3个node)
 			parent->do_child_nr = buf->pb_domain_nr;
 			D_DEBUG(DB_TRACE, "root do_child_nr %d, without performance domain\n",
 				parent->do_child_nr);
 		}
 	}
+
+	//Yuanguo:
+	//  - without performance domain
+	//        parent(root)的children指向第一个node;
+	//  - with performance domain:
 	parent->do_children = &tree[1];
 
+	//Yuanguo:
+	//  - without performance domain
+	//        parent++之后，指向第一个node
+	//  - with performance domain:
 	parent++;
+
+	//Yuanguo:
+	//  - without performance domain
+	//        type = 2 (node)
+	//  - with performance domain:
 	type = buf->pb_comps[0].co_type;
 
+	//Yuanguo:
+	//  - without performance domain
+	//        循环所有node和rank，直到type == PO_COMP_TP_TARGET (指向target) 结束
+	//              node:  tree[1,2,3]           buf->pb_comps[0,1,2]
+	//              rank:  tree[4,5,6,7,8,9]     buf->pb_comps[3,4,5,6,7,8]
+	//  - with performance domain:
 	for (i = 1;; i++) {
 		nr = 0;
 		comp = &tree[i].do_comp;
@@ -542,11 +766,51 @@ pool_buf_parse(struct pool_buf *buf, struct pool_domain **tree_pp)
 			pool_comp_type2str(comp->co_type), comp->co_id,
 			i, comp->co_nr, comp->co_status);
 
+		//Yuanguo:
+		//  - without performance domain
+		//        第一次执行到这里:
+		//            type = 2 (node)
+		//            所有node在这continue，直到遇到第一个rank
+		//        第二次执行到这里:
+		//            type = 1 (rank)
+		//            所有rank在这continue，直到遇到第一个target
+		//  - with performance domain:
 		if (comp->co_type == type)
 			continue;
 
+		//Yuanguo:
+		//  - without performance domain
+		//        第一次执行到这里 (comp是遇到的遇到第一个rank)
+		//           设置type = 1 (rank)
+		//        第二次执行到这里 (comp是遇到的遇到第一个target)
+		//           设置type = 0 (target)
+		//  - with performance domain:
 		type = comp->co_type;
 
+		//Yuanguo:
+		//  - without performance domain
+		//        第一次执行到这里：
+		//            i = 4 (第一个rank的index)，i = 1,2,3都是node，上面continue了；
+		//            tree[i]即tree[4]是第一个rank;
+		//            parent指向第一个node
+		//            type = 1 (rank)
+		//            所以，for循环是处理所有node (type != PO_COMP_TP_TARGET)，即为每个node设置children(children是rank)
+		//                (node) tree[1]的children指向-----> tree[第一个rank的index]，即tree[4]
+		//                (node) tree[2]的children指向-----> tree[第一个rank的index + tree[1]的children数]，即tree[4+2]
+		//                (node) tree[3]的children指向-----> tree[第一个rank的index + tree[1]的children数 + tree[2]的children数]，即tree[4+2+2]
+		//        第二次执行到这里:
+		//            i = 10 (第一个target的index), i = 4,5,6,7,8,9都是rank，上面continue了；
+		//            tree[i]即tree[10]是第一个target;
+		//            parent指向第一个rank
+		//            type = 0 (target)
+		//            所以，for循环是处理所有rank (type == PO_COMP_TP_TARGET)，即为每个rank设置children(children是targets)
+		//                (rank) tree[4]的children(即do_targets)指向----->targets[0]  targets的空间和tree的后面，是一起分配的；
+		//                (rank) tree[5]的children(即do_targets)指向----->targets[0 + tree[4]的children数do_target_nr] = targets[0+18]
+		//                (rank) tree[6]的children(即do_targets)指向----->targets[0 + tree[4]的children数do_target_nr + tree[5]的children数do_target_nr] = targets[0+18+18]
+		//                (rank) tree[7]的children(即do_targets)指向----->targets[0 + tree[4]的children数do_target_nr + tree[5]的children数do_target_nr + ... ] = targets[0+18+18+18]
+		//                (rank) tree[8]的children(即do_targets)指向----->targets[0 + tree[4]的children数do_target_nr + tree[5]的children数do_target_nr + ... ] = targets[0+18+18+18+18]
+		//                (rank) tree[9]的children(即do_targets)指向----->targets[0 + tree[4]的children数do_target_nr + tree[5]的children数do_target_nr + ... ] = targets[0+18+18+18+18+18]
+		//  - with performance domain:
 		for (; parent < &tree[i]; parent++) {
 			if (type != PO_COMP_TP_TARGET) {
 				D_DEBUG(DB_TRACE, "Setup children for %s[%d]"
@@ -563,6 +827,12 @@ pool_buf_parse(struct pool_buf *buf, struct pool_domain **tree_pp)
 					pool_domain_name(parent),
 					parent->do_comp.co_id);
 
+				//Yuanguo:
+				//  - without performance domain
+				//        rank的children就是do_targets，所以
+				//            - 不设置do_children字段，而设置do_targets字段，指向children (targets)
+				//            - 把do_comp.co_nr设置为0，而用do_target_nr字段记children数；
+				//  - with performance domain:
 				parent->do_target_nr  = parent->do_comp.co_nr;
 				parent->do_comp.co_nr = 0;
 				parent->do_targets    = targets;
@@ -575,14 +845,44 @@ pool_buf_parse(struct pool_buf *buf, struct pool_domain **tree_pp)
 			}
 		}
 
+		//Yuanguo:
+		//  - without performance domain
+		//        第一次执行到这里，上面for循环结束时
+		//            i = 4, tree[i]是第一个rank
+		//            parent指向第一个rank (所以上面的for循环才结束)
+		//            type = 1 (rank)
+		//            所以，这里不break，继续！
+		//        第二次执行到这里:
+		//            type = 0 (target)
+		//            break!
+		//  - with performance domain:
 		if (type == PO_COMP_TP_TARGET)
 			break;
 	}
 
 	D_DEBUG(DB_TRACE, "Build children and targets pointers\n");
 
+	//Yuanguo:
+	//  - without performance domain
+	//        rank的do_targets已经设置，rank前面的root,node没有设置；
+	//        现在设置它们；
+	//  - with performance domain:
+	//
+	//注意：for循环的"updation表达式"又让domain指向tree[0]，即每一遍都从root开始；
 	for (domain = &tree[0]; domain->do_targets == NULL;
 	     domain = &tree[0]) {
+
+		//Yuanguo:
+		//  - without performance domain
+		//        第一次执行到此：
+		//            while停止时：
+		//                domain指向第一个rank(do_targets != NULL)
+		//                parent是它的父，即第一个node;
+		//        第二次执行到此：
+		//            while停止时：
+		//                domain指向第一个node(do_targets != NULL，在上一轮循环中被设置)
+		//                parent是它的父，即root;
+		//  - with performance domain:
 		while (domain->do_targets == NULL) {
 			parent = domain;
 			D_ASSERTF(domain->do_children != NULL,
@@ -593,6 +893,24 @@ pool_buf_parse(struct pool_buf *buf, struct pool_domain **tree_pp)
 			domain = &domain->do_children[0];
 		}
 
+		//Yuanguo:
+		//  - without performance domain
+		//        第一次执行到此：
+		//            domain指向第一个rank
+		//            parent是它的父，即第一个node;
+		//            type = 2 (node)
+		//            外层for循环遍历所有node, 设置node的do_targets = 它的第一个child (rank) 的do_targets
+		//            内层for循环计算node的targets数: 遍历node的所有children, 累加children的targets数；
+		//        第二次执行到此：
+		//            domain指向第一个node
+		//            parent是它的父，即root;
+		//            type = 255 (root)
+		//            外层for循环其实只有1个root, 设置root的do_targets = 它的第一个child (node) 的do_targets
+		//            内层for循环计算root的targets数: 遍历root的所有children, 累加children的targets数；
+		//
+		//    注意：target在内存上是连续的，所以才可以设置起始指针，累加数量；
+		//
+		//  - with performance domain:
 		type = parent->do_comp.co_type;
 		for (; parent->do_comp.co_type == type; parent++) {
 			parent->do_targets = domain->do_targets;
@@ -702,6 +1020,22 @@ pool_tree_count(struct pool_domain *tree, struct pool_comp_cntr *cntr)
 	cntr->cc_targets  = 0;
 	cntr->cc_layers   = 0;
 
+	//Yuanguo:
+	//  - without performance domain: 见pool_buf_parse()函数中的例子
+	//        外层循环遍历各个层；
+	//            - 第1次：tree指向root；内层循环遍历1个root，cntr->cc_domains累加root的children数(+3)；结束后，外层循环更新tree指向第一个node
+	//            - 第2次：tree指向第一个node；内层循环遍历3个root，cntr->cc_domains累加3个node的children数(+2 +2 +2)；结束后，外层循环更新tree指向第一个rank
+	//            - 第3次：tree指向第一个rank；rank的do_children为NULL，所以内层循环遍历所有rank，把它们的children(target)累加到cntr->cc_targets；
+	//                     结束后，外层循环更新tree指向第一个rank的do_children(rank的do_children都为NULL)；
+	//            - 第4次：tree为NULL，结束；
+	//        所以，对于pool_buf_parse()函数中的例子，
+	//            cntr->cc_top_doms = 1  1个root
+	//            cntr->cc_domains  = 1(root)+3(node)+6(rank) = 10
+	//            cntr->cc_targets  = 108
+	//            cntr->cc_layers   = 3
+	//  - with performance domain:
+	//
+	//Yuanguo: 注意，上面的例子以tree=root作为输入，其实输入参数tree可以是任意一层的第一个节点，见pool_map_initialise()函数；
 	for (; tree != NULL; tree = tree[0].do_children, cntr->cc_layers++) {
 		int      child_nr;
 		int      i;
@@ -1008,6 +1342,25 @@ pool_map_initialise(struct pool_map *map, struct pool_domain *tree)
 	}
 
 	/* pointer arrays for binary search of domains */
+	//Yuanguo:
+	//  - without performance domain：pool_buf_parse()中的例子，po_domain_layers = 3 (3层: root, node, rank; target层不算)
+	//        第1次(i=0)：root层
+	//            pool_tree_count(root, &cntr)；得到cntr.cc_top_doms=1;
+	//            sorter->cs_nr=1;
+	//            所以sorter->cs_comps数组只有1个元素，排序(comp_sorter_sort函数)无意义
+	//            更新tree = 第一个node
+	//        第2次(i=1)：node层
+	//            pool_tree_count(pointer-of-first-node, &cntr)；得到cntr.cc_top_doms=3;
+	//            sorter->cs_nr=3;
+	//            所以sorter->cs_comps数组有3个元素(3个node)，排序：按node的co_id排序；
+	//            更新tree = 第一个rank
+	//        第3次(i=2)：rank层
+	//            pool_tree_count(pointer-of-first-rank, &cntr)；得到cntr.cc_top_doms=6;
+	//            sorter->cs_nr=6;
+	//            所以sorter->cs_comps数组有6个元素(6个rank)，排序：按rank的co_id排序；
+	//            更新tree = 第一个target
+	//        i=3，循环结束；
+	//  - with performance domain:
 	for (i = 0; i < map->po_domain_layers; i++) {
 		struct pool_comp_sorter	*sorter = &map->po_domain_sorters[i];
 		unsigned int		 j;
@@ -1022,6 +1375,8 @@ pool_map_initialise(struct pool_map *map, struct pool_domain *tree)
 		D_DEBUG(DB_TRACE, "domain %s, ndomains %d\n",
 			pool_domain_name(&tree[0]), sorter->cs_nr);
 
+		//Yuanguo: sorter->cs_comps 以及下面的 map->po_target_sorter.cs_comps 都是指针的数组；
+		//  排序不会修改map->po_tree;
 		for (j = 0; j < sorter->cs_nr; j++)
 			sorter->cs_comps[j] = &tree[j].do_comp;
 
@@ -1032,6 +1387,10 @@ pool_map_initialise(struct pool_map *map, struct pool_domain *tree)
 		tree = &tree[sorter->cs_nr];
 	}
 
+	//Yuanguo:
+	//  - without performance domain：pool_buf_parse()中的例子，cntr.cc_targets = 108
+	//        po_target_sorter->cs_nr = 108
+	//  - with performance domain:
 	rc = comp_sorter_init(&map->po_target_sorter, cntr.cc_targets,
 			      PO_COMP_TP_TARGET);
 	if (rc != 0)
@@ -1043,6 +1402,8 @@ pool_map_initialise(struct pool_map *map, struct pool_domain *tree)
 		struct pool_target *ta;
 
 		ta = &map->po_tree->do_targets[i];
+		//Yuanguo: map->po_target_sorter.cs_comps 以及上面的 sorter->cs_comps 都是指针的数组；
+		//  排序不会修改map->po_tree;
 		map->po_target_sorter.cs_comps[i] = &ta->ta_comp;
 	}
 

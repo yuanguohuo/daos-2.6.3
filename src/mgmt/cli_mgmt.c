@@ -29,6 +29,9 @@
 
 char agent_sys_name[DAOS_SYS_NAME_MAX + 1] = DAOS_DEFAULT_SYS_NAME;
 
+//Yuanguo: info_g和resp_g是通过RPC请求从"/var/run/daos_agent/daos_agent.sock"获取到的信息；
+//  代表服务端的信息与配置；
+//  见dc_mgmt_cache_attach_info()和get_attach_info()
 static struct dc_mgmt_sys_info info_g;
 static Mgmt__GetAttachInfoResp *resp_g;
 
@@ -521,6 +524,7 @@ dc_mgmt_put_sys_info(struct daos_sys_info *info)
 #define SYS_INFO_BUF_SIZE 16
 
 static int       g_num_serv_ranks = -1;
+//Yuanguo: DAOS engines的rank，见dc_mgmt_net_cfg_init()对其初始化；
 static d_rank_t *g_serv_ranks;
 
 /* Return the number of attached ranks.  */
@@ -576,11 +580,17 @@ dc_mgmt_net_cfg_init(const char *name, crt_init_options_t *crt_info)
 	char                    *cli_srx_set        = NULL;
 	char                    *crt_timeout        = NULL;
 	char                     buf[SYS_INFO_BUF_SIZE];
+	//Yuanguo: info_g和resp_g是通过RPC请求从"/var/run/daos_agent/daos_agent.sock"获取到的信息；
+	//  代表服务端的信息与配置；
+	//  见dc_mgmt_cache_attach_info()和get_attach_info()
 	struct dc_mgmt_sys_info *info = &info_g;
 	Mgmt__GetAttachInfoResp *resp = resp_g;
 	int                      idx;
 	d_rank_t                *serv_ranks_tmp;
 
+	//Yuanguo: resp是DAOS server端返回的信息；这里根据这些信息，在client端设置一些环境变量；
+	//  问1：都是什么环境变量？
+	//  问2：哪里用这些环境变量？
 	if (resp->client_net_hint != NULL && resp->client_net_hint->n_env_vars > 0) {
 		int i;
 		char *env = NULL;
@@ -606,6 +616,9 @@ dc_mgmt_net_cfg_init(const char *name, crt_init_options_t *crt_info)
 	}
 
 	/* If the server has set this, the client must use the same value. */
+	//Yuanguo: 若服务端设置了环境变量FI_OFI_RXM_USE_SRX = info->srv_srx_set，
+	//  客户端也要做同样的设置；若服务端没有设置，确保客户端也没设置；
+	//  问：哪里用这个环境变量？
 	if (info->srv_srx_set != -1) {
 		rc = asprintf(&cli_srx_set, "%d", info->srv_srx_set);
 		if (rc < 0) {
@@ -626,6 +639,9 @@ dc_mgmt_net_cfg_init(const char *name, crt_init_options_t *crt_info)
 		}
 	}
 
+	//Yuanguo: 初始化crt_info->cio_crt_timeout;
+	//  - 若client本地设置了环境变量CRT_TIMEOUT，则使用它；
+	//  - 否则，使用服务端的配置；
 	/* Allow client env overrides for these three */
 	d_agetenv_str(&crt_timeout, "CRT_TIMEOUT");
 	if (!crt_timeout) {

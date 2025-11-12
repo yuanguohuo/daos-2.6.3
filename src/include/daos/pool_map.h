@@ -87,6 +87,7 @@ struct pool_component {
 	/** padding for 64-bit alignment */
 	uint8_t		co_padding;
 	/** Immutable component ID. */
+	//Yuanguo: co_id在同一层是唯一的，但不同层之间可以相同；
 	uint32_t	co_id;
 	/**
 	 * e.g. rank in the communication group, only used by PO_COMP_TARGET

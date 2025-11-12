@@ -454,6 +454,39 @@ sched_ult2xs(int xs_type, int tgt_id)
 		 * ask neighbor to do IO forwarding seems is helpful to make
 		 * them concurrent, right?
 		 */
+		//Yuanguo:
+		//  配置文件 /etc/daos/daos_server.yml：
+		//      targets: 18             # number of I/O service threads per-engine
+		//      nr_xs_helpers: 4        # count of I/O offload threads per engine
+		//
+		//  进程
+		//      /usr/bin/daos_engine -t 18 -x 4 ...
+		//
+		//  这种情况下：
+		//      dss_tgt_nr            = 18
+		//      dss_tgt_offload_xs_nr = 4
+		//      dss_helper_pool       = true   // 因为 4%18 != 0，即4个helper线程没法平均分给18个target，所以只能做成一个"共享池"即"helper pool"
+		//      dss_sys_xs_nr         = DAOS_TGT0_OFFSET + DRPC_XS_NR = 3
+		//
+		//  注：helper 和 offload 是同一个意思：辅助xstream，main-xstream把一些任务offload到辅助xstream
+		//
+		//  xs_id     ctx_id   dx_tgt_id  dx_name     dx_comm  dx_main_xs  dx_iofw
+		// -----------------------------------------------------------------------
+		//   0          0        -1      daos_sys_0     1       0            0
+		//   1          1        -1      daos_sys_1     1       0            0
+		//   2          -1       -1      daos_sys_2     0       0
+		// -----------------------------------------------------------------------
+		//   3          2        0       daos_io_0      1       1            0
+		//   4          3        1       daos_io_1      1       1            0
+		//   ...                 ...      ...           ...     ...          ...
+		//   20         19       17      daos_io_17     1       1            0
+		// -----------------------------------------------------------------------
+		//   21         20       -1      daos_off_21    1       0            1
+		//   22         21       -1      daos_off_22    1       0            1
+		//   23         22       -1      daos_off_23    1       0            1
+		//   24         23       -1      daos_off_24    1       0            1
+		//
+		// xs_id = 3 + 18 + rand()%4，也就是从4个 helper/offload xstream 随机选择一个；
 		if (dss_tgt_offload_xs_nr > 0)
 			xs_id = dss_sys_xs_nr + dss_tgt_nr +
 				rand() % min(dss_tgt_nr, dss_tgt_offload_xs_nr);
@@ -723,6 +756,7 @@ dss_chore_ult(void *arg)
  *
  * \retval	-DER_CANCEL	chore queue stopping
  */
+//Yuanguo: 把 chore 任务 offload 到一个helper xstream上；就是 producer-consumer 模型！
 int
 dss_chore_register(struct dss_chore *chore)
 {
@@ -747,6 +781,37 @@ dss_chore_register(struct dss_chore *chore)
 	}
 
 	/* Find the chore queue. */
+	//Yuanguo: 找一个 dx_iofw = 1 的 helper/offload xtream
+	//  配置文件 /etc/daos/daos_server.yml：
+	//      targets: 18             # number of I/O service threads per-engine
+	//      nr_xs_helpers: 4        # count of I/O offload threads per engine
+	//
+	//  进程
+	//      /usr/bin/daos_engine -t 18 -x 4 ...
+	//
+	//  这种情况下：
+	//      dss_tgt_nr            = 18
+	//      dss_tgt_offload_xs_nr = 4
+	//      dss_helper_pool       = true   // 因为 4%18 != 0，即4个helper线程没法平均分给18个target，所以只能做成一个"共享池"即"helper pool"
+	//      dss_sys_xs_nr         = DAOS_TGT0_OFFSET + DRPC_XS_NR = 3
+	//
+	//  注：helper 和 offload 是同一个意思：辅助xstream，main-xstream把一些任务offload到辅助xstream
+	//
+	//  xs_id     ctx_id   dx_tgt_id  dx_name     dx_comm  dx_main_xs  dx_iofw
+	// -----------------------------------------------------------------------
+	//   0          0        -1      daos_sys_0     1       0            0
+	//   1          1        -1      daos_sys_1     1       0            0
+	//   2          -1       -1      daos_sys_2     0       0
+	// -----------------------------------------------------------------------
+	//   3          2        0       daos_io_0      1       1            0
+	//   4          3        1       daos_io_1      1       1            0
+	//   ...                 ...      ...           ...     ...          ...
+	//   20         19       17      daos_io_17     1       1            0
+	// -----------------------------------------------------------------------
+	//   21         20       -1      daos_off_21    1       0            1
+	//   22         21       -1      daos_off_22    1       0            1
+	//   23         22       -1      daos_off_23    1       0            1
+	//   24         23       -1      daos_off_24    1       0            1
 	xs_id = sched_ult2xs(DSS_XS_IOFW, info->dmi_tgt_id);
 	D_ASSERT(xs_id != -DER_INVAL);
 	dx = dss_get_xstream(xs_id);
@@ -754,6 +819,8 @@ dss_chore_register(struct dss_chore *chore)
 	queue = &dx->dx_chore_queue;
 	D_ASSERT(queue != NULL);
 
+	//Yuanguo: queue 是 dx (xstream) 独享的，为什么还要锁？
+	//  这里是 offload：当前 xtream 把任务 offload 到 dx (xstream)，就是 producer-consumer 模型！
 	ABT_mutex_lock(queue->chq_mutex);
 	if (queue->chq_stop) {
 		ABT_mutex_unlock(queue->chq_mutex);

@@ -69,6 +69,29 @@ struct pl_obj_shard {
 			po_reintegrating:1; /* reintegrating status */
 };
 
+//Yuanguo:
+//  例如
+//    - daos_obj_generate_oid(..., cid=OC_RP_3GX, ...)
+//    - DAOS集群有3个node, 每个node有2个rank(共6个runk)，每个rank有12个target (共72个target);
+//
+//  则会生成如下oid
+//
+//      daos_obj_id_t::hi
+//         1B        1B           2B                         4B
+//      +--------+--------+-----------------+-----------------------------------+
+//      |  type  | redun  |     nr_grps     | ############ user filled #########|
+//      |   0    |  9     |      22         | ..................................|
+//      +--------+--------+-----------------+-----------------------------------+
+//      high-addr                                                        low-addr
+//
+//   ol_grp_nr (nr_grps) = 22   因为 72/3 = 24，预留2个group，所以是22；
+//   ol_grp_size         = 3    因为3副本；
+//   ol_nr      = 3 * 22 = 66   表示object最多占用66个target (预留的2个group有6个target)
+//   ol_shards 存储66个target信息 (这里target也叫shard)
+//
+//   注：1个dkey占用3个target；但1个object有多个dkey，所以会占用很多target;
+//
+//   见 pl_obj_layout_alloc() 函数；
 struct pl_obj_layout {
 	uint32_t		 ol_ver;
 	uint32_t		 ol_grp_size;
@@ -99,6 +122,11 @@ struct pl_map {
 
 /** attributes of the placement map */
 struct pl_map_attr {
+	//Yuanguo:
+	//  pa_type      ：PL_TYPE_JUMP_MAP，因为 Ring Placement Map 不可用，只有 Jump Placement Map 可用；
+	//  pa_domain    ：fault domain level，例如PO_COMP_TP_NODE(2), PO_COMP_TP_GRP(3), PO_COMP_TP_MAX(254)
+	//  pa_domain_nr ：例如，pa_domain=PO_COMP_TP_NODE，则pa_domain_nr是node的数量；
+	//  pa_target_nr ：pool的target数量；
 	int		pa_type;
 	int		pa_domain;
 	int		pa_domain_nr;

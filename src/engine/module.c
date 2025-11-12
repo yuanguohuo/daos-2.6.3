@@ -68,6 +68,30 @@ dss_module_search(const char *modname)
 
 #define DSS_MODNAME_MAX_LEN	32
 
+//Yuanguo: src/engine/init.c : modules_load() 调用本函数，加载全局变量`modules`中的模块:
+//
+//         "vos,rdb,rsvc,security,mgmt,dtx,pool,cont,obj,rebuild"
+//
+//  - modname = "mgmt"
+//      - 代码在 src/mgmt/srv.c 中;
+//      - 已被编译成 "libmgmt.so"   (/usr/lib64/daos_srv/libmgmt.so 属于 daos-server-2.6.3-4.el8.x86_64.rpm)
+//      - 其中有重要的symbol "mgmt_module"，下面 dlsym() 就是获取它的指针；
+//      - mgmt_module 中注册了dRPC handlers:     sm_drpc_handlers = mgmt_drpc_handlers; 说明 daos_engine 是 DRPC_MODULE_MGMT 的服务端；
+//            以下待确认
+//            - control-plane 的 mgmt: 例如 DRPC_METHOD_MGMT_POOL_CREATE, DRPC_METHOD_MGMT_POOL_DESTROY, DRPC_METHOD_MGMT_POOL_EVICT, DRPC_METHOD_MGMT_REINTEGRATE, ...
+//            - daos_server 与 daos_engine 之间、运行于 unix-socket 上；
+//      - mgmt_module 中注册了CART RPC handlers: sm_handlers = {mgmt_handlers_v2, mgmt_handlers_v3}; 说明 daos_engine 也是这些CART RPC的服务端；
+//            以下待确认
+//            - data-plane 的 mgmt: 例如 MGMT_TGT_CREATE, MGMT_TGT_DESTROY, MGMT_TGT_MAP_UPDATE, ...
+//            - libdaos (daos_client) 与 daos_engine 之间，运行于 RDMA network 上；
+//
+//  - modname = "security"
+//      - 代码在 src/security/srv.c 中;
+//      - 已被编译成 "libsecurity.so"   (/usr/lib64/daos_srv/libsecurity.so 属于 daos-server-2.6.3-4.el8.x86_64.rpm)
+//      - 其中有重要的symbol "security_module"，下面 dlsym() 就是获取它的指针；
+//      - 没有注册 sm_drpc_handlers；
+//        那么 DRPC_MODULE_SEC 的服务端是谁呢？
+//      - 没有注册 sm_handlers;
 int
 dss_module_load(const char *modname)
 {
