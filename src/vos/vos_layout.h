@@ -169,6 +169,8 @@ struct vos_dtx_cmt_ent_df {
 	uint64_t			dce_cmt_time;
 };
 
+//Yuanguo: 关于 struct vos_dtx_act_ent, struct vos_dtx_act_ent_df 以及 struct vos_dtx_blob_df 之间的关系，
+//  见函数 vos_dtx_prepared() 之前的注释！
 /** Active DTX entry on-disk layout in both SCM and DRAM. */
 struct vos_dtx_act_ent_df {
 	/** The DTX identifier. */
@@ -210,6 +212,8 @@ struct vos_dtx_act_ent_df {
 	umem_off_t			dae_mbs_off;
 };
 
+//Yuanguo: 关于 struct vos_dtx_act_ent, struct vos_dtx_act_ent_df 以及 struct vos_dtx_blob_df 之间的关系，
+//  见函数 vos_dtx_prepared() 之前的注释！
 struct vos_dtx_blob_df {
 	/** Magic number, can be used to distinguish active or committed DTX. */
 	int					dbd_magic;

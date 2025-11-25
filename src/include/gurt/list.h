@@ -212,6 +212,8 @@ __gurt_list_splice(d_list_t *list, d_list_t *head)
  * \param[in] head	the place to add it in the first list.
  *
  */
+//Yuanguo: 把`list`里的元素合并到`head`处，返回时`list`处于 undefined 状态；
+//  对比 d_list_splice_init(), 把`list`重新初始化；
 static inline void
 d_list_splice(d_list_t *list, d_list_t *head)
 {
@@ -228,6 +230,7 @@ d_list_splice(d_list_t *list, d_list_t *head)
  * \param[in] head	the place to add it in the first list.
  */
 //Yuanguo: 把`list`里的元素合并到`head`处；然后把`list`清空(重新初始化)；
+//  对比 d_list_splice(), 返回时`list`处于 undefined 状态；
 static inline void
 d_list_splice_init(d_list_t *list, d_list_t *head)
 {

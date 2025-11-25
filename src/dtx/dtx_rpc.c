@@ -72,6 +72,11 @@ struct dtx_req_args {
 /* The record for the DTX classify-tree in DRAM.
  * Each dtx_req_rec contains one RPC (to related rank/tag) args.
  */
+//Yuanguo: 见函数 dtx_rpc() 前的注释；
+//  一个 struct dtx_req_rec 代表一个 (remote) target (由drr_rank:drr_tag标识，drr_tag是co_index，见 dtx_classify_one 函数)
+//  但可以有多个 dtx 和这个 remote target 相关:
+//      - drr_count 就是和它相关的 dtx 数;
+//      - drr_dti   就是和它相关的 dtx array;
 struct dtx_req_rec {
 	/* All the records are linked into one global list,
 	 * used for travelling the classify-tree efficiently.
@@ -370,6 +375,8 @@ struct dtx_common_args {
 	uint32_t		  dca_tgtid;
 	struct ds_cont_child	 *dca_cont;
 	struct dtx_id		  dca_dti_inline;
+	//Yuanguo: dca_dtis 和 dca_dtes 是2个数组，它们一一对应，长度是dca_count;
+	// 并且，当dca_count==1时，dca_dtis指向dca_dti_inline
 	struct dtx_id		 *dca_dtis;
 	struct dtx_entry	**dca_dtes;
 
@@ -521,6 +528,7 @@ btr_ops_t dbtree_dtx_cf_ops = {
 
 #define DTX_CF_BTREE_ORDER	20
 
+//Yuanguo: 见 dtx_rpc() 函数前的注释；
 static int
 dtx_classify_one(struct ds_pool *pool, daos_handle_t tree, d_list_t *head, int *length,
 		 struct dtx_entry *dte, int count, d_rank_t my_rank, uint32_t my_tgtid,
@@ -636,6 +644,64 @@ dtx_rpc_helper(struct dss_chore *chore, bool is_reentrance)
 	return DSS_CHORE_DONE;
 }
 
+//Yuanguo:
+//  参数`dti_list` 和 `dtes` 代表一些 dtx; 每个 dtx 有多个 target (由co_rank:co_index标识)
+//  所以，多个 dtx 的 target 之间有重复的。例如：
+//        - dtx.1: target-5, target-8, target-18
+//        - dtx.2: target-3, target-8, target-22
+//        - dtx.3: target-5, target-11, target-20
+//  给它们发 RPC 时可以聚合，例如给 target-5 和 target-8 各发1个RPC，而不是2个；
+
+//Yuanguo: 参数`dti_list`和`dtes`，有且只有1个不为null
+//
+//   CaseA：dti_list != NULL && dtes == NULL: Path [Step-A1 --> Step-A2]
+//      这种情况最简单，不做聚合，直接把`dti_list`链表 splice 到`dca->dca_head`，
+//      然后遍历链表 `dca->dca_head`，分批发 RPC (见Step-C)
+//
+//   CaseB：dti_list == NULL && dtes != NULL: Path [Step-B1 --> Step-B2]
+//      - 若count/dca_count == 1，只有1个dtx，所以无需聚合
+//      - 若count/dca_count >  1，通过btree `dca->dca_tree_hdl`做聚合
+//        问：如何聚合呢？只看到 dtx_classify_one() 函数中往btree insert，
+//            没有看到消费btree（Step-C只消费dca->dca_head链表，与btree无关）
+//        答：往btree insert的时候，其实也 insert 到 dca->dca_head 链表。
+//            因为 DBTREE_CLASS_DTX_CF btree 的 ops:
+//                  btr_ops_t dbtree_dtx_cf_ops = {
+//                    .to_rec_alloc = dtx_cf_rec_alloc,
+//                    .to_rec_update  = dtx_cf_rec_update,
+//                  };
+//            insert btree 的时候可能调用:
+//                  - dtx_cf_rec_alloc (若target在btree中不存在):
+//                       - 分配一个 struct dtx_req_rec drr，代表一个 remote target；
+//                       - drr->drr_dti 包含第一个dtx/dti；drr_count计数为1;
+//                       - 把drr insert 到链表 dcrb->dcrb_head，而它是dca->dca_head 的指针；见 dtx_classify_one() 函数；
+//                  - dtx_cf_rec_update (若target在btree中存在):
+//                       - 找到已存在的 struct dtx_req_rec drr，
+//                       - 在 drr->drr_dti 中放入dtx/dti；drr_count++;
+//
+//  聚合之后，dca->dca_head 链表如下：
+//
+//                                       remote-target-1                                 remote-target-2                 ...
+//
+//                        +---------- struct dtx_req_rec ----------+      +---------- struct dtx_req_rec ----------+
+//  dca->dca_head --------|--- d_list_t   drr_link; ---------------|R-----|----d_list_t   drr_link; ---------------|---> ...
+//                        |    d_rank_t   drr_rank; // server ID   |      |    d_rank_t   drr_rank; // server ID   |
+//                        |    uint32_t   drr_tag;  // vos ID      |      |    uint32_t   drr_tag;  // vos ID      |
+//                        |    int        drr_count // dtx数       |      |    int        drr_count // dtx数       |
+//                        |    struct dtx_id *drr_dti; //dtx array |      |    struct dtx_id *drr_dti; //dtx array |
+//                        |    ......         |                    |      |    ......         |                    |
+//                        +-------------------|--------------------+      +-------------------|--------------------+
+//                                            V                                               V
+//                                            +-- struct dtx_id --+                           +-- struct dtx_id --+
+//                                            |                   |                           |                   |
+//                                            +-- struct dtx_id --+                           +-- struct dtx_id --+
+//                                            |                   |                           |                   |
+//                                            +-- struct dtx_id --+                           +-------------------+
+//                                            |                   |
+//                                            +-------------------+
+//
+// Step-C 开始消费 dca->dca_head 链表，即分批发送 RPC
+//
+// Step-D 等待reply
 static int
 dtx_rpc(struct ds_cont_child *cont,d_list_t *dti_list,  struct dtx_entry **dtes, uint32_t count,
 	int opc, daos_epoch_t epoch, d_list_t *cmt_list, d_list_t *abt_list, d_list_t *act_list,
@@ -671,9 +737,11 @@ dtx_rpc(struct ds_cont_child *cont,d_list_t *dti_list,  struct dtx_entry **dtes,
 	uuid_copy(dra->dra_co_uuid, cont->sc_uuid);
 
 	if (dti_list != NULL) {
+		//Yuanguo: Step-A1
 		d_list_splice(dti_list, &dca->dca_head);
 		D_INIT_LIST_HEAD(dti_list);
 	} else {
+		//Yuanguo: Step-B1
 		if (count > 1) {
 			D_ALLOC_ARRAY(dca->dca_dtis, count);
 			if (dca->dca_dtis == NULL)
@@ -684,6 +752,15 @@ dtx_rpc(struct ds_cont_child *cont,d_list_t *dti_list,  struct dtx_entry **dtes,
 	}
 
 	if (dca->dca_dtes != NULL) {
+		//Yuanguo: Step-B2
+
+		//Yuanguo: 通过这个 assertion 可以推断出参数`dti_list`和`dtes` 不能同时 "not-null"
+		//  - 假如 dti_list != NULL 成立：上面dca->dca_dtis就未初始化(为NULL)，所以必须不能执行到这里，所以dca->dca_dtes == NULL必须成立；
+		//  - 假如 dca->dca_dtes != NULL 成立：dca->dca_dtis != NULL 必须成立，即上面必须要初始化它，故 dti_list == NULL；
+		// 而两者同时为null也是不可能的，见后面
+		//    D_ASSERT(!d_list_empty(&dca->dca_head));
+		// 即dca->dca_dtes == NULL时，dca->dca_head必须不空，所以，上面必须d_list_splice(..., &dca->dca_head)，故dti_list != NULL;
+		// 总之：参数`dti_list`和`dtes` 有且只有一个为null (另一个非null)
 		D_ASSERT(dca->dca_dtis != NULL);
 
 		if (dca->dca_count > 1) {
@@ -716,10 +793,21 @@ dtx_rpc(struct ds_cont_child *cont,d_list_t *dti_list,  struct dtx_entry **dtes,
 			goto out;
 		}
 	} else {
+		//Yuanguo: Step-A2
 		D_ASSERT(!d_list_empty(&dca->dca_head));
 
 		length = dca->dca_count;
 	}
+
+	//Yuanguo: Step-C
+	//  如本函数前注释所述，到现在我们已经有了一个以 `dca->dca_head` 为头的链表，其元素是 struct dtx_req_rec 类型，长度是`length`;
+	//  一个元素代表一个 target，可能有多个 dtx 与它相关，但只发一个 RPC 请求；
+	//  下面分批并发发送 RPC，DTX_PRI_RPC_STEP_LENGTH 个 target 一批；对于每一批
+	//      - dca->dca_drr 是起始位置；
+	//      - dca->dca_steps 是数量；
+	//      - 组装成一个 dtx_chore: 函数是 dtx_rpc_helper，参数是 dca
+	//      - 把 dtx_chore offload 到一个 helper xstream；
+	// 一般情况下，length 不会大于 DTX_PRI_RPC_STEP_LENGTH, 即只分1批；
 
 	dca->dca_chore.cho_func     = dtx_rpc_helper;
 	dca->dca_chore.cho_priority = 1;
@@ -747,6 +835,12 @@ dtx_rpc(struct ds_cont_child *cont,d_list_t *dti_list,  struct dtx_entry **dtes,
 
 			dca->dca_chore.cho_credits = dca->dca_steps;
 			dca->dca_chore.cho_hint    = NULL;
+			//Yuanguo: 把 dca->dca_chore offload 到一个 helper xtream 执行；即执行函数 dca->dca_chore.cho_func (dtx_rpc_helper)
+			//  dtx_rpc_helper 函数：
+			//      从 dca->dca_drr (链表 dca->dca_head) 开始，发送 dca->dca_steps 个(1批)；
+			// 一般情况下，length 不会大于 DTX_PRI_RPC_STEP_LENGTH, 即只分1批；
+			// 所以后面 length -= dca->dca_steps; 之后length 为0；
+			// 所以，可以简单认为 dtx_rpc_helper 函数处理整个链表 dca->dca_head
 			rc                         = dss_chore_register(&dca->dca_chore);
 			if (rc != 0) {
 				ABT_eventual_free(&dca->dca_chore_eventual);
@@ -762,6 +856,7 @@ dtx_rpc(struct ds_cont_child *cont,d_list_t *dti_list,  struct dtx_entry **dtes,
 			dss_chore_diy(&dca->dca_chore);
 		}
 
+		//Yuanguo: Step-D
 		rc = dtx_req_wait(&dca->dca_dra);
 		dss_chore_deregister(&dca->dca_chore);
 		if (rc == 0 || rc == -DER_NONEXIST)

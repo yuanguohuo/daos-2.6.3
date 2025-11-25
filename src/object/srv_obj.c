@@ -1608,6 +1608,9 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 
 	time = daos_get_ntime();
 	biod = vos_ioh2desc(ioh);
+	//Yuanguo:
+	//  - 对于update : 准备DMA buffer
+	//  - 对于fetch  : 准备DMA buffer,发起DMA请求, 并等待完成
 	rc   = bio_iod_prep(biod, BIO_CHK_TYPE_IO, rma ? rpc->cr_ctx : NULL, CRT_BULK_RW);
 	if (rc) {
 		D_ERROR(DF_UOID " bio_iod_prep failed: " DF_RC "\n", DP_UOID(orw->orw_oid),
@@ -1660,6 +1663,9 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 
 	if (rma) {
 		bulk_bind = orw->orw_flags & ORF_BULK_BIND;
+		//Yuanguo:
+		//  - 对于update : (待确认)使用 RDMA 从远程client (libdaos) 内存拷贝数据到本地 DMA buffer (还没发起DMA请求)
+		//  - 对于fetch  : (待确认)把数据从本地 DMA buffer 拷贝到远程client (libdaos) 内存
 		rc = obj_bulk_transfer(rpc, bulk_op, bulk_bind, orw->orw_bulks.ca_arrays, offs,
 				       skips, ioh, NULL, iods_nr, orw->orw_bulks.ca_count, NULL,
 				       ioc->ioc_coh);
@@ -1678,6 +1684,9 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 				rc = dss_sleep(3100);
 		}
 	} else if (orw->orw_sgls.ca_arrays != NULL) {
+		//Yuanguo:
+		//  - 对于update : 把数据从用户内存拷贝到DMA buffer (还没发起DMA请求)
+		//  - 对于fetch  : 把数据从DMA buffer拷贝到用户内存
 		rc = bio_iod_copy(biod, orw->orw_sgls.ca_arrays, iods_nr);
 	}
 
@@ -1726,6 +1735,9 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 		obj_log_csum_err();
 post:
 	time = daos_get_ntime();
+	//Yuanguo:
+	//  - 对于update : 发起 DMA 请求 (可能async也可能sync，见bio_iod_post_async)
+	//  - 对于fetch  : 释放DMA buffer
 	rc = bio_iod_post_async(biod, rc);
 	bio_post_latency = daos_get_ntime() - time;
 out:
@@ -1984,6 +1996,34 @@ obj_get_iods_offs(daos_unit_oid_t uoid, struct obj_iod_array *iod_array,
 	return rc;
 }
 
+//Yuanguo:
+//  对于daos update操作，粗略来说，本函数做2件事：
+//      A. 写数据 (到SCM，NVME)
+//      B. DTX 本地进入 "prepared" 状态，见vos_dtx_prepared()
+//
+//  1. vos_update_begin
+//         1.1 vos_ioc_create
+//         1.1 vos_space_hold
+//         1.1 dkey_update_begin
+//  2. bio_iod_prep
+//  3. bio_iod_copy
+//  4. bio_iod_post_async
+//  5. obj_rw_complete
+//         5.1 dtx_sub_init
+//         5.2 vos_update_end
+//                vos_ts_set_add
+//                vos_tx_begin (umem_tx_begin; dth->dth_local_tx_started=1)
+//                vos_obj_hold
+//                dkey_update
+//                    obj_tree_init (创建object的dkey-tree)
+//                    vos_ilog_update
+//                    akey_update
+//                vos_tx_end
+//                    vos_dtx_prepared  DTX进入 "prepared" 状态，持久化 Active DTX
+//  						  		vos_tx_publish (make "prepared" visible ???)
+//  						  		umem_tx_end/umem_tx_end_ex;
+//  						  vos_space_unhold
+//  6. free csums, iods
 static int
 obj_local_rw_internal_wrap(crt_rpc_t *rpc, struct obj_io_context *ioc, struct dtx_handle *dth)
 {
@@ -2025,6 +2065,7 @@ obj_local_rw_internal_wrap(crt_rpc_t *rpc, struct obj_io_context *ioc, struct dt
 	return rc;
 }
 
+//Yuanguo: 见 obj_local_rw_internal_wrap 的注释！
 static int
 obj_local_rw(crt_rpc_t *rpc, struct obj_io_context *ioc, struct dtx_handle *dth)
 {
@@ -2812,6 +2853,9 @@ obj_tgt_update(struct dtx_leader_handle *dlh, void *arg, int idx,
 		 *	on the server. That should be avoided. So pre-allocating
 		 *	DTX entry before bulk data transfer is necessary.
 		 */
+		//Yuanguo: 对于daos update操作，本函数做2件事：
+		//  A. 写数据 (到SCM，NVME)
+		//  B. DTX 本地进入 "prepared" 状态，即调用 vos_dtx_prepared() 函数
 		rc = obj_local_rw(exec_arg->rpc, exec_arg->ioc, &dlh->dlh_handle);
 		if (rc != 0)
 			DL_CDEBUG(rc == -DER_INPROGRESS || rc == -DER_TX_RESTART ||
@@ -2866,6 +2910,35 @@ process_epoch(uint64_t *epoch, uint64_t *epoch_first, uint32_t *flags)
 	return PE_OK_LOCAL;
 }
 
+//Yuanguo:
+// - daos update操作：
+//     1. client (libdaos) 通过 RPC (CaRT) 调用 ds_obj_rw_handler() 函数；
+//     2. DTX leader上，执行 ds_obj_rw_handler() 函数
+//         A. dtx_leader_begin()
+//         B. dtx_leader_exec_ops(..., obj_tgt_update, ...)
+//               a. 把函数指针 obj_tgt_update 保存到一个 struct dtx_chore 结构体中；
+//                     - dtx_chore.func = obj_tgt_update
+//                     - dtx_chore.chore.cho_func = dtx_leader_exec_ops_chore;
+//               b. 把 chore 调度到一个 helper xstream 上去执行 (dss_chore_register(&dtx_chore.chore);)
+//                     - helper xstream 上有一个 dss_chore_queue_ult (见dss_chore_queue_start函数)，用于执行
+//                       dtx_chore.chore.cho_func, 即 dtx_leader_exec_ops_chore() 函数；
+//                     - dtx_leader_exec_ops_chore() 函数: 对每一个 DTX participant 执行 dtx_chore.func, 即 obj_tgt_update 函数；
+//                     - obj_tgt_update 函数: idx参数(即non-leader participant的rank)不为-1，所以调用 ds_obj_remote_update();
+//                     - ds_obj_remote_update 函数: 给 participant 发 RPC (CaRT) 请求 DAOS_OBJ_RPC_TGT_UPDATE (处理函数ds_obj_tgt_update_handler); 
+//                     - 各个 participant 接收到 RPC 请求，执行 ds_obj_tgt_update_handler()函数
+//                         - dtx_begin():
+//                         - obj_local_rw(): 和 leader 一样，主要完成以下2件事：
+//                             I.  写数据到SCM/NVME
+//                             II. DTX 本地进入 "prepared" 状态，即调用 vos_dtx_prepared() 函数：持久化 dtx entry (struct vos_dtx_act_ent_df) 到 SCM (struct vos_cont_df::cd_dtx_active_tail，struct vos_dtx_blob_df)
+//                         - dtx_end():
+//               c. leader 自己执行 obj_tgt_update() 函数: idx参数为-1，表示自己是leader，所以调用 obj_local_rw()，主要完成以下2件事：
+//                             I.  写数据到SCM/NVME
+//                             II. DTX 本地进入 "prepared" 状态，即调用 vos_dtx_prepared() 函数：持久化 dtx entry (struct vos_dtx_act_ent_df) 到 SCM (struct vos_cont_df::cd_dtx_active_tail，struct vos_dtx_blob_df)
+//               d. 等待remote participant 完成，即调用 dtx_leader_wait() 函数
+//         C. dtx_leader_end(): 假设所有 participant 都成功，即参数 result = 0
+//               a. vos_dtx_mark_committable(): 设置 dae->dae_committable = 1 (DRAM 状态)
+//               b. dtx_commit():
+//                   - dtx_rpc(): 向其它 participant 发 RPC (CaRT) 请求 DTX_COMMIT (处理函数dtx_handler)
 void
 ds_obj_rw_handler(crt_rpc_t *rpc)
 {

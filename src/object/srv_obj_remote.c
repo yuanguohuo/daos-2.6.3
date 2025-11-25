@@ -78,6 +78,7 @@ obj_inherit_timeout(crt_rpc_t *parent, crt_rpc_t *child)
 }
 
 /* Execute update on the remote target */
+//Yuanguo: 关于本函数如何被触发，见函数 ds_obj_rw_handler 前的注释；
 int
 ds_obj_remote_update(struct dtx_leader_handle *dlh, void *data, int idx,
 		     dtx_sub_comp_cb_t comp_cb)
@@ -85,6 +86,8 @@ ds_obj_remote_update(struct dtx_leader_handle *dlh, void *data, int idx,
 	struct ds_obj_exec_arg		*obj_exec_arg = data;
 	struct daos_shard_tgt		*shard_tgt;
 	crt_endpoint_t			 tgt_ep;
+	//Yuanguo: parent_req 就是 DTX 的总 RPC 请求，即 client (libdaos) 发给 leader 的 RPC，
+	//  也是ds_obj_rw_handler(rpc)的参数
 	crt_rpc_t			*parent_req = obj_exec_arg->rpc;
 	crt_rpc_t			*req;
 	struct dtx_sub_status		*sub;
@@ -123,6 +126,7 @@ ds_obj_remote_update(struct dtx_leader_handle *dlh, void *data, int idx,
 	crt_req_addref(parent_req);
 	remote_arg->parent_req = parent_req;
 
+	//Yuanguo: 远端 participant 的处理函数是 ds_obj_tgt_update_handler
 	rc = obj_req_create(dss_get_module_info()->dmi_ctx, &tgt_ep,
 			    DAOS_OBJ_RPC_TGT_UPDATE, &req);
 	if (rc != 0) {

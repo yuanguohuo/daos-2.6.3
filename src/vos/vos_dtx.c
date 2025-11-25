@@ -1095,7 +1095,7 @@ vos_dtx_alloc(struct umem_instance *umm, struct dtx_handle *dth)
 	//    - 下面 DAE_LID(dae) = idx + DTX_LID_RESERVED 还是保留了idx; 
 	//    - 若后面失败，要删除，调用dtx_evict_lid()就会使用idx;
 	//
-	//Yuanguo: 这时 dae (struct vos_dtx_act_ent) 是在 DRAM 上；它的成员 dae_base 以后会持久化到 SCM !
+	//Yuanguo: 这时 dae (struct vos_dtx_act_ent) 是在 DRAM 上；它的成员 dae_base 以后会持久化到 NVME !
 	rc = lrua_allocx(cont->vc_dtx_array, &idx, dth->dth_epoch, &dae, &dth->dth_local_stub);
 	if (rc != 0) {
 		//Yuanguo: 如上所述，多subarray情况下，lru_array不会自动淘汰，可能full；
@@ -1757,6 +1757,80 @@ cache:
 	return 0;
 }
 
+
+//Yuanguo:
+//                    container 在 SCM 中的layout
+//                 +------- struct vos_cont_df -------+
+//                 |       ......                     |
+//              +--|-----  cd_dtx_active_head         |
+//       +------|--|-----  cd_dtx_active_tail         |
+//       |      |  |                                  |
+//       |      |  |       ......                     |
+//       |      |  |                                  |
+//       |      |  +----------------------------------+
+//       |      |
+//       |      |
+//       |      |
+//       |      |       container 的 Active DTX 表(head)
+//       |      +->+----- struct vos_dtx_blob_df -----+
+//       |         |             dbd_magic            |
+//       |         |             dbd_cap              |
+//       |         |             dbd_count            |
+//       |         |             dbd_index            |
+//       |         |             dbd_prev             |
+//       |         |             dbd_next             |
+//       |         +---- struct vos_dtx_act_ent_df ---+ dbd_active_data[0]
+//       |         |                                  |
+//       |         |                                  |
+//       |         |                                  |
+//       |         |                                  |
+//       |         |                                  |
+//       |         +---- struct vos_dtx_act_ent_df ---+ dbd_active_data[dbd_cap-1]
+//       |         |                                  |
+//       |         |                                  |
+//       |         |                                  |
+//       |         +----------------------------------+
+//       |
+//       |
+//       |
+//       |              container 的 Active DTX 表(tail)
+//       +-------> +----- struct vos_dtx_blob_df -----+  <----------------------------------------+
+//                 |             dbd_magic            |                                           |
+//                 |             dbd_cap              |                                           |
+//                 |             dbd_count            |                                           |
+//                 |             dbd_index            |                                           |
+//                 |             dbd_prev             |                                           |
+//                 |             dbd_next             |                                           |
+//                 +---- struct vos_dtx_act_ent_df ---+ dbd_active_data[0]                        |
+//                 |                                  |                                           |
+//                 |                                  |                                           |
+//                 |                                  |                                           |
+//                 +---- struct vos_dtx_act_ent_df ---+ dbd_active_data[1]                        |
+//                 |                                  |                                           |
+//                 |                                  |                                           |
+//                 |             ......               |                                           |
+//                 |                                  |                                           |                    一个 dtx 在 RAM 中
+//                 |                                  |                                           |         +--------- struct vos_dtx_act_ent --------+
+//                 +---- struct vos_dtx_act_ent_df ---+ dbd_active_data[dbd_index] 第一个free项   |         |  +---- struct vos_dtx_act_ent_df ----+  |
+//                 |                                  |     被使用                           ^    |         |  |            (dae_base)             |  |
+//                 |                                  |           <===== 持久化============= |    |         |  |                                   |  |
+//                 |                                  |                                      |    |         |  |                                   |  |
+//                 +----------------------------------+                                      |    |         |  +-----------------------------------+  |
+//                 |                                  |                                      +----|---------|- dae_df_off (dae_base的持久化位置)      |
+//                 |                                  |                                           +-<<<<----|- dae_dbd    (RAM形式的指针)             |
+//                 |             ......               |                                                     |                                         |
+//                 |                                  |                                                     |                                         |
+//                 |                                  |                                                     +-----------------------------------------+
+//                 +---- struct vos_dtx_act_ent_df ---+ dbd_active_data[dbd_cap-1]
+//                 |                                  |
+//                 |                                  |
+//                 |                                  |
+//                 +----------------------------------+
+//
+//                                 SCM                                                                                             DRAM
+//
+//Yuanguo: 本函数 就是吧 struct vos_dtx_act_ent (dae) 的 dae_base 持久化到
+//  container 的 Active DTX 表
 int
 vos_dtx_prepared(struct dtx_handle *dth, struct vos_dtx_cmt_ent **dce_p)
 {
@@ -1818,6 +1892,7 @@ vos_dtx_prepared(struct dtx_handle *dth, struct vos_dtx_cmt_ent **dce_p)
 	dae->dae_df_off = umem_ptr2off(umm, dbd) +
 			  offsetof(struct vos_dtx_blob_df, dbd_active_data) +
 			  sizeof(struct vos_dtx_act_ent_df) * dbd->dbd_index;
+	//Yuanguo: dae_df 指向 SCM 中的目标位置；下面将把 dae->dae_base 拷贝到这里；
 	dae_df = umem_off2ptr(umm, dae->dae_df_off);
 
 	/* Use the dkey_hash for the last modification as the dkey_hash
@@ -1861,6 +1936,7 @@ vos_dtx_prepared(struct dtx_handle *dth, struct vos_dtx_cmt_ent **dce_p)
 		dae->dae_oid_cnt = 1;
 	}
 
+	//Yuanguo: 拷贝之前，先修改 dae->dae_base 的状态到目标值；
 	if (DAE_MBS_DSIZE(dae) <= sizeof(DAE_MBS_INLINE(dae))) {
 		memcpy(DAE_MBS_INLINE(dae), dth->dth_mbs->dm_data,
 		       DAE_MBS_DSIZE(dae));
@@ -1906,6 +1982,7 @@ vos_dtx_prepared(struct dtx_handle *dth, struct vos_dtx_cmt_ent **dce_p)
 			goto out;
 	}
 
+	//Yuanguo: dae_df 指向 SCM 中的目标位置；这里把 dae->dae_base 拷贝到SCM；
 	memcpy(dae_df, &dae->dae_base, sizeof(*dae_df));
 	dbd->dbd_count++;
 	dbd->dbd_index++;
@@ -3200,7 +3277,8 @@ vos_dtx_attach(struct dtx_handle *dth, bool persistent, bool exist)
 	//Yuanguo:
 	//  - 从 cont->vc_dtx_array 内存池分配一个 struct vos_dtx_act_ent 对象；
 	//  - 把key-value: [tx-id ==> struct vos_dtx_act_ent 对象的地址] 记入conf->vc_dtx_active_hdl (Active DTX tree)
-	//注意：conf->vc_dtx_array 和 conf->vc_dtx_active_hdl (Active DTX tree) 都在 DRAM 中；
+	// 注意：conf->vc_dtx_array 和 conf->vc_dtx_active_hdl (Active DTX tree) 都在 DRAM 中；什么时候持久化呢？见
+	//    obj_local_rw_internal_wrap() --> obj_rw_complete() --> vos_update_end() --> vos_tx_end() --> vos_dtx_prepared()
 	if (dth->dth_ent == NULL)
 		rc = vos_dtx_alloc(umm, dth);
 

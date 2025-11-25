@@ -1643,6 +1643,15 @@ bio_iod_post(struct bio_desc *biod, int err)
 		goto out;
 	}
 
+	//Yuanguo:
+	//  对于读操作(BIO_IOD_TYPE_FETCH)
+	//    - DMA 操作已经在 iod_prep_internal 中发起并block等待完成；
+	//  对于写操作(BIO_IOD_TYPE_UPDATE)
+	//    - 这里发起 DMA 操作；即下面注释 "Land data from buffer to media on write"
+	//
+	//Yuanguo: 这里 biod->bd_async_post 应该是0;
+	//因为函数 bio_iod_post_async 中为了发起asyc操作，显示地设置其为1；
+
 	/* Land data from buffer to media on write */
 	if (err == 0 && biod->bd_type == BIO_IOD_TYPE_UPDATE)
 		dma_rw(biod);
@@ -1662,10 +1671,12 @@ out:
 int
 bio_iod_post_async(struct bio_desc *biod, int err)
 {
+	//Yuanguo: 读请求不能async (和ceph一样)
 	/* Async post is for UPDATE only */
 	if (biod->bd_type != BIO_IOD_TYPE_UPDATE)
 		goto out;
 
+	//Yuanguo: 为什么 PMEM 不 async? 写 NVME 和内存的类型有什么关系？
 	/* Async post is only for MD on SSD */
 	if (!bio_nvme_configured(SMD_DEV_TYPE_META))
 		goto out;

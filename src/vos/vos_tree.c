@@ -1181,6 +1181,8 @@ key_tree_delete(struct vos_object *obj, daos_handle_t toh, d_iov_t *key_iov)
 }
 
 /** initialize tree for an object */
+//Yuanguo: create 或者 open 对象的 dkey-tree;
+//  vos_btr_attrs[0] 是 dkey-tree-attr;
 int
 obj_tree_init(struct vos_object *obj)
 {

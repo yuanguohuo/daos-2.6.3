@@ -310,6 +310,7 @@ d_realpath(const char *path, char *resolved_path) _dalloc_;
 		}                                                                                  \
 	} while (0)
 
+//Yuanguo: D_ALLOC* 从 DRAM 分配内存
 #define D_ALLOC(ptr, size)	D_ALLOC_CORE(ptr, size, 1)
 #define D_ALLOC_PTR(ptr)	D_ALLOC(ptr, sizeof(*ptr))
 #define D_ALLOC_ARRAY(ptr, count) D_ALLOC_CORE(ptr, sizeof(*ptr), count)

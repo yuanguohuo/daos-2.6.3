@@ -2151,8 +2151,8 @@ dtx_leader_exec_ops_chore(struct dss_chore *chore, bool is_reentrance)
 			continue;
 		}
 
-		//Yuanguo: 对于 update 操作，dtx_chore->func = obj_tgt_update，见
-		//  ds_obj_rw_handler() --> dtx_leader_exec_ops()
+		//Yuanguo: 对于 update 操作，dtx_chore->func = obj_tgt_update; 参数 dtx_chore->i 是DTX participant 的 rank
+		//  见 ds_obj_rw_handler() --> dtx_leader_exec_ops()
 		rc = dtx_chore->func(dlh, dtx_chore->func_arg, dtx_chore->i, dtx_sub_comp_cb);
 		if (rc != 0) {
 			if (sub->dss_comp == 0)
@@ -2321,6 +2321,9 @@ exec:
 	if (remote_rc != 0 && remote_rc != allow_failure)
 		D_GOTO(out, rc = remote_rc);
 
+	//Yuanguo: 当 participant 太多(sub_cnt个)，分批发送 RPC (CaRT) 请求，每一批 dlh->dlh_forward_cnt 个；
+	//  goto again1 发下一批；
+	//  一般情况下，不会分批，故这里 sub_cnt -= dlh->dlh_forward_cnt 之后，等于0；
 	sub_cnt -= dlh->dlh_forward_cnt;
 	if (sub_cnt > 0) {
 		dlh->dlh_forward_idx += dlh->dlh_forward_cnt;

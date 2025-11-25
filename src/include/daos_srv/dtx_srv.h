@@ -103,6 +103,11 @@ struct dtx_handle {
 	    /* For data migration. */
 	    dth_for_migration                     : 1,
 	    /* Has prepared locally, for resend. */
+		//Yuanguo: dth_prepared 和 dae_prepared 有什么区别呢？
+		//  - dae_prepared: 肯定是用于跟踪一个 dtx 在本地的状态的；
+		//    见 vos_tx_end() 调用 vos_dtx_prepared() 之后，设置 dae_prepared = 1;
+		//  - dth_prepared: 只有 dtx_handle_init() 函数中，初始化时，设置过它的值；
+		//    怀疑是客户端 resend 请求，才设置
 	    dth_prepared                          : 1,
 	    /* The DTX handle is aborted. */
 	    dth_aborted                           : 1,

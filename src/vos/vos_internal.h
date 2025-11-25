@@ -385,6 +385,8 @@ struct vos_container {
 	unsigned int		vc_open_count;
 };
 
+//Yuanguo: 关于 struct vos_dtx_act_ent, struct vos_dtx_act_ent_df 以及 struct vos_dtx_blob_df 之间的关系，
+//  见函数 vos_dtx_prepared() 之前的注释！
 struct vos_dtx_act_ent {
 	struct vos_dtx_act_ent_df	 dae_base;
 	umem_off_t			 dae_df_off;
@@ -430,6 +432,10 @@ struct vos_dtx_act_ent {
 					 dae_need_validation:1,
 					 dae_need_release:1,
 					 dae_preparing:1,
+					 //Yuanguo: dth_prepared 和 dae_prepared 有什么区别呢？
+					 //  - dae_prepared: 肯定是用于跟踪一个 dtx 在本地的状态的；
+					 //    见 vos_tx_end() 调用 vos_dtx_prepared() 之后，设置 dae_prepared = 1;
+					 //  - dth_prepared: 对比
 					 dae_prepared:1;
 };
 

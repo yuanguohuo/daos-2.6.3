@@ -333,8 +333,11 @@ vos_tx_end(struct vos_container *cont, struct dtx_handle *dth_in,
 		return 0;
 	}
 commit:
+	//Yuanguo: 这里是本地 vos transaction commit；
+	//  分布式 DTX 在本地进入 "prepared" 状态，见下面 vos_dtx_prepared(...)，持久化 Active DTX
 	dth->dth_local_tx_started = 0;
 
+	//Yuanguo: vos_dtx_prepared(): 持久化 Active DTX ，即 本地进入 "prepared" 状态；
 	if (dtx_is_valid_handle(dth_in) && err == 0 && !dth->dth_local)
 		err = vos_dtx_prepared(dth, &dce);
 

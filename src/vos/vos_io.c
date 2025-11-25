@@ -2401,7 +2401,7 @@ akey_update_begin(struct vos_io_context *ioc)
 		size = (iod->iod_type == DAOS_IOD_SINGLE) ? iod->iod_size :
 				iod->iod_recxs[i].rx_nr * iod->iod_size;
 
-		//Yuanguo: 小于(严格小于，不是小于等于)vp_data_thresh的record extent写在SCM(PMEM/BMEM)上；
+		//Yuanguo: 小于(严格小于，不是小于等于)pool的vp_data_thresh的record extent写在SCM(PMEM/BMEM)上；
 		if (vos_io_scm(vos_cont2pool(ioc->ic_cont), iod->iod_type, size, VOS_IOS_GENERIC))
 			media = DAOS_MEDIA_SCM;
 		else
