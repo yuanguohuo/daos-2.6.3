@@ -2,12 +2,14 @@ clang
 %c -std=c11
 -isysroot
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
--I/Users/yuanguo/workspace/code-reading/linux-sdk-emulator/argobots-1.2/include
--I/Users/yuanguo/workspace/code-reading/linux-sdk-emulator/pmdk-2.1.0/include
--I/Users/yuanguo/workspace/code-reading/linux-sdk-emulator/spdk-20.07/include
+-I/Users/yuanguo/linux-emulator/usr/include
+-I/Users/yuanguo/linux-emulator/usr/local/argobots-1.2/include
+-I/Users/yuanguo/linux-emulator/usr/local/pmdk-2.1.0/include
+-I/Users/yuanguo/linux-emulator/usr/local/spdk-20.07/include
 -I./src/include
 -I./src/include/daos
 -I./src/common
 -I./src/common/dav
+-D__x86_64__
 -D_GNU_SOURCE
 -DDAOS_PMEM_BUILD

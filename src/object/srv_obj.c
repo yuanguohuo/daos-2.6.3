@@ -2915,7 +2915,7 @@ process_epoch(uint64_t *epoch, uint64_t *epoch_first, uint32_t *flags)
 //     1. client (libdaos) 通过 RPC (CaRT) 调用 ds_obj_rw_handler() 函数；
 //     2. DTX leader上，执行 ds_obj_rw_handler() 函数
 //         A. dtx_leader_begin()
-//         B. dtx_leader_exec_ops(..., obj_tgt_update, ...)
+//         B. dtx_leader_exec_ops(..., obj_tgt_update, ...)；即所有 participant 包括 leader 自己，执行 obj_tgt_update 函数，并等待都完成；
 //               a. 把函数指针 obj_tgt_update 保存到一个 struct dtx_chore 结构体中；
 //                     - dtx_chore.func = obj_tgt_update
 //                     - dtx_chore.chore.cho_func = dtx_leader_exec_ops_chore;
