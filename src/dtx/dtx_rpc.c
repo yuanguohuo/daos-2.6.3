@@ -700,7 +700,6 @@ dtx_rpc_helper(struct dss_chore *chore, bool is_reentrance)
 //                                            +-------------------+
 //
 // Step-C 开始消费 dca->dca_head 链表，即分批发送 RPC
-//
 // Step-D 等待reply
 static int
 dtx_rpc(struct ds_cont_child *cont,d_list_t *dti_list,  struct dtx_entry **dtes, uint32_t count,
@@ -856,7 +855,7 @@ dtx_rpc(struct ds_cont_child *cont,d_list_t *dti_list,  struct dtx_entry **dtes,
 			dss_chore_diy(&dca->dca_chore);
 		}
 
-		//Yuanguo: Step-D
+		//Yuanguo: Step-D 等待reply
 		rc = dtx_req_wait(&dca->dca_dra);
 		dss_chore_deregister(&dca->dca_chore);
 		if (rc == 0 || rc == -DER_NONEXIST)

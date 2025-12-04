@@ -2938,7 +2938,16 @@ process_epoch(uint64_t *epoch, uint64_t *epoch_first, uint32_t *flags)
 //         C. dtx_leader_end(): 假设所有 participant 都成功，即参数 result = 0
 //               a. vos_dtx_mark_committable(): 设置 dae->dae_committable = 1 (DRAM 状态)
 //               b. dtx_commit():
-//                   - dtx_rpc(): 向其它 participant 发 RPC (CaRT) 请求 DTX_COMMIT (处理函数dtx_handler)
+//                   - dtx_rpc(): 向其它 participant 发 RPC (CaRT) 请求 DTX_COMMIT (处理函数dtx_handler)，并等待reply回来；
+//                   - vos_dtx_commit():
+//                       - umem_tx_begin(): PMEM/BMEM内存transaction，因为要修改 cd_dtx_committed_tail 指向的 SCM 区域 
+//                       - vos_dtx_commit_internal() 一次性可以commit多个dtx;
+//                           - 修改 container 的 Committed DTX tree (vc_dtx_committed_hdl)，insert各个dtx;
+//                                   注意：Committed DTX tree 是在DRAM中的，但可以在持久化 "committed状态" 之前修改它；因为假如持久化之前crash并重启，
+//                                   有人要查dtx的状态，leader看到是prepared(持久化之前crash了)，就会查询各个participant，得知都prepared，就重
+//                                   新commit;
+//                           - 持久化 "committed状态" 到 container 的 cd_dtx_committed_tail 指向的 SCM 区；这非常类似于dtx的prepare过程，见vos_dtx_prepared()前的注释；
+//                       - umem_tx_commit): PMEM/BMEM内存transaction
 void
 ds_obj_rw_handler(crt_rpc_t *rpc)
 {
