@@ -23,6 +23,7 @@ all
 0 ofi+tcp://101.67.23.169:8686
 1 ofi+tcp://101.67.23.170:8686
 EOF
+	return 0
 }
 
 #if a IV_SERVER has been started on current machine, "/tmp/IV_TEST.attach_info_tmp" has been created by it.

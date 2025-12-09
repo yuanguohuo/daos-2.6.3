@@ -8,6 +8,8 @@ clang
 -I/Users/yuanguo/linux-emulator/usr/local/spdk-20.07/include
 -I./src/include
 -I./src/include/daos
+-I./src/include/gurt
+-I./src/cart/utils
 -I./src/common
 -I./src/common/dav
 -D__x86_64__
