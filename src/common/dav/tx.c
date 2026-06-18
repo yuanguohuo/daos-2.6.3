@@ -62,9 +62,16 @@ struct tx {
 	DAV_SLIST_HEAD(txd, tx_data) tx_entries;
 
 	//Yuanguo:
-	//  使用一个avl-tree保存current transaction修改的heap ranges的原状态，就是这些ranges的snapshot；
-	//  以便在transaction abort时回滚；就是undo log;
-	//  详细逻辑见 dav_tx_add_common() 函数;
+	//  使用一个avl-tree保存current transaction修改的heap ranges:
+	//      - 辅助生成 redo logs (持久化到 NVME wal blob)，见
+	//          tx_pre_commit ->
+	//          ravl_delete_cb ->
+	//          tx_flush_range ->
+	//          mo_wal_flush ->
+	//          dav_wal_tx_snap
+	//      - 辅助生成 undo logs (DRAM 中，用于abort 回滚，不用持久化)
+	//          - undo logs 就是这些 ranges 的snapshot，用于在transaction abort时回滚；
+	//          - 详细逻辑见 dav_tx_add_common() 函数;
 	struct ravl *ranges;
 
 	//Yuanguo:
@@ -73,6 +80,8 @@ struct tx {
 	// 	size_t size;
 	// 	size_t capacity;
 	// } actions;
+	//
+	//Yuanguo: 非常重要，见 struct dav_clogs 中的注释 ！！！
 	VEC(, struct dav_action) actions;
 
 	dav_tx_callback stage_callback;
@@ -326,6 +335,9 @@ tx_clean_range(void *data, void *ctx)
 /*
  * tx_pre_commit -- (internal) do pre-commit operations
  */
+//Yuanguo:
+//  - 对每个 tx 的修改的 range (tx->ranges)，生成一个 redo log entry，并链到 struct dav_tx wt_redo 链表尾
+//  - free tx->ranges
 static void
 tx_pre_commit(struct tx *tx)
 {
@@ -545,6 +557,11 @@ dav_tx_begin(dav_obj_t *pop, jmp_buf env, ...)
 	enum dav_tx_failure_behavior failure_behavior = DAV_TX_FAILURE_ABORT;
 
 	if (tx->stage == DAV_TX_STAGE_WORK) {
+		//Yuanguo: nested transaction；已在事务中, 再开一层
+		//   - 不重新预留 WAL ID
+		//   - 不重新分配 clogs / ranges / actions
+		//   - 只继承 parent 的 failure_behavior
+		//   - 只压入一个 tx_data 到 tx_entries 链表 (引用计数)
 		if (tx->pop != pop) {
 			ERR("nested transaction for different pool");
 			return obj_tx_fail_err(EINVAL, 0);
@@ -557,6 +574,10 @@ dav_tx_begin(dav_obj_t *pop, jmp_buf env, ...)
 
 		VALGRIND_START_TX;
 	} else if (tx->stage == DAV_TX_STAGE_NONE) {
+		//Yuanguo: 非 nested transaction，即最外层 transaction.
+		//   - 预留 cache page, WAL ID
+		//   - 分配 umem_wal_tx, clogs, ranges, actions
+		//   - 完整初始化
 		struct umem_wal_tx *utx = NULL;
 
 		DAV_DBG("");
@@ -568,8 +589,12 @@ dav_tx_begin(dav_obj_t *pop, jmp_buf env, ...)
 			goto err_abort;
 		}
 
-		//Yuanguo: 若当前内存池(dav_obj_t对象表示MD-on-SSD的内存池)上没有transaction，
-		//  则创建transaction实例(struct umem_wal_tx);
+		//Yuanguo: dav_tx_end() --> lw_tx_end() 会把 pop->do_utx 释放并置 NULL.
+		//  所以正常情况下，最外层 transaction begin 时 do_utx 应该总是 NULL;
+		//  这个判断，可能是只是一个防御性代码，或者历史遗留。证据：
+		//      - dav_umem_wtx_new() 中有 D_ASSERT(dav_hdl->do_utx == NULL);
+		//      - 那个 D_ASSERT 和这个 if 判断 是重复的；
+		//  忽略这个这判断，认为 pop->do_utx 总是 NULL !
 		if (pop->do_utx == NULL) {
 			utx = dav_umem_wtx_new(pop);
 			if (utx == NULL) {
@@ -581,6 +606,25 @@ dav_tx_begin(dav_obj_t *pop, jmp_buf env, ...)
 		pop->do_utx->utx_id = wal_id;
 
 		//Yuanguo: 一个vos，即一个xstream/线程，有一个thread local的struct tx对象；
+		//
+		//  struct tx 和 struct umem_wal_tx (dav_umem_wtx_new分配的) 有什么关系？
+		//
+		//   |----------|------------------------------------|---------------------------------------------------------------------|
+		//   |          | struct tx                          | struct umem_wal_tx                                                  |
+		//   |----------|------------------------------------|---------------------------------------------------------------------|
+		//   | 生命周期 | thread-local 永驻,跨事务复用       | 每个最外层transaction分配/释放                                      |
+		//   |----------|------------------------------------|---------------------------------------------------------------------|
+		//   | 管什么   | 事务逻辑状态: stage, ranges(修改区 | WAL 数据：utx_id、wt_redo 链表(redo actions)、迭代redo logs的函数指 |
+		//   |          | 域), actions(deferred alloc/free), | 针(BIO 的 bio_wal_commit 不知道 redo 怎么组织，它只通过这四个函数指 |
+		//   |          | callbacks                          | 针迭代所有 redo action，序列化后写入 NVMe WAL blob)                 |
+		//   |----------|------------------------------------|---------------------------------------------------------------------|
+		//   | 谁用它   | DAV 内部 (commit/abort 决策)       | BIO WAL 层 (通过 utx_ops 迭代 redo 落盘)                            |
+		//   |----------|------------------------------------|---------------------------------------------------------------------|
+		//   | 存在哪   | 栈上 static __thread               | 堆上 D_ALLOC，挂在 pop->do_utx                                      |
+		//   |----------|------------------------------------|---------------------------------------------------------------------|
+		//   | 一句话   | 事务做了什么改动；事务状态         | 这些改动怎么变成 WAL redo 交给 BIO                                  |
+		//   |----------|------------------------------------|---------------------------------------------------------------------|
+
 		tx = get_tx();
 
 		VALGRIND_START_TX;
@@ -592,9 +636,16 @@ dav_tx_begin(dav_obj_t *pop, jmp_buf env, ...)
 		DAV_SLIST_INIT(&tx->tx_entries);
 
 		//Yuanguo:
-		//  使用一个avl-tree保存current transaction修改的heap ranges的原状态，就是这些ranges的snapshot；
-		//  以便在transaction abort时回滚；就是undo log;
-		//  详细逻辑见 dav_tx_add_common() 函数;
+		//  使用一个avl-tree保存current transaction修改的heap ranges:
+		//      - 辅助生成 redo logs (持久化到 NVME wal blob)，见
+		//          tx_pre_commit ->
+		//          ravl_delete_cb ->
+		//          tx_flush_range ->
+		//          mo_wal_flush ->
+		//          dav_wal_tx_snap
+		//      - 辅助生成 undo logs (DRAM 中，用于abort 回滚，不用持久化)
+		//          - undo logs 就是这些 ranges 的snapshot，用于在transaction abort时回滚；
+		//          - 详细逻辑见 dav_tx_add_common() 函数;
 		tx->ranges = ravl_new_sized(tx_range_def_cmp,
 			sizeof(struct tx_range_def));
 		tx->first_snapshot = 1;
@@ -803,10 +854,17 @@ dav_tx_commit(void)
 		/* this is the outermost transaction */
 
 		/* pre-commit phase */
+		//Yuanguo:
+		//  - 对每个 tx 的修改的 range (tx->ranges)，生成一个 redo log entry，并链到 struct dav_tx wt_redo 链表尾
+		//  - free tx->ranges
 		tx_pre_commit(tx);
 
 		mo_wal_drain(&pop->p_ops);
 
+		//Yuanguo:
+		//  - 见 struct dav_clogs 的 external 的注释，非常重要！！！
+		//  - pop->external->ulog 指向 struct dav_clogs 的 external；见 dav_create_clogs()
+		//这里是初始化，为下面 palloc_publish 把 struct tx actions 转换成 external log 做准备
 		operation_start(pop->external);
 
 		palloc_publish(pop->do_heap, VEC_ARR(&tx->actions),
@@ -929,6 +987,8 @@ vg_verify_initialized(dav_obj_t *pop, const struct tx_range_def *def)
 /*
  * dav_tx_add_snapshot -- (internal) creates a variably sized snapshot
  */
+//Yuanguo:
+//  参数snapshot: 要被存入 undo log 的区间
 static int
 dav_tx_add_snapshot(struct tx *tx, struct tx_range_def *snapshot)
 {
@@ -1000,10 +1060,23 @@ dav_tx_merge_flags(struct tx_range_def *dest, struct tx_range_def *merged)
  * dav_tx_add_common -- (internal) common code for adding persistent memory
  * into the transaction
  */
-//Yuanguo:
-//  使用一个avl-tree保存current transaction修改的heap ranges的原状态，就是这些ranges的snapshot；
-//  以便在transaction abort时回滚；就是undo log;
-//  显而易见，一个range只在第一次被修改时，才保存；
+//Yuanguo 注释：
+//  使用一个 avl-tree(tx->ranges) 保存 current transaction 修改的 ranges；其作用是**使undo log能被正确地创建**（以及 reodo log能被正确地创建），具体地：
+//      - 事务 (tx) 修改内存时，要考虑失败abort场景，到时需要把内存恢复到原始状态，也就是需要 undo log;
+//      - undo log 何时创建呢？一个 tx 之中，可能修改同一块内存多次：例如原始状态是"AAAA"，第一次修改成"BBBB"，第二次修改成"CCCC" ......
+//        显然，只能在第一次修改的时候，生成undo log，即 AAAA -> BBBB 时，把 AAAA 记入undo log;
+//      - 所以，tx 需要记录它已经修改了哪些 ranges，下次修改一个range时，要和已经修改的 ranges 对比，看是不是第一次修改；
+//      - 这就是 tx->ranges 的作用：记录tx 已经修改了哪些 ranges；
+//
+//  注意：
+//      1. tx->ranges 本身并不是 undo log，它只是帮助我们正确地创建 undo log.
+//             undo log entire 在 tx->pop->undo / tx->pop->clogs.undo 中；
+//      2. snapshot 和 undo log 基本上可以认为是同一个东西的两个视角:
+//             做一个range的snapshot  =  往 pop->clogs.undo 写一条 BUF_CPY entry（内容 = 该 range 修改前的原始字节），见 operation_add_buffer(..., ULOG_OPERATION_BUF_CPY)
+//      3. 本函数只负责 tx 的 undo log
+//
+//Yuanguo 引用 AI 注释：
+//  对新增的内存范围与已有快照范围进行合并/去重，避免重复快照，并在必要时创建 undo 日志条目，用于 abort 恢复
 static int
 dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 {
@@ -1035,10 +1108,35 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 	struct ravl_node *nprev = NULL;
 
 	while (r.size != 0) {
-        //Yuanguo:
-        //  将要修改range r: [r.offset, r.offset+r.size)，
-        //  搜索有没有一个range f紧跟着r，即f: [r.offset+r.size, ...)，
-        //  假如有，那么就可以合并range；
+		//Yuanguo:
+		//  将要修改range r: [r.offset, r.offset + r.size)，
+		//
+		//                r: |======================|
+		//                                          ^
+		//                                          |
+		//                                       search-point
+		//
+		//  在 search-point 左侧(RAVL_PREDICATE_LESS_EQUAL) 搜索最接近 search-point 的 range；可能的结果:
+		//
+		//      - Case1: 无重叠
+		//
+		//                        r: |======================|
+		//              f: |======|
+		//              f: null
+		//
+		//      - Case2:
+		//
+		//                        r: |======================|
+		//              f: |======================|
+		//              f:               |========|
+		//
+		//      - Case3:
+		//
+		//                        r: |----------------------|
+		//              f:    |===================================|
+		//              f:                   |====================|
+		//
+		//  循环可以看作递归，Case1 是递归出口。
 		search.offset = r.offset + r.size;
 		struct ravl_node *n = ravl_find(tx->ranges, &search, p);
 		/*
@@ -1054,12 +1152,12 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 		size_t rend = r.offset + r.size;
 
 		if (fend == 0 || fend < r.offset) {
-            //Yuanguo: Case1
-            //  未找到紧跟着r.end的，也未找到左边和r有verlap的.
-            //  问题：为什么可能 fend != 0 && fend < r.offset (如下)?
-            //                                 r: ================
-            //      f: ===============
-            //  猜测：前面搜索时，p=RAVL_PREDICATE_LESS_EQUAL，可能返回小的:
+			//Yuanguo: Case1 无重叠
+			//
+			//                        r: |======================|
+			//              f: |======|
+			//              f: null
+
 			/*
 			 * If found no range or the found range is not
 			 * overlapping or adjacent on the left side, we can just
@@ -1072,6 +1170,11 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 			 * or	+--- (no overlap)
 			 * or	---+ (adjacent on on right side)
 			 */
+
+			//Yuanguo:
+			//   假如第一次循环，就是Case1，nprev==NULL；
+			//   假如经过Case2之后，下一轮循环立即进入Case1，则 nprev != NULL；见Case2的注释；
+			//   假如经过Case3之后，下一轮循环立即进入Case1，则 nprev != NULL；见Case3的注释；
 			if (nprev != NULL) {
 				/*
 				 * But, if we have an existing adjacent snapshot
@@ -1094,26 +1197,39 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 					break;
 			}
 			ret = dav_tx_add_snapshot(tx, &r);
+			//Yuanguo: 递归出口
 			break;
 		} else if (fend <= rend) {
-            //Yuanguo: Case2
-            //  不满足Case1，所以 fend != 0 && fend >= r.offset
-            //       r: ================================
-            //   f:=========================
-            //          |    intersection   | snapshot |
-            //
-            //          r = empty  (r.size -= intersection + snapshot.size之后为0)
-            //          f = f 并 r
-            //          snapshot添加进去，while结束(r.size为0)
-            //
-            //       r: ================================
-            //           f: ================
-            //              | intersection  | snapshot |
-            //          | s |
-            //
-            //          r = s;
-            //          f = f 并 snapshot
-            //          snapshot添加进去，while下一次循环，处理r=s部分；
+			//Yuanguo: Case2 又分两种情况
+			//
+			//   Case2-A:
+			//
+			//               r: |==============================|
+			//           f: |=======================|
+			//                  |    intersection   | snapshot |
+			//
+			//                  r = empty 因为 r.size -= (intersection + snapshot.size) 之后为0，即 r 除去 intersection部分 和 snapshot部分 之后，就没有了；
+			//                               intersection部分：已经snap；
+			//                               snapshot部分：本次要snap；
+			//                  f = f 并 r
+			//                  snapshot添加进去，while结束(r.size为0)
+			//
+			//   Case2-B:
+			//
+			//               r: |==============================|
+			//                   f:  |==============|
+			//                       | intersection | snapshot |
+			//                  | s  |
+			//
+			//                  r = s;    因为 r.size -= (intersection + snapshot.size) 之后剩s，即 r 除去 intersection部分 和 snapshot部分 之后，还剩下s需要继续处理；
+			//                               intersection部分：已经snap；
+			//                               snapshot部分：本次要snap；
+			//                  f = f 并 snapshot
+			//
+			//                  snapshot添加进去，while下一次循环，处理r=s部分：进入新一轮循环（递归）
+			//                      - 还可能出现同样的 3 种情况；
+			//                      - 但 Case1 略不同：nprev 是 f (即 avl-tree node `n`) 而不是 NULL，所以，s 在 Case1 中，将合并到 f
+
 			/*
 			 * If found range has its end inside of the desired
 			 * snapshot range, we can extend the found range by the
@@ -1138,6 +1254,7 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 			size_t intersection = fend - MAX(f->offset, r.offset);
 
 			r.size -= intersection + snapshot.size;
+			//Yuanguo: 在 avl-tree 中，原地修改 f 的尺寸，使其覆盖住 snapshot部分
 			f->size += snapshot.size;
 			dav_tx_merge_flags(f, args);
 
@@ -1151,6 +1268,7 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 			 * If there's a snapshot adjacent on right side, merge
 			 * the two ranges together.
 			 */
+			//Yuanguo: Case2/Case3 之后，下一轮递归又到此，则 nprev != NULL
 			if (nprev != NULL) {
 				struct tx_range_def *fprev = ravl_data(nprev);
 
@@ -1160,27 +1278,31 @@ dav_tx_add_common(struct tx *tx, struct tx_range_def *args)
 				ravl_remove(tx->ranges, nprev);
 			}
 		} else if (fend >= r.offset) {
-            //Yuanguo: Case3
-            // 不满足Case1，所以 fend != 0 && fend >= r.offset
-            // 不满足Case2，所以 fend > rend
-            //
-            //              r: ======================
-            //     f:  =========================================
-            //                 |   overlap          |
-            //
-            //     r = empty  (r.size -= overlap 之后为0)
-            //     while结束(r.size为0)
-            //     这种情况下，没有添加任何range，因为r完全被f覆盖；
-            //
-            //
-            //
-            //              r: ======================
-            //                       f: ========================
-            //                          | overlap   |
-            //                 |   s    |
-            //
-            //     r = s
-            //     while下一次循环，处理r=s部分；overlap部分被f覆盖；
+			//Yuanguo: Case3 也分两种情况
+			//
+			//   Case3-A:
+			//
+			//                      r: |====================|
+			//             f:  |=======================================|
+			//                         |   overlap          |
+			//
+			//             r = empty  (r.size -= overlap 之后为0)
+			//             while结束(r.size为0)
+			//             这种情况下，没有添加任何range，因为r完全被f覆盖；
+			//
+			//   Case3-B:
+			//
+			//                      r: |====================|
+			//                               f: |======================|
+			//                                  | overlap   |
+			//                         |   s    |
+			//
+			//             r = s
+			//             这种情况下，也没有添加range；
+			//             while下一次循环，处理r=s部分：进入新一轮循环（递归）
+			//                      - 还可能出现同样的 3 种情况；
+			//                      - 但 Case1 略不同：nprev 是 f (即 avl-tree node `n`) 而不是 NULL，所以，s 在 Case1 中，将合并到 f
+
 			/*
 			 * If found range has its end extending beyond the
 			 * desired snapshot.

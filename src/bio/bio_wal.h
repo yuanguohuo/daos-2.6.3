@@ -125,12 +125,12 @@ struct wal_super_info {
     //       - 低32-bits(WAL_ID_OFF_BITS)叫做off(offset);
     //   - off表示一个transaction在wal中所处的block号(32bit=4G个block号，每个block 4k, wal最大16T)；
     //   - seq每当wal写满回绕时递增1；
-    // 见wal_next_id()函数;
+    //   - 见wal_next_id()函数;
     //
     // 假如：
-    //   - wal的block总数是1024 (即si_header.wh_tot_blks=1024)
-    //   - si_unused_id = 3 << 32 | 1000;  即seq=3, off=1000;
-    // 那么：
+    //   - wal的block总数是1024 (即si_header.wh_tot_blks=1024，理论上最多4G个block号，但实际上有多少block号取决于wal blob的大小，1024个 -> 4M wal blob)
+    //   - 当前 si_unused_id = 3 << 32 | 1000;  即seq=3, off=1000;
+    // 分配：
     //   - T1: txA reserve id: 3 << 32 | 1000；假设txA的size是20个block；si_unused_id更新为：3 << 32 | 1020
     //   - T2: txB reserve id: 3 << 32 | 1020；假设txB的size是10个block；si_unused_id更新为：4 << 32 | 6
     //         txB占的空间是第3遍(seq=3)结尾4个block + 第4遍开头6个block;

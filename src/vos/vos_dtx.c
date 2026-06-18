@@ -1829,7 +1829,7 @@ cache:
 //
 //                                 SCM                                                                                             DRAM
 //
-//Yuanguo: 本函数 就是吧 struct vos_dtx_act_ent (dae) 的 dae_base 持久化到
+//Yuanguo: 本函数 就是把 struct vos_dtx_act_ent (dae) 的 dae_base 持久化到
 //  container 的 Active DTX 表
 int
 vos_dtx_prepared(struct dtx_handle *dth, struct vos_dtx_cmt_ent **dce_p)
@@ -3276,8 +3276,8 @@ vos_dtx_attach(struct dtx_handle *dth, bool persistent, bool exist)
 
 	//Yuanguo:
 	//  - 从 cont->vc_dtx_array 内存池分配一个 struct vos_dtx_act_ent 对象；
-	//  - 把key-value: [tx-id ==> struct vos_dtx_act_ent 对象的地址] 记入conf->vc_dtx_active_hdl (Active DTX tree)
-	// 注意：conf->vc_dtx_array 和 conf->vc_dtx_active_hdl (Active DTX tree) 都在 DRAM 中；什么时候持久化呢？见
+	//  - 把key-value: [tx-id ==> struct vos_dtx_act_ent 对象的地址] 记入cont->vc_dtx_active_hdl (Active DTX tree)
+	// 注意：cont->vc_dtx_array 和 cont->vc_dtx_active_hdl (Active DTX tree) 都在 DRAM 中；什么时候持久化呢？见
 	//    obj_local_rw_internal_wrap() --> obj_rw_complete() --> vos_update_end() --> vos_tx_end() --> vos_dtx_prepared()
 	if (dth->dth_ent == NULL)
 		rc = vos_dtx_alloc(umm, dth);

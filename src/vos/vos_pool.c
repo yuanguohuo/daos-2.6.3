@@ -1310,7 +1310,7 @@ vos_pool_create_ex(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_
 	//Yuanguo: 通过transaction修改持久化内存(包括MD-on-SSD):
 	//
 	//       step-1   :  创建transaction;
-	//       step-2   :  对要修改的ranges打snapshot，保存在transaction中，生成undo log;
+	//       step-2   :  对要修改的ranges打snapshot，保存在undo log中；
 	//       step-3   :  修改ranges;
 	//       step-4.a :  commit: 生成redo log，并持久化；
 	//       step-4.b :  abort;
@@ -1327,7 +1327,7 @@ vos_pool_create_ex(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_
 	if (rc != 0)
 		goto close;
 
-	//Yuanguo: step-2: 对要修改的ranges打snapshot，保存在transaction中，生成undo log;
+	//Yuanguo: step-2: 对要修改的ranges打snapshot，保存在undo log中；
 	//  Takes a "snapshot" of the given memory region and saves it in the undo log.
 	//  The application is then free to directly modify the object in that memory
 	//  range.

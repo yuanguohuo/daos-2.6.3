@@ -313,18 +313,17 @@ bio_wal_reserve(struct bio_meta_context *mc, uint64_t *tx_id, struct bio_wal_sta
 	struct wal_super_info	*si = &mc->mc_wal_info;
 	int			 rc = 0;
 
-    //Yuanguo:
-    //  问1：这里读si->si_rsrv_waiters，以及si->si_rsrv_waiters++没有锁保护，是安全的吗？
-    //  答1：应该是一个线程(xstream)，多个ULT (user level thread)，所以是安全的；
-    //  问2：那么下面ABT_mutex_lock/ABT_cond_wait的作用是什么呢？
-    //  答2：应该是为了yield，等待reserve_allowed()变为true，且排在前面的waiter都已分配(si->si_rsrv_wq FIFO队列为空)
+	//Yuanguo:
+	//  问1：这里读si->si_rsrv_waiters，以及si->si_rsrv_waiters++没有锁保护，是安全的吗？
+	//  答1：应该是一个线程(xstream)，多个ULT (user level thread)，所以是安全的；
+	//  问2：那么下面ABT_mutex_lock/ABT_cond_wait的作用是什么呢？
+	//  答2：应该是为了yield，等待reserve_allowed()变为true，且排在前面的waiter都已分配(si->si_rsrv_wq FIFO队列为空)
 	if (!si->si_rsrv_waiters && reserve_allowed(si))
 		goto done;
 
-    //Yuanguo: 前面有waiter，或者现在reserve_allowed为false；
-    //   - waiter数递增；
-    //   - 进入si->si_rsrv_wq FIFO队列；
-    //   - yield;
+	//Yuanguo: 前面有waiter，或者 reserve_allowed() 返回 false；
+	//   - waiter数递增；
+	//   - ABT_cond_wait: 进入si->si_rsrv_wq FIFO队列，并 yield;
 	si->si_rsrv_waiters++;
 	if (stats)
 		stats->ws_waiters = si->si_rsrv_waiters;
@@ -333,22 +332,22 @@ bio_wal_reserve(struct bio_meta_context *mc, uint64_t *tx_id, struct bio_wal_sta
 	ABT_cond_wait(si->si_rsrv_wq, si->si_mutex);
 	ABT_mutex_unlock(si->si_mutex);
 
-    //Yuanguo: reserve_allowed()变为true，且排在前面的waiter都已分配；
+	//Yuanguo: reserve_allowed()变为true，且排在前面的waiter都已分配；
 	D_ASSERT(si->si_rsrv_waiters > 0);
 	si->si_rsrv_waiters--;
 
-    //Yuanguo: 唤醒一个排在后面的waiter；
+	//Yuanguo: 唤醒一个排在后面的waiter (ULT)：让它进入runnable队列，但没有运行，因为当前xstream运行的是自己！
 	wakeup_reserve_waiters(si, false);
 	/* It could happen when wakeup all on WAL unload */
 	if (!reserve_allowed(si))
 		rc = -DER_SHUTDOWN;
 done:
-    //Yuanguo:
-    //  这里没有立即更新si_unused_id(因为当前transaction的大小还不知道？)
-    //  所以，下一个waiter并不能立即分配tx_id，要等到当前transaction commit
-    //  之后才更新(才能分配)，见bio_wal_commit()
-    //  若在此之前去reserve就会transaction id重复(transaction id代表的是空间，故覆盖)；如何保证没有别的ULT去reserve呢？
-    //  见函数前注释：Caller must guarantee no yield between bio_wal_reserve() and bio_wal_submit()
+	//Yuanguo:
+	//  这里没有立即更新si_unused_id(因为当前transaction的大小还不知道？)
+	//  所以，下一个waiter并不能立即分配tx_id，要等到当前transaction commit
+	//  之后才更新(才能分配)，见bio_wal_commit()
+	//  若在此之前去reserve就会transaction id重复(transaction id代表的是空间，故覆盖)；如何保证没有别的ULT去reserve呢？
+	//  见函数前注释：Caller must guarantee no yield between bio_wal_reserve() and bio_wal_submit()
 	*tx_id = si->si_unused_id;
 	return rc;
 }

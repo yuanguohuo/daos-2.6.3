@@ -2006,8 +2006,8 @@ obj_get_iods_offs(daos_unit_oid_t uoid, struct obj_iod_array *iod_array,
 //         1.1 vos_space_hold
 //         1.1 dkey_update_begin
 //  2. bio_iod_prep
-//  3. bio_iod_copy
-//  4. bio_iod_post_async
+//  3. bio_iod_copy / obj_bulk_transfer
+//  4. bio_iod_post_async -> bio_iod_post -> dma_rw
 //  5. obj_rw_complete
 //         5.1 dtx_sub_init
 //         5.2 vos_update_end

@@ -79,6 +79,7 @@ typedef uint64_t ulog_operation_type;
 #define ULOG_OPERATION_AND		(0b001ULL << 61ULL)
 #define ULOG_OPERATION_OR		(0b010ULL << 61ULL)
 #else
+//Yuanguo: `0b`表示二进制，不是值的一部分！
 #define ULOG_OPERATION_CLR_BITS		(0b001ULL << 61ULL)
 #define ULOG_OPERATION_SET_BITS		(0b010ULL << 61ULL)
 #endif

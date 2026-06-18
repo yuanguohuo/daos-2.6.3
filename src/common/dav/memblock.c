@@ -673,6 +673,57 @@ chunk_get_chunk_hdr_value(uint16_t type, uint16_t flags, uint32_t size_idx)
  * huge_prep_operation_hdr -- prepares the new value of a chunk header that will
  *	be set after the operation concludes.
  */
+//Yuanguo:
+//  - zone 结构（BMEM v1 其实只有一个巨大的zone）：
+//           zone-header                  -- 64B
+//           struct chunk_header[] 数组   -- 每个元素8B，和后面 chunk 一一 对应
+//           chunks                       -- 每个256KB，和前面struct chunk_header[] 数组 一一对应；
+//  - 一个chunk 256KB (CHUNKSIZE)
+//  - 两种分配模式：huge vs. run
+//
+//Huge模式：大块内存分配（大于 last_run_max_size, 10 个 256KB chunk）
+//
+//例如，从 i 开始分配 4 (size_idx=4) 个 chunk 作为一个 block (4*256KB = 1MB)
+//
+//  chunk_headers[i ~ i+3]:
+//  ┌──────────────────┬───────────────┬───────────────┬──────────────────┐
+//  │ type=USED/FREE   │ (undefined)   │ (undefined)   │ type=FOOTER      │
+//  │ flags            │               │               │ flags=0          │
+//  │ size_idx=4       │               │               │ size_idx=4       │
+//  └──────────────────┴───────────────┴───────────────┴──────────────────┘
+//    i                   i+1            i+2             i+3
+//    ← HEADER                                           ← FOOTER (仅 size_idx>1)
+//
+//  chunks[i ~ i+3]:
+//  ┌──────────┬──────────┬──────────┬──────────┐
+//  │  256 KB  │  256 KB  │  256 KB  │  256 KB  │  → 用户可用空间 (减去 alloc header)
+//  └──────────┴──────────┴──────────┴──────────┘
+//
+//  分配时写什么（huge_prep_operation_hdr）
+//
+//  |----------------|-------------------------------|--------------------------|----------------------|
+//  | 情况           | 写哪里                        | 写什么                   | redo entry 类型      |
+//  |----------------|-------------------------------|--------------------------|----------------------|
+//  | header         | chunk_headers[i]              | {type=USED, flags=原值,  | ULOG_OPERATION_SET   |
+//  | (始终写)       |                               |  size_idx=4} 整个 8 字节 |                      |
+//  |----------------|-------------------------------|--------------------------|----------------------|
+//  | footer         | chunk_headers[i +             | {type=FOOTER, flags=0,   | ULOG_OPERATION_SET   |  <-- 不持久化，因为从 HEADER 修改可以重建 FOOTER；
+//  | (仅size_idx>1) | size_idx - 1]                 |  size_idx=4}             |                      |
+//  |----------------|-------------------------------|--------------------------|----------------------|
+//
+//  注意：size_idx == 1 时，只写 header 不写 footer；
+//
+//  Footer 的作用：方便释放时向前合并（coalescing）—— 通过尾部 chunk 的 footer 可以反向找到整个 huge block 的起始位置和大小。
+//                 plus: 不但向前合并，还会向后合并，例如:
+//                       free chunk 112-118
+//                       used chunk 119-125
+//                       free chunk 126-130
+//                 那么，释放 119-125 时，会合并成一个大的free chunk 112-130
+//                 见 heap_free_chunk_reuse -> heap_coalesce_huge
+//                                                 -> heap_get_adjacent_free_block(..., prev=1) //向前
+//                                                 -> heap_get_adjacent_free_block(..., prev=0) //向后
+//
+//Run模式：见 run_prep_operation_hdr 的注释；
 static void
 huge_prep_operation_hdr(const struct memory_block *m, enum memblock_state op,
 	struct operation_context *ctx)
@@ -726,6 +777,11 @@ huge_prep_operation_hdr(const struct memory_block *m, enum memblock_state op,
 			memory_order_relaxed);
 		VALGRIND_SET_CLEAN(footer, sizeof(*footer));
 	} else {
+		//Yuanguo: 对 FOOTER 的修改，和 HEADER 一样：
+		//    - 内存事务执行时，记录在 tx->actions中；未实际修改内存，故不可见；
+		//    - 内存事务commit时，生成 redo log，记录在 operation_context 中；然后执行，使修改可见；
+		// 但对 FOOTER 的修改，不用持久化（不用存在 wal blob 中），因为对HEADER的修改 log 持久化了，replay 它时，可以恢复 FOOTER；
+		// 换句话说，FOOTER 的修改 log 是冗余的；但在 DAOS 2.8 的 BMEM v2 中，FOOTER 的修改日志，也持久化了。。。
 		operation_add_typed_entry(ctx,
 			footer, val, ULOG_OPERATION_SET, LOG_TRANSIENT);
 	}
@@ -739,10 +795,144 @@ huge_prep_operation_hdr(const struct memory_block *m, enum memblock_state op,
  * bitmap this method is modifying must not be changed after this function
  * is called and before the operation is processed.
  */
+//Yuanguo:
+//  - zone 结构（BMEM v1 其实只有一个巨大的zone）：
+//           zone-header                  -- 64B
+//           struct chunk_header[] 数组   -- 每个元素8B，和后面 chunk 一一 对应
+//           chunks                       -- 每个256KB，和前面struct chunk_header[] 数组 一一对应；
+//  - 一个chunk 256KB (CHUNKSIZE)
+//  - 两种分配模式：huge vs. run
+//
+//Huge模式：大块内存分配（大于 last_run_max_size, 10 个 256KB chunk）
+//
+//例如，从 i 开始分配 4 (size_idx=4) 个 chunk 作为一个 block (4*256KB = 1MB)
+//
+//  chunk_headers[i ~ i+3]:
+//  ┌──────────────────┬───────────────┬───────────────┬──────────────────┐
+//  │ type=USED/FREE   │ (undefined)   │ (undefined)   │ type=FOOTER      │
+//  │ flags            │               │               │ flags=0          │
+//  │ size_idx=4       │               │               │ size_idx=4       │
+//  └──────────────────┴───────────────┴───────────────┴──────────────────┘
+//    i                   i+1            i+2             i+3
+//    ← HEADER                                           ← FOOTER (仅 size_idx>1)
+//
+//  chunks[i ~ i+3]:
+//  ┌──────────┬──────────┬──────────┬──────────┐
+//  │  256 KB  │  256 KB  │  256 KB  │  256 KB  │  → 用户可用空间 (减去 alloc header)
+//  └──────────┴──────────┴──────────┴──────────┘
+//
+//  分配时写什么（huge_prep_operation_hdr）
+//
+//  |----------------|-------------------------------|--------------------------|----------------------|
+//  | 情况           | 写哪里                        | 写什么                   | redo entry 类型      |
+//  |----------------|-------------------------------|--------------------------|----------------------|
+//  | header         | chunk_headers[i]              | {type=USED, flags=原值,  | ULOG_OPERATION_SET   |
+//  | (始终写)       |                               |  size_idx=4} 整个 8 字节 |                      |
+//  |----------------|-------------------------------|--------------------------|----------------------|
+//  | footer         | chunk_headers[i +             | {type=FOOTER, flags=0,   | ULOG_OPERATION_SET   |  <-- 不持久化，因为从 HEADER 修改可以重建 FOOTER；
+//  | (仅size_idx>1) | size_idx - 1]                 |  size_idx=4}             |                      |
+//  |----------------|-------------------------------|--------------------------|----------------------|
+//
+//  注意：size_idx == 1 时，只写 header 不写 footer；
+//
+//  Footer 的作用：方便释放时向前合并（coalescing）—— 通过尾部 chunk 的 footer 可以反向找到整个 huge block 的起始位置和大小。
+//                 plus: 不但向前合并，还会向后合并，例如:
+//                       free chunk 112-118
+//                       used chunk 119-125
+//                       free chunk 126-130
+//                 那么，释放 119-125 时，会合并成一个大的free chunk 112-130
+//                 见 heap_free_chunk_reuse -> heap_coalesce_huge
+//                                                 -> heap_get_adjacent_free_block(..., prev=1) //向前
+//                                                 -> heap_get_adjacent_free_block(..., prev=0) //向后
+//
+//Run模式：小对象分配（小于等于 last_run_max_size, 10 个 256KB chunk）
+//
+//  - 一个 Run = 1~16 个连续 256KB chunk（RUN_SIZE_IDX_CAP = 16），内部被等分成若干固定大小的 block (例如 128B, 256B, 512B, ...)。
+//  - 类似于linux 内核中的 slab allocator
+//
+//例如，从 i 开始的 3 个连续 256KB chunk 组成一个 run
+//
+//  chunk_headers[]:
+//  ┌──────────────────┬────────────────────────┬───────────────────────┐
+//  │ type=RUN         │ type=RUN_DATA          │ type=RUN_DATA         │  ← size_idx=3 的 run
+//  │ flags            │ size_idx=1             │ size_idx=2            │
+//  │ size_idx=3       │   (距首 chunk 偏移1)   │   (距首 chunk 偏移2)  │
+//  └──────────────────┴────────────────────────┴───────────────────────┘
+//    i                  i+1                      i+2
+//
+//  Run 内部 layout (跨越上面 3 个 chunk 的连续空间):
+//  ┌───────────────────────────────────────────────────────────────────┐
+//  │ chunk_run_header (16B): { block_size, alignment }                 │
+//  ├───────────────────────────────────────────────────────────────────┤
+//  │ bitmap: uint64_t values[nvalues]                                  │
+//  │   bit=1 → 已分配, bit=0 → 空闲                                    │
+//  ├───────────────────────────────────────────────────────────────────┤
+//  │ data area:                                                        │
+//  │ ┌─────┬─────┬─────┬─────┬─────┬─────┬─── ─ ─ ─ ──┬─────┐          │
+//  │ │blk 0│blk 1│blk 2│blk 3│blk 4│blk 5│    ...     │blk N│          │
+//  │ └─────┴─────┴─────┴─────┴─────┴─────┴─── ─ ─ ─ ──┴─────┘          │
+//  │  每个 block = unit_size (即block_size，如 128B, 256B, 512B, ...)  │
+//  └───────────────────────────────────────────────────────────────────┘
+//
+//  说明：unit_size 是运行时名字，在分配类管理层（alloc_class）使用；
+//        block_size 持久化存在每个 run 的 header 中（即上图中 chunk_run_header）；
+//        两者值完全一样；
+//
+//  注意：chunk_headers[] (struct chunk_header) 的 size_idx 和下面函数中 m->size_idx (struct memory_block 的 size_idx) 完全不同：
+//      |-----------------------|------------------------------|---------------------------------------|
+//      |                       | chunk_header.size_idx        | memory_block.size_idx                 |
+//      |-----------------------|------------------------------|---------------------------------------|
+//      | Run 模式含义          | 这个 run 占几个连续 chunk    | 这次操作涉及几个连续 block            |
+//      |-----------------------|------------------------------|---------------------------------------|
+//      | 单位                  | chunk 数（每个 256KB）       | block 数（每个 = unit_size，如 256B） |
+//      |-----------------------|------------------------------|---------------------------------------|
+//      | 典型值                | 1 ~ 16（RUN_SIZE_IDX_CAP）   | 1 ~ 64（RUN_BITS_PER_VALUE）          |
+//      |-----------------------|------------------------------|---------------------------------------|
+//      | 存储位置              | 持久化（SCM/NVMe 上的元数据）| DRAM 运行时（描述一次分配/释放操作）  |
+//      |-----------------------|------------------------------|---------------------------------------|
+//      | 谁设置                | 创建 run 时一次性写入        | 每次 alloc/free 时根据请求大小计算    |
+//      |-----------------------|------------------------------|---------------------------------------|
+//
+//  注意：说block，需要按语境体会到底指什么？
+//      - run 中的一个 unit (128B, 256B, 512B, ...)
+//      - 正在分配/释放的 struct memory_block；它其实指多个连续的 unit
+//
+//  Run模式下，分配/释放时写什么？本函数 (run_prep_operation_hdr) 的核心
+//      - 不修改 chunk_header，
+//      - 只修改 bitmap 中某个 uint64_t 的若干 bit：
+//
+//           bitmap values[]:
+//           ┌────────────────────────────────────────────────────────┐
+//           │ values[0]: 64 bits → 对应 block 0~63                   │
+//           │ values[1]: 64 bits → 对应 block 64~127                 │
+//           │ values[2]: 64 bits → 对应 block 128~191                │
+//           │ ...                                                    │
+//           └────────────────────────────────────────────────────────┘
+//
+//           假设分配 block_off=130, size_idx=3 (3 个连续 block, 即 3 个 256B 的unit):
+//           → bpos = 130 / 64 = 2        (修改 values[2])
+//           → 在 values[2] 中从 bit 2 开始置 3 个 bit
+//
+//           values[2] 修改前: ...0000 0000 0000 0000
+//           values[2] 修改后: ...0000 0000 0001 1100   (bit 2,3,4 置 1)
+//
+//           若是释放，则相反！
+//
+//      |------|-------------------------|---------------------------------|
+//      | 操作 | redo entry 类型         | 含义                            |
+//      |------|-------------------------|---------------------------------|
+//      | 分配 | ULOG_OPERATION_SET_BITS | 对 values[bpos] 的指定 bit 置 1 |
+//      |------|-------------------------|---------------------------------|
+//      | 释放 | ULOG_OPERATION_CLR_BITS | 对 values[bpos] 的指定 bit 清 0 |
+//      |------|-------------------------|---------------------------------|
+//
+//  注意：一次分配最多操作 64 个连续 block/unit（因为 redo entry 只能原子写一个 uint64_t）。
 static void
 run_prep_operation_hdr(const struct memory_block *m, enum memblock_state op,
 	struct operation_context *ctx)
 {
+	//Yuanguo: 这里 size_idx 是指要分配/释放的 连续 block/unit 个数；
+	//         一次分配最多操作 RUN_BITS_PER_VALUE(值64) 个连续 block/unit（因为 redo entry 只能原子写一个 uint64_t）。
 	ASSERT(m->size_idx <= RUN_BITS_PER_VALUE);
 	ASSERT(m->size_idx > 0);
 
@@ -758,18 +948,33 @@ run_prep_operation_hdr(const struct memory_block *m, enum memblock_state op,
 	uint64_t bmask;
 
 #ifdef	WAL_SUPPORTS_AND_OR_OPS
+	//Yuanguo: BMEM 中，未 define WAL_SUPPORTS_AND_OR_OPS，下面注释只是表达函数的作用；#else 分支作用同此；
 	if (m->size_idx == RUN_BITS_PER_VALUE) {
 		ASSERTeq(m->block_off % RUN_BITS_PER_VALUE, 0);
+		//Yuanguo: 假如本次操作(分配/释放)64个连续block/unit，则需要翻转整个 values[pos]，64bit
 		bmask = UINT64_MAX;
 	} else {
+		//Yuanguo: 假如本次操作(分配/释放) 从 block_off=130 开始的 3 个连续block/unit (即block/unit 130, 131, 132)，即size_idx=3
+		//    (1 << 3  - 1ULL)     -->   0000 ... 0000 0000 0000 0111
+		//    左移2位(130%64=2)    -->   0000 ... 0000 0000 0001 1100
 		bmask = ((1ULL << m->size_idx) - 1ULL) <<
 				(m->block_off % RUN_BITS_PER_VALUE);
 	}
 #else
+	//Yuanguo: BMEM 中，实际是此分支：
 	uint16_t num = m->size_idx;
 	uint32_t pos = m->block_off % RUN_BITS_PER_VALUE;
 
 	ASSERT_rt(num > 0 && num <= RUN_BITS_PER_VALUE);
+	//Yuanguo: bmask （编码 pos 和 num）
+	//     63                   22  21       16  15            0
+	//     ┌───────────────────────┬───────────┬────────────────┐
+	//     │       unused (0)      │  pos (6b) │   num (16b)    │
+	//     └───────────────────────┴───────────┴────────────────┘
+	//
+	// 例如， pos = 2, num = 3
+	// bmask 相当于一个指令的参数：在一个 64B 持久内存单元上，从第 2 位开始修改 3 个位；
+	//     修改动作 = ULOG_OPERATION_SET_BITS / ULOG_OPERATION_CLR_BITS
 	bmask = ULOG_ENTRY_TO_VAL(pos, num);
 #endif
 
@@ -777,25 +982,37 @@ run_prep_operation_hdr(const struct memory_block *m, enum memblock_state op,
 	 * The run bitmap is composed of several 8 byte values, so a proper
 	 * element of the bitmap array must be selected.
 	 */
+	//Yuanguo: bpos=2  -->  block/unit [130~132] 在 bitmap (values) 中，是values[2]
 	unsigned bpos = m->block_off / RUN_BITS_PER_VALUE;
 	struct run_bitmap b;
 
+	//Yuanguo: 拿到 持久数据通过 umem_cache 映射到的 RAM 地址。
+	//  这里，就是 bitmap 中，和 被分配/释放的 units 对应的那个 values[bpos] (uint64_t)
+	//  下面将生成一条 redo log 来修改它！
 	run_get_bitmap(m, &b);
 
 	/* the bit mask is applied immediately by the add entry operations */
 	if (op == MEMBLOCK_ALLOCATED) {
 #ifdef	WAL_SUPPORTS_AND_OR_OPS
+		//Yuanguo: BMEM 中，未 define WAL_SUPPORTS_AND_OR_OPS，下面注释只是表达函数的作用；#else 分支作用同此；
+		//        对应 64B 持久内存单元    <-    原值 || bmask (0000 ... 0000 0000 0001 1100)
 		operation_add_entry(ctx, &b.values[bpos],
 				    bmask, ULOG_OPERATION_OR);
 #else
+		//Yuanguo: BMEM 中，实际是此分支：
+		//        对应 64B 持久内存单元：执行指令 ULOG_OPERATION_SET_BITS(arg=bmask)
 		operation_add_entry(ctx, &b.values[bpos],
 				    bmask, ULOG_OPERATION_SET_BITS);
 #endif
 	} else if (op == MEMBLOCK_FREE) {
 #ifdef	WAL_SUPPORTS_AND_OR_OPS
+		//Yuanguo: BMEM 中，未 define WAL_SUPPORTS_AND_OR_OPS，下面注释只是表达函数的作用；#else 分支作用同此；
+		//        对应 64B 持久内存单元  <- 原值 && ~bmask (1111 ... 1111 1111 1110 0011)
 		operation_add_entry(ctx, &b.values[bpos],
 				    ~bmask, ULOG_OPERATION_AND);
 #else
+		//Yuanguo: BMEM 中，实际是此分支：
+		//        对应 64B 持久内存单元：执行指令 ULOG_OPERATION_CLR_BITS(arg=bmask)
 		operation_add_entry(ctx, &b.values[bpos],
 				    bmask, ULOG_OPERATION_CLR_BITS);
 #endif

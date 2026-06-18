@@ -40,7 +40,7 @@ static int daos_md_backend = DAOS_MD_PMEM;
 //Yuanguo: 通过transaction修改持久化内存(包括MD-on-SSD):
 //
 //       step-1   :  创建transaction;
-//       step-2   :  对要修改的ranges打snapshot，保存在transaction中，生成undo log;
+//       step-2   :  对要修改的ranges打snapshot，保存在undo log中;
 //       step-3   :  修改ranges;
 //       step-4.a :  commit: 生成redo log，并持久化；
 //       step-4.b :  abort;

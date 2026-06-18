@@ -38,11 +38,34 @@ struct dav_clogs {
 	 * Redo log for large operations/transactions.
 	 * Can be extended by the use of internal ulog.
 	 */
+	//Yuanguo:
+	//  - 事务执行过程中，有两类内存变更：
+	//      TypeA. user做的内存变更
+	//      TypeB. 非user直接修改的、需要延迟到commit时才执行的内部变化 (分配器bitmap、undo.gen_num等)
+	//  - 对于TypeB
+	//      - 工作阶段：先记在 struct tx 的 actions 中（延迟执行描述符）
+	//          例1: tx_alloc_common
+	//                  -> tx_action_add
+	//                  -> palloc_reserve
+	//          例2: dav_tx_add_common -> dav_tx_add_snapshot 事务第一次 snapshot 一个range 时 (first_snapshot==1)
+	//                  -> tx_action_add
+	//                  -> palloc_set_value（TYPE_MEM: 递增 undo.gen_num）
+	//
+	//      - commit阶段，不会整理到本字段 (external) 中，而是会整理到 struct dav_obj 的 external->pshadow_ops 中；
+	//          - tx_pre_commit：遍历 tx->ranges，把user做的内存变更直接写入 wt_redo (不经过 external)
+	//          - dav_tx_commit -> palloc_publish -> palloc_exec_actions: 处理内部元数据变更
+	//               - 对 struct tx 的 actions 的每条 action 生成一条 external entry，记录在 struct dav_obj 的 external->pshadow_ops 中
+	//               - operation_process -> operation_process_persistent_redo
+	//                   - 对本 struct dav_obj 的 external->pshadow_ops 中的每条entry:
+	//                       - tx_create_wal_entry: 转换成 redo log 记录到 wt_redo，至此和user修改内存一致！
+	//                       - ulog_process: apply 到内部元数据上（即修改元数据内存状态）；
+	//        Yuanguo: 最初我以为是此字段，最后发现不是，而是 struct dav_obj 的 external->pshadow_ops;
 	struct ULOG(LANE_REDO_EXTERNAL_SIZE) external;
 	/*
 	 * Undo log for snapshots done in a transaction.
 	 * Can be extended/shrunk by the use of internal ulog.
 	 */
+	//Yuanguo: 用于 abort 回滚的 undo entries;
 	struct ULOG(LANE_UNDO_SIZE) undo;
 };
 

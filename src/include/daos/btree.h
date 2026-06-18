@@ -57,11 +57,16 @@ struct btr_record {
 	 * - a complex data structure under this record, e.g. a sub-tree.
 	 */
     //Yuanguo:
-    //  - inner节点 ：指向child的指针(memory ID)；
-    //  - leaf节点  ：指向body的指针(memory ID)；
-    //      - 对于hashed key类型的btree : body是variable-length/large key and value (包含key和value，因为rec_hkey不是real key)
-    //      - 对于uint key类型的btree   : body是value (key不必存在body中，因为rec_ukey就是real key)
-    //      - 对于direct key类型的btree : body是key and value (包含key和value，因为rec_node不是real key)
+    //  - 1. inner节点 ：指向child的指针(memory ID)；
+    //  - 2. leaf节点  ：有3种情况，和key的类型(hashed key, uint key, direct key)无关：
+    //      2.a 纯value的地址
+    //      2.b 指向一个包含key-value 的结构
+    //      2.c 任意复杂结构，由上层逻辑解释
+    //
+    //  虽然 和key的类型(hashed key, uint key, direct key)无关，但有弱约束：
+    //      - hashed key ：槽位里只有 hash，所以 2.b 可能性很大，
+    //      - uint key   ：槽位里已有 rec_ukey，所以，可以是2.a, 2.c； 2.b也没问题（只是重复了一个key而已）
+    //      - direct key : 2.a, 2.b, 2.c 都可以；
 	umem_off_t		rec_off;
 	/**
 	 * Fix-size key can be stored in if it is small enough (DAOS_HKEY_MAX),

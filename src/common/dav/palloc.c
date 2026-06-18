@@ -266,6 +266,9 @@ out:
 /*
  * palloc_heap_action_exec -- executes a single heap action (alloc, free)
  */
+//Yuanguo: ctx 参数是 struct dav_obj 的 external，即 redo log context;
+//    struct dav_obj 的 undo (即 redo log context) 并不会调用此函数 
+//Yuanguo: 本函数本身不翻转 bitmap，它只是把翻转动作注册到 operation 日志里。
 static void
 palloc_heap_action_exec(struct palloc_heap *heap,
 	const struct dav_action_internal *act,
@@ -284,6 +287,18 @@ palloc_heap_action_exec(struct palloc_heap *heap,
 	 * value - either modification of few bits in a bitmap or
 	 * changing a chunk type from free to used or vice versa.
 	 */
+	//Yuanguo:
+	//       - 对于 run 类型内存块 → prep_hdr = run_prep_operation_hdr
+	//               bmask = 算出要翻转的 bit mask
+	//                 - 分配 → operation_add_entry(ctx, &bitmap[bpos], bmask, SET_BITS)
+	//                 - 释放 → operation_add_entry(ctx, &bitmap[bpos], bmask, CLR_BITS)
+	//       - 对于 huge 类型内存块 → prep_hdr = huge_prep_operation_hdr
+	//                 - huge chunk 的 type 切换（FREE↔USED）
+	//
+	//   就是说：无论是 huge chunk 的 type 切换（FREE↔USED），还是 run bitmap 中若干 bit 的翻转，最终都归结为对一个
+	//   8 字节单元的修改——这是 redo log 项天然支持的最小单位。
+	//
+	//   注意：现在没有修改! 只是把 "我要改哪个地址、改成什么值" 记到 struct dav_obj external->pshadow_ops 的 redo log 里!
 	act->m.m_ops->prep_hdr(&act->m, act->new_state, ctx);
 }
 
@@ -506,6 +521,8 @@ palloc_action_compare(const void *lhs, const void *rhs)
 /*
  * palloc_exec_actions -- perform the provided free/alloc operations
  */
+//Yuanguo: ctx 参数是 struct dav_obj 的 external，即 redo log context;
+//    struct dav_obj 的 undo (即 redo log context) 并不会调用此函数
 static void
 palloc_exec_actions(struct palloc_heap *heap,
 	struct operation_context *ctx,
@@ -683,6 +700,8 @@ palloc_cancel(struct palloc_heap *heap, struct dav_action *actv, size_t actvcnt)
 /*
  * palloc_publish -- publishes all reservations in the array
  */
+//Yuanguo: ctx 参数是 struct dav_obj 的 external，即 redo log context;
+//    struct dav_obj 的 undo (即 redo log context) 并不会调用此函数
 void
 palloc_publish(struct palloc_heap *heap, struct dav_action *actv, size_t actvcnt,
 	       struct operation_context *ctx)
@@ -725,6 +744,8 @@ palloc_publish(struct palloc_heap *heap, struct dav_action *actv, size_t actvcnt
  * Reallocation is a combination of the above, with one additional step
  * of copying the old content.
  */
+//Yuanguo: ctx 参数是 struct dav_obj 的 external，即 redo log context;
+//    struct dav_obj 的 undo (即 redo log context) 并不会调用此函数
 int
 palloc_operation(struct palloc_heap *heap, uint64_t off, uint64_t *dest_off, size_t size,
 		 palloc_constr constructor, void *arg, uint64_t extra_field, uint16_t object_flags,

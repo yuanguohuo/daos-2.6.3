@@ -250,12 +250,26 @@ ulog_checksum(struct ulog *ulog, size_t ulog_base_bytes, int insert)
  * This function requires at least a cacheline of space to be available in the
  * ulog.
  */
+//Yuanguo:
+//
+//  - 本函数 在给定位置 (ulog->data + offset) 处，构造一个redo log entry，代表的动作是：修改 dest 处的持久内存
+//  - 修改方式取决于参数 type，对于 BMEM 来说，有 3 种可能:
+//      - ULOG_OPERATION_SET      : 持久内存单元(64B *dest) 的值 <- value；即 *dest = value;
+//      - ULOG_OPERATION_SET_BITS : 持久内存单元(64B *dest) 执行 from bit `pos` set `num` bits  (`pos` 和 `num` 编码在 value 中)
+//      - ULOG_OPERATION_CLR_BITS : 持久内存单元(64B *dest) 执行 from bit `pos` clr `num` bits  (`pos` 和 `num` 编码在 value 中)
+//  - p_ops 参数是 struct dav_obj 的 external 的 s_ops 或者 t_ops，可以通过其 base 来判断；
+//      - s_ops->base 为非NULL ：生成的redo log entry 是 LOG_PERSISTENT，此 log entry 可以用于apply RAM，也要持久化；
+//      - t_ops->base 为 NULL  ：生成的redo log entry 是 LOG_TRANSIENT，此 log entry 可以用于apply RAM，但不持久化；
 struct ulog_entry_val *
 ulog_entry_val_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 		      uint64_t value, ulog_operation_type type, const struct mo_ops *p_ops)
 {
 	struct ulog_entry_val *e =
 		(struct ulog_entry_val *)(ulog->data + offset);
+
+	//Yuanguo: 我们只需要填充 data.v；
+	//  但为了安全，把 data.v 后面的一个 sizeof(struct ulog_entry_base) 全部填上0；
+	//  因为：与分配的空间可能是脏的，清理出一个 sizeof(struct ulog_entry_base) 空间，表示 ulog 链表结束；
 
 	struct {
 		struct ulog_entry_val v;
@@ -268,10 +282,23 @@ ulog_entry_val_create(struct ulog *ulog, size_t offset, uint64_t *dest,
 	 * resides in the log is erased. This will prevent leftovers from
 	 * a previous, clobbered, log from being incorrectly applied.
 	 */
+	//Yuanguo: 如上注释
 	data.zeroes.offset = 0;
+
+	//Yuanguo: 真正需要填的内存
+	//  LOG_PERSISTENT(p_ops->base 非NULL) : v.base.offset = (dest - struct dav_obj 的 do_base)  
+	//                                      (do_base是do_path文件通过mmap映射到内存返回的地址，对应do_path文件的起始位置)；
+	//  LOG_TRANSIENT (p_ops->base NULL)   : v.base.offset = dest, 即 RAM 中的、被修改内存的地址；
+	//p_ops(t_ops / s_ops) 中的函数，应该能区分这 2 种不同的地址；
 	data.v.base.offset = p_ops->base ? (uint64_t)(dest) -
 		(uint64_t)((dav_obj_t *)p_ops->base)->do_base :
 		(uint64_t)dest;
+
+	//Yuanguo:
+	//    - ULOG_OPERATION_SET      : 二进制 000 + 61个0   持久内存单元(64B *dest) 的值 <- value；即 *dest = value;
+	//    - ULOG_OPERATION_SET_BITS : 二进制 010 + 61个0   持久内存单元(64B *dest) 执行 from bit `pos` set `num` bits  (`pos` 和 `num` 编码在 value 中)
+	//    - ULOG_OPERATION_CLR_BITS : 二进制 001 + 61个0   持久内存单元(64B *dest) 执行 from bit `pos` clr `num` bits  (`pos` 和 `num` 编码在 value 中)
+	// 所以，这里复用 offset，用最高 3 bit 存储 “操作类型”；地址用不到最高 3 bit；
 	data.v.base.offset |= ULOG_OPERATION(type);
 	data.v.value = value;
 

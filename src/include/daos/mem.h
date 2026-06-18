@@ -131,6 +131,7 @@ struct umem_store_ops {
 /** The offset of an object from the base address of the pool */
 typedef uint64_t umem_off_t;
 
+//Yuanguo: 只对 BMEM/ADMEM 有意义
 struct umem_store {
     //Yuanguo: MD-on-SSD场景下
     //    path = "/mnt/daos0/NEWBORNS/c090c2fc-8d83-45de-babe-104bad165593/vos-0"  (on tmpfs)
@@ -272,6 +273,7 @@ enum umem_pobj_tx_stage {
 
 typedef enum {
 	/** volatile memory */
+  //Yuanguo: 用于测试，非生产可用。
 	UMEM_CLASS_VMEM,
 	/** persistent memory */
 	UMEM_CLASS_PMEM,
@@ -280,6 +282,7 @@ typedef enum {
 	/** blob backed memory */
 	UMEM_CLASS_BMEM,
 	/** ad-hoc memory */
+  //Yuanguo: ADMEM 和 BMEM 类似，也是使用 WAL 持久化。实验性，非生产可用。
 	UMEM_CLASS_ADMEM,
 	/** unknown */
 	UMEM_CLASS_UNKNOWN,
@@ -345,6 +348,28 @@ typedef struct {
 	 * \param flags	   [IN]	flags like zeroing, noflush (for PMDK)
 	 * \param type_num [IN]	struct type (for PMDK)
 	 */
+	//Yuanguo:
+	// (BMEM) mo_tx_alloc 和 mo_reserve: 两者其实都没有真正分配内存（没有反转bitmap），只是预留了内存，并返回offset（用户可以修改那块内存）
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    |                  | mo_tx_alloc                            | mo_reserve                                     |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | 调用场景         | 必须在 tx_begin ... tx_commit 之间     | 不要求在事务内                                 |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | action 维护      | tx->actions                            | 调用者提供 action                              |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | ranges 维护      | tx->ranges，但不生成undo log，abort不必| 无，纳入事务时处理？                           |
+	//    |                  | 回滚到原始状态(新预留内存)             |                                                |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | 何时真正分配     | commit 时事务框架统一调 palloc_publish | 调用者在后续的某个事务中，显式调用             |
+	//    |                  | 翻转 bitmap                            | mo_tx_publish 来"领养"这些 action              |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | 如何cancel预留   | abort 时由事务框架统一 cancel 这些     | 显示调用 mo_cancel                             |
+	//    |                  | action                                 |                                                |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | 设计意图         | 事务内使用内存                         | 先在事务外预留空间并填数据，然后在一个事务中一 |
+	//    |                  |                                        | 次性把所有预留"纳入"事务保护。                 |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	// 关于内存的预留/分配，见 struct tx 和 struct dav_clogs 中的注释。
 	umem_off_t	 (*mo_tx_alloc)(struct umem_instance *umm, size_t size,
 					uint64_t flags, unsigned int type_num);
 	/**
@@ -356,6 +381,11 @@ typedef struct {
 	 *			transaction.
 	 * \param size	[IN]	size of \a umoff tracked by the transaction.
 	 */
+	//Yuanguo:
+	//  (BMEM) 和新分配内存不同，当事务要修改一块旧内存时，需要额外工作：
+	//    - 添加到 tx->ranges（同新分配内存）
+	//    - 记录undo log；若tx abort，必须使用 undo log 把内存恢复到原来的状态；见 dav_tx_add_common 的注释！
+	// “修改”一块内存前，就需要调用本函数来完成上述两件事。
 	int		 (*mo_tx_add)(struct umem_instance *umm,
 				      umem_off_t umoff, uint64_t offset,
 				      size_t size);
@@ -371,6 +401,8 @@ typedef struct {
 	 * \param size	[IN]	size of \a umoff tracked by the transaction.
 	 * \param flags [IN]	PMDK flags
 	 */
+	//Yuanguo:
+	// (BMEM) 同 mo_tx_add，但若 flags 包含 DAV_XADD_NO_SNAPSHOT 位，则不生成 undo log (不需要回滚)
 	int		 (*mo_tx_xadd)(struct umem_instance *umm,
 				       umem_off_t umoff, uint64_t offset,
 				       size_t size, uint64_t flags);
@@ -384,14 +416,155 @@ typedef struct {
 	//Yuanguo:
 	//  for pmem: pmem_tx_add_ptr
 	//  for bmem: bmem_tx_add_ptr
+	//Yuanguo:
+	// (BMEM) 同 mo_tx_add，只是参数形式不同；
 	int		 (*mo_tx_add_ptr)(struct umem_instance *umm,
 					  void *ptr, size_t size);
 	/** abort memory transaction */
 	int		 (*mo_tx_abort)(struct umem_instance *umm, int error);
 	/** start memory transaction */
+	//Yuanguo: 初始化事务
+	//   - 预留 cache page
+	//   - 分配 WAL ID
+	//   - 分配 umem_wal_tx(管理redo logs)
+	//   - 初始化 clogs (管理undo logs；管理 external log；见 struct dav_clogs 中的注释)
+	//   - 初始化 tx->actions
+	//   - 初始化 tx->ranges
+	//   - tx->stage = DAV_TX_STAGE_WORK  进入工作阶段
 	int		 (*mo_tx_begin)(struct umem_instance *umm,
 					struct umem_tx_stage_data *txd);
+
+	//Yuanguo: (BMEM) 内存操作
+	//
+	//  |-------------------|-------------------------|------------------------------|------------------------------|------------------------------------|
+	//  | 修改对象          | 触发 API                | 何时可见                     | 持久化方式                   | 涉及结构                           |
+	//  |-------------------|-------------------------|------------------------------|------------------------------|------------------------------------|
+	//  | 用户数据修改      | dav_tx_add_range + 直接 | 立即可见（普通 C 写入 RAM）  | 先把原值写入 UNDO log；      | pop->undo → operation_add_buffer → |
+	//  |                   | *ptr = ...              |                              | commit 丢弃；abort 时回滚；  | ULOG_OPERATION_BUF_CPY(undo log)   |
+	//  |-------------------|-------------------------|------------------------------|------------------------------|------------------------------------|
+	//  | 用户分配/释放内存 | dav_tx_alloc /          | commit 时生效（在用户视角：  | REDO 路径：tx actions 暂存 → | tx->actions[] → palloc_publish →   |
+	//  |                   | dav_tx_free             | 返回的 offset 立即可用，但分 | commit 时生成 redo entry →   | external (pshadow_ops) →           |
+	//  |                   |                         | 配器元数据 commit 后才落定） | 写 WAL → apply               | 操作 chunk_header / bitmap         |
+	//  |-------------------|-------------------------|------------------------------|------------------------------|------------------------------------|
+	//  | 分配器内部元数据  | 由分配器内部触发        | commit 时生效                | REDO 写 WAL → apply 到 RAM   | 同上：与"用户分配"是同一条路径     |
+	//  |（chunk_header /   |（无独立 API）           |（apply pshadow_ops）         |                              |       本质就是它的内部步骤         |
+	//  |  bitmap）         |                         |                              |                              |                                    |
+	//  |-------------------|-------------------------|------------------------------|------------------------------|------------------------------------|
+	//  | root 指针 / size  | dav_root / 内部         | 同上                         | 同上                         | 同上                               |
+	//  | 等小标量          | operation_add_entry     |                              |                              |                                    |
+	//  |-------------------|-------------------------|------------------------------|------------------------------|------------------------------------|
+	//
+	//Yuanguo:
+	//  A. 用户数据修改
+	//     修改时：
+	//         - 把被修改前的状态保存到 undo log (struct dav_obj::undo->ulog 指向的 struct dav_obj::clogs.undo)；
+	//         - 把修改区间记录到 tx->ranges；
+	//         - 不产生用户修改类 action，但首次 snapshot 会产生一个内部 gen_num++ action，用于 UNDO 失效机制；
+	//           这个action的处理，同下面 "用户分配/释放内存"
+	//     commit时：
+	//         - 根据 tx->ranges 以及内存状态（被修改后的），生成 redo/wal log 累积到 struct dav_tx wt_redo
+	//         - 丢弃undo log；
+	//         - redo/wal log (struct dav_tx wt_redo) 持久化到 nvme wal blob
+	//     rollback时：
+	//         - 使用undo log 恢复到修改前的状态；
+	//  B. 用户分配/释放内存（以分配为例）
+	//     分配时：
+	//         - 把分配的内存区间记录到 tx->ranges；
+	//         - 把分配动作(action) 记录到 tx->actions 中，不立即 apply（不立即可见）；
+	//         - 返回地址，用户可以立即开始写入数据；
+	//         - 不产生undo log；
+	//     commit时：
+	//         - 根据 tx->ranges 以及内存状态（用户新写的数据），生成 redo/wal log 累积到 struct dav_tx wt_redo
+	//         - tx->actions 中的 action(huge模式修改chunk_header；run模式修改bitmap中的bits)，转换成redo log记录到
+	//           struct dav_obj::external->pshadow_ops/transient_ops 中；
+	//         - pshadow_ops 中的 redo log，进一步转成 redo/wal log 累积到 struct dav_tx wt_redo；
+	//           transient_ops：不用持久化；它对内存的修改，可以通过重构heap完成
+	//         - apply pshadow_ops 和 transient_ops, 实际修改 chunk_header (huge模式) 或 bitmap (run模式)，使分配可见；
+	//         - redo/wal log (struct dav_tx wt_redo) 持久化到 nvme wal blob
+	//     rollback时:
+	//         - 丢弃tx->actions，不apply：用户得到的内存以及写入的数据，自动无效，因为内存分配动作(修改 chunk_header/bitmap)没有执行；
+	//  C. 分配器内部元数据(chunk_header/bitmap):
+	//     修改时：如上
+	//     commit时：如上
+	//     rollback时：如上
+	//  D. root 指针/size等小标量:
+	//     修改时：如上
+	//     commit时：如上
+	//     rollback时：如上
+
 	/** commit memory transaction */
+	//Yuanguo: (BMEM)
+	// dav_tx_commit()
+	//   ├── 1. obj_tx_callback(tx)            // WORK 阶段回调
+	//   │
+	//   ├── 2. tx_pre_commit(tx)              // 刷 WAL redo（数据修改）
+	//   │       └── ravl_delete_cb(tx->ranges, tx_flush_range)
+	//   │           ├── 遍历 ranges 树，对每个 range 调用:
+	//   │           │        mo_wal_flush(pop, ptr, size)  // 将用户修改的数据写入 WAL redo，并链到 struct dav_tx wt_redo 链表尾；
+	//   │           └── free tx->ranges
+	//   │
+	//   ├── 3. mo_wal_drain(&pop->p_ops)      // 等待之前的 WAL 写入完成
+	//   │
+	//   ├── 4. operation_start(pop->external) // 开启新的 operation 上下文；下面 palloc_publish 将把 tx->actions 中的"actions" 转换成 
+	//   │                                     // redo log，记录到 pop->external->pshadow_ops 中；这些 "actions" 代表内部元数据(bitmap等)
+	//   │                                     // 的修改；
+	//   │
+	//   ├── 5. palloc_publish(heap, tx->actions, cnt, ctx=pop->external)
+	//   │       └─ palloc_exec_actions(heap, ctx, actv, actvcnt)
+	//   │           ├── a. qsort(actv) — 按 lock 地址排序，确保加锁顺序一致
+	//   │           ├── b. 逐个 action 加锁 + exec:
+	//   │           │      action_funcs[act->type].exec(heap, act, ctx)
+	//   │           │       └── palloc_heap_action_exec():  <-- 对于分配内存的action
+	//   │           │           act->m.m_ops->prep_hdr(&act->m, act->new_state, ctx)
+	//   │           │           生成 bitmap 修改的 redo entry（SET_BITS/CLR_BITS），写到pop->external->pshadow_ops.ulog
+	//   │           │           此时还没有真正修改 bitmap
+	//   │           │
+	//   │           │       └── palloc_mem_action_exec(): <-- 对于修改内存的 action (非用户修改，分配器内部状态维护)
+	//   │           │                                         act->type 为 DAV_ACTION_TYPE_MEM, 生成的 ulog (注意是redo log) 为 ULOG_OPERATION_SET 类型（设置一个持久内存单元64B）
+	//   │           │                                         例如： dav_tx_add_snapshot 过程中（维护 undo log），当 tx->first_snapshot 成立时，会产生 DAV_ACTION_TYPE_MEM 类action;
+	//   │           │                                                即维护 undo log 时，生成了一个 redo log;
+	//   │           │
+	//   │           ├── c. mo_wal_drain() — 等待 object header 持久化
+	//   │           │
+	//   │           ├── d. operation_process(ctx=pop->external) — 执行所有持久化修改
+	//   │           │      ├── 单条优化路径：如果只有1条 redo entry
+	//   │           │      │   └── tx_create_wal_entry() + ulog_entry_apply()
+	//   │           │      │       // 直接写 WAL + 原地修改 bitmap
+	//   │           │      └── 多条路径：
+	//   │           │          └── operation_process_persistent_redo(ctx=pop->external)
+	//   │           │              ├── ulog_foreach_entry → tx_create_wal_entry()  遍历 ctx->pshadow_ops.ulog（只包含 LOG_PERSISTENT entry），对每个 entry:
+	//   │           │              │                                               调用 tx_create_wal_entry 转换成 WAL 动作，追加到 struct dav_tx 的 wt_redo 链表尾!
+	//   │           │              │                                               此时仅在 DRAM 中累积，尚未持久化! 持久化见下面 dav_tx_end!
+	//   │           │              ├── ulog_process() → ulog_foreach_entry → ulog_process_entry：原地 apply 所有修改！
+	//   │           │              │                                               真正翻转 bitmap（alloc→used, free→free）
+	//   │           │              │                                               分配内存的bitmap修改，内部状态设置，等，现在“可见”！
+	//   │           │              └── ulog_clobber() — 清理临时 redo log
+	//   │           │
+	//   │           ├── e. 逐个 action: on_process() — 更新运行时状态（持锁）
+	//   │           ├── f. 逐个 action: 解锁
+	//   │           ├── g. 逐个 action: on_unlock() — 释放运行时资源（无锁）
+	//   │           └── h. operation_finish(ctx=pop->external) — 清理 redo log
+	//   │
+	//   ├── 6. tx_post_commit(tx=pop->undo)
+	//   │       └── operation_finish(pop->undo) — 清理 undo log
+	//   │               // 与 operation_finish 对应的 operation_start(pop->undo) 在 dav_tx_begin 中就被调用了
+	//   │               // 因为 pop->undo 是用于存储 undo log；而 undo log 在 user 修改内存(dav_tx_add_common → dav_tx_add_snapshot) 时产生；
+	//   │               // 另外，operation_process 不会对 pop->undo 调用(1. 我检查了代码； 2. operation_process 内有断言)；
+	//   │
+	//   ├── 7. dav_release_clogs(pop)         // 释放 commit log 资源
+	//   │
+	//   └── 8. tx->stage = ONCOMMIT → obj_tx_callback(tx) // ONCOMMIT 回调
+	//
+	// 然后调用方调用 dav_tx_end():
+	//   dav_tx_end(data)
+	//   ├── 清理 tx_entries 链表
+	//   ├── VEC_DELETE(&tx->actions)
+	//   └── lw_tx_end(pop, data)
+	//       ├── stats_persist()               // 持久化统计数据
+	//       └── dav_wal_tx_commit(pop, utx, data)
+	//           └── dav_wal_tx_submit(hdl, utx, data)
+	//               └── store->stor_ops->so_wal_submit(store, utx, data)
+	//                   // 将所有 WAL redo actions 提交给底层存储
 	int		 (*mo_tx_commit)(struct umem_instance *umm, void *data);
 
 #ifdef DAOS_PMEM_BUILD
@@ -406,6 +579,28 @@ typedef struct {
 	 * \param size	[IN]		size to be reserved.
 	 * \param type_num [IN]		struct type (for PMDK)
 	 */
+	//Yuanguo:
+	// (BMEM) mo_tx_alloc 和 mo_reserve: 两者其实都没有真正分配内存（没有反转bitmap），只是预留了内存，并返回offset（用户可以修改那块内存）
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    |                  | mo_tx_alloc                            | mo_reserve                                     |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | 调用场景         | 必须在 tx_begin ... tx_commit 之间     | 不要求在事务内                                 |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | action 维护      | tx->actions                            | 调用者提供 action                              |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | ranges 维护      | tx->ranges，但不生成undo log，abort不必| 无，纳入事务时处理？                           |
+	//    |                  | 回滚到原始状态(新预留内存)             |                                                |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | 何时真正分配     | commit 时事务框架统一调 palloc_publish | 调用者在后续的某个事务中，显式调用             |
+	//    |                  | 翻转 bitmap                            | mo_tx_publish 来"领养"这些 action              |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | 如何cancel预留   | abort 时由事务框架统一 cancel 这些     | 显示调用 mo_cancel                             |
+	//    |                  | action                                 |                                                |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	//    | 设计意图         | 事务内使用内存                         | 先在事务外预留空间并填数据，然后在一个事务中一 |
+	//    |                  |                                        | 次性把所有预留"纳入"事务保护。                 |
+	//    |------------------|----------------------------------------|------------------------------------------------|
+	// 关于内存的预留/分配，见 struct tx 和 struct dav_clogs 中的注释。
 	umem_off_t	 (*mo_reserve)(struct umem_instance *umm, void *act, size_t size,
 				       unsigned int type_num);
 
@@ -435,6 +630,7 @@ typedef struct {
 	 * \param actv	[IN]	action array to be published.
 	 * \param actv_cnt [IN]	size of action array.
 	 */
+	// Yuanguo: 将预留操作从"私有/暂态"状态变为"事务可见/即将持久化"状态；见 mo_tx_alloc / mo_reserve
 	int		 (*mo_tx_publish)(struct umem_instance *umm, void *act, int actv_cnt);
 
 	/**

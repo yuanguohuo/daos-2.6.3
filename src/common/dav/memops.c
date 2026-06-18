@@ -57,6 +57,7 @@ struct operation_context {
 	ulog_free_fn ulog_free; /* function to free next ulogs */
 
 	const struct mo_ops *p_ops;
+	//Yuanguo: 见下面 pshadow_ops / transient_ops 的注释；
 	struct mo_ops t_ops; /* used for transient data processing */
 	struct mo_ops s_ops; /* used for shadow copy data processing */
 
@@ -75,6 +76,30 @@ struct operation_context {
 
 	enum operation_state state; /* operation sanity check */
 
+	//Yuanguo:
+	//  LOG_TRANSIENT 和 LOG_PERSISTENT
+	//    - 在内存修改可见性方面是类似：
+	//        1. 内存事务执行时：内存修改动作记录在 struct tx 的 actions 中；此时未真的修改内存，故不可见；
+	//        2. 内存事务commit时：生成一个 redo log，LOG_TRANSIENT log 记录在 transient_ops 中；LOG_PERSISTENT 记录在 pshadow_ops 中；
+	//           然后执行它，实际修改内存，使修改可见；
+	//    - 但 LOG_TRANSIENT 的 redo log 不持久化在wal blob (nvme blob)中；
+	//
+	// |------------|---------------------------------------|--------------------------------------|
+	// |            | LOG_PERSISTENT                        |   LOG_TRANSIENT                      |
+	// |------------|---------------------------------------|--------------------------------------|
+	// |  写到哪    | ctx->pshadow_ops（DRAM 影子 redo log）| ctx->transient_ops（DRAM 临时 log）  |
+	// |------------|---------------------------------------|--------------------------------------|
+	// |  commit 时 |  → WAL entry → 持久化 → apply         | → 仅 apply 到 RAM（不入 WAL）        |
+	// |------------|---------------------------------------|--------------------------------------|
+	// |  崩溃后    | WAL 回放时能恢复                      | 丢失，需要 heap boot 重建            |
+	// |------------|---------------------------------------|--------------------------------------|
+	// |  操作函数  | ctx->s_ops（有 umem_store）           | ctx->t_ops（base=NULL，纯内存）      |
+	// |------------|---------------------------------------|--------------------------------------|
+	//
+	// LOG_TRANSIENT 例子：
+	//    - huge_prep_operation_hdr 中，huge block 的分配，需要修改 HEADER 和 FOOTER；
+	//    - 但对 FOOTER 的修改，不用持久化（不用存在 wal blob 中），因为对HEADER的修改 log 持久化了，replay 它时，可以恢复 FOOTER；
+	//    - 换句话说，FOOTER 的修改 log 是冗余的；但在 DAOS 2.8 的 BMEM v2 中，FOOTER 的修改日志，也持久化了。。。
 	struct operation_log pshadow_ops; /* used by context for redo ops */
 	struct operation_log transient_ops; /* log of transient changes */
 
@@ -270,6 +295,13 @@ operation_free_logs(struct operation_context *ctx)
 /*
  * operation_merge -- (internal) performs operation on a field
  */
+//Yuanguo: 对于位操作：
+//   - log entry e，               修改   ........1111........
+//   - 当前操作(与e的type相同)，   修改   ...........111......  连接无gap
+//                                   或   .....11111..........  连接无gap
+//                                   或   .........11.........  连接无gap，被e包围
+//                                   或   ......111111111.....  连接无gap，包围e
+//  则可以把当前操作合并到 e (已经存在的entry)
 static inline int
 operation_merge(struct ulog_entry_base *entry, uint64_t value,
 	ulog_operation_type type)
@@ -346,6 +378,10 @@ operation_try_merge_entry(struct operation_context *ctx,
  * operation_merge_entry_add -- adds a new entry to the merge collection,
  *	keeps capacity at OP_MERGE_SEARCH. Removes old entries in FIFO fashion.
  */
+//Yuanguo:
+//  注意：ctx->merge_entries 是一个 FIFO cache，会淘汰最旧的，只保留 64 条 entry
+//  若 “本来可以合并的entry 被淘汰”，则错失合并机会。
+//  但错过合并，并不影响正确性，合并只是一个优化！
 static void
 operation_merge_entry_add(struct operation_context *ctx,
 	struct ulog_entry_val *entry)
@@ -364,6 +400,18 @@ operation_merge_entry_add(struct operation_context *ctx,
  *	same ptr address already exists and the operation type is set,
  *	the new value is not added and the function has no effect.
  */
+//Yuanguo:
+//  LOG_TRANSIENT 和 LOG_PERSISTENT
+//    - 在内存修改可见性方面是类似：
+//        1. 内存事务执行时：内存修改动作记录在 struct tx 的 actions 中；此时未真的修改内存，故不可见；
+//        2. 内存事务commit时：生成一个 redo log，LOG_TRANSIENT log 记录在 operation_context 的 transient_ops 中；LOG_PERSISTENT 记录在 pshadow_ops 中；
+//           然后执行它，实际修改内存，使修改可见；
+//    - 但 LOG_TRANSIENT 的 redo log 不持久化；
+//
+// LOG_TRANSIENT 例子：
+//    - huge_prep_operation_hdr 中，huge block 的分配，需要修改 HEADER 和 FOOTER；
+//    - 但对 FOOTER 的修改，不用持久化（不用存在 wal blob 中），因为对HEADER的修改 log 持久化了，replay 它时，可以恢复 FOOTER；
+//    - 换句话说，FOOTER 的修改 log 是冗余的；但在 DAOS 2.8 的 BMEM v2 中，FOOTER 的修改日志，也持久化了。。。
 int
 operation_add_typed_entry(struct operation_context *ctx,
 	void *ptr, uint64_t value,
@@ -394,17 +442,31 @@ operation_add_typed_entry(struct operation_context *ctx,
 		VECQ_CLEAR(&ctx->merge_entries);
 	}
 
+	//Yuanguo: 对于persistent redo log，尝试合并优化；对于 transient redo log，不做优化！
+	//优化：寻找type相同(同为set或clear)的位操作 log entry e：
+	//   - log entry e，               修改   ........1111........
+	//   - 当前操作(与e的type相同)，   修改   ...........111......  连接无gap
+	//                                   或   .....11111..........  连接无gap
+	//                                   或   .........11.........  连接无gap，被e包围
+	//                                   或   ......111111111.....  连接无gap，包围e
+	//  则可以把当前操作合并到 e (已经存在的entry)
 	if (log_type == LOG_PERSISTENT &&
 		operation_try_merge_entry(ctx, ptr, value, type) != 0)
 		return 0;
 
+	//Yuanguo: 没能合并，在 (oplog->ulog + oplog->offset) 处，构造独立log
 	struct ulog_entry_val *entry = ulog_entry_val_create(
 		oplog->ulog, oplog->offset, ptr, value, type,
 		log_type == LOG_TRANSIENT ? &ctx->t_ops : &ctx->s_ops);
 
+	//Yuanguo: 维护 ctx->merge_entries，其作用见上面 operation_try_merge_entry；
+	//  注意：ctx->merge_entries 是一个 FIFO cache，会淘汰最旧的，只保留 64 条 entry
+	//        若 “本来可以合并的entry 被淘汰”，则错失合并机会。
+	//        但错过合并，并不影响正确性，合并只是一个优化！
 	if (log_type == LOG_PERSISTENT)
 		operation_merge_entry_add(ctx, entry);
 
+	//Yuanguo: oplog->ulog + oplog->offset 已经被新 ulog entry 占用，更新offset
 	oplog->offset += ulog_entry_size(&entry->base);
 
 	return 0;
@@ -415,6 +477,15 @@ operation_add_typed_entry(struct operation_context *ctx,
  * operation_add_value -- adds new entry to the current operation with
  *	entry type autodetected based on the memory location
  */
+//Yuanguo: 见 run_prep_operation_hdr 对本函数的调用
+//  ptr   : 被修改的 持久内存单元(64B) 对应的 RAM 地址；
+//  type  : 操作类型，对于 BMEM 来说，是：
+//            - ULOG_OPERATION_SET      : 持久内存单元(64B) 的值 <- value
+//            - ULOG_OPERATION_SET_BITS : 持久内存单元(64B) 执行 from bit `pos` set `num` bits  (`pos` 和 `num` 编码在 value 中)
+//            - ULOG_OPERATION_CLR_BITS : 持久内存单元(64B) 执行 from bit `pos` clr `num` bits  (`pos` 和 `num` 编码在 value 中)
+//          不会是：
+//            - ULOG_OPERATION_BUF_SET  ← 通过 operation_add_buffer 提交,不走 add_entry
+//            - ULOG_OPERATION_BUF_CPY  ← UNDO log 用,通过 operation_add_buffer
 int
 operation_add_entry(struct operation_context *ctx, void *ptr, uint64_t value,
 	ulog_operation_type type)
@@ -422,6 +493,8 @@ operation_add_entry(struct operation_context *ctx, void *ptr, uint64_t value,
 	const struct mo_ops *p_ops = ctx->p_ops;
 	dav_obj_t *pop = (dav_obj_t *)p_ops->base;
 
+	//Yuanguo: 在 DAOS 的 BMEM 实际使用中，from_pool 始终为 true，transient_ops 路径实际上不会被触发。
+	//   它是从 libpmemobj 继承的遗留逻辑
 	int from_pool = OBJ_PTR_IS_VALID(pop, ptr);
 
 	return operation_add_typed_entry(ctx, ptr, value, type,
@@ -431,6 +504,23 @@ operation_add_entry(struct operation_context *ctx, void *ptr, uint64_t value,
 /*
  * operation_add_buffer -- adds a buffer operation to the log
  */
+//Yuanguo: 对于 BMEM，唯一调用来自 dav_tx_add_snapshot：生成 undo log
+//   - ctx  : struct dav_obj 的 undo 指针
+//   - dest : 用户要修改的持久内存地址（umem_cache 映射的 RAM 地址）。将来要回滚的话，就是恢复这块地址，即"回滚目的地"；
+//   - src  : snapshot/undo-log 中要保留的数据地址；
+//   - size : 要快照的字节数（任意长度）
+//   - type : ULOG_OPERATION_BUF_CPY
+//
+// 注意：其实 dest 和 src 相等，只是它们语义不同:
+//   src 是 生成undo-log时，源数据所在内存的地址；dest是“回滚”时，要恢复的目的内存的地址；
+//   |------|-------------------------------------------------|------------------|------------------------------------------------------|
+//   | 形参 | 时间点                                          | 语义角色         | 实际用途                                             |
+//   |------|-------------------------------------------------|------------------|------------------------------------------------------|
+//   | src  | T0：写 UNDO 时（operation_add_buffer 调用瞬间） | 数据源的当前位置 | 从这里 memcpy 出旧值，存入 ulog entry 的 data[] 字段 |
+//   |------|-------------------------------------------------|------------------|------------------------------------------------------|
+//   | dest | T1：回滚时   tx_abort -> tx_abort_set ->        | 回滚的目的位置   | 把 ulog entry 中保存的旧值 memcpy 回这里             |
+//   |      |  tx_undo_entry_apply -> tx_restore_range        |                  |                                                      |
+//   |------|-------------------------------------------------|------------------|------------------------------------------------------|
 int
 operation_add_buffer(struct operation_context *ctx,
 	void *dest, void *src, size_t size, ulog_operation_type type)
@@ -450,6 +540,10 @@ operation_add_buffer(struct operation_context *ctx,
 		ctx->ulog_curr_capacity = ctx->ulog_curr->capacity;
 	}
 
+	//Yuanguo: 假设上面 reserve 了足够的 ulog 空间
+	//    curr_size == real_size
+	//    entry_size < ctx->ulog_curr_capacity
+	//    一个 entry (size 为 entry_size，包含 ulog_entry_buf 和 data) 记录完整修改，不用拆成多个 entry
 	size_t curr_size = MIN(real_size, ctx->ulog_curr_capacity);
 	size_t data_size = curr_size - sizeof(struct ulog_entry_buf);
 	size_t entry_size = ALIGN_UP(curr_size, CACHELINE_SIZE);
@@ -467,8 +561,9 @@ operation_add_buffer(struct operation_context *ctx,
 		if (u != NULL)
 			next_entry = (struct ulog_entry_base *)u->data;
 	} else {
+		//Yuanguo: 假设上面 reserve 了足够的 ulog 空间，会走到此分支
 		size_t next_entry_offset = ctx->ulog_curr_offset + entry_size;
-
+		//Yuanguo: 当前 entry 之后的一个 entry，要把它置零；
 		next_entry = (struct ulog_entry_base *)(ctx->ulog_curr->data +
 			next_entry_offset);
 	}
@@ -476,6 +571,57 @@ operation_add_buffer(struct operation_context *ctx,
 		ulog_clobber_entry(next_entry);
 
 	/* create a persistent log entry */
+	//Yuanguo: 这个注释是错误的。
+	//  这是从 PMDK pmemobj 直接继承下来的代码。在 PMDK 时代：
+	//    - clogs 真的位于 persistent memory (PMEM) 上
+	//    - ulog_entry_buf_create 内部对每次 memcpy 调用 pmem_persist/pmem_flush + pmem_drain，确实持久化
+	//    - 所以"create a persistent log entry"这条注释当时是准确的
+	// 但BMEM中，undo log 只在 RAM 中，不持久化！crash 自动消失；
+
+	//Yuanguo: ctx 是 struct dav_obj 的 undo 指针
+	//
+	//                          head: ctx->ulog (链表头)
+	//                          ┌────────────────────────────────┐
+	//                          │  struct ulog header (64B)      │
+	//                          │  checksum / next / capacity /  │
+	//                          │  gen_num / flags / unused[]    │
+	//                          ├────────────────────────────────┤  data[0]
+	//                          │////////////////////////////////│
+	//                          │//// 已用 (上一条 entry 等) ////│
+	//                          │////////////////////////////////│
+	//                          ├────────────────────────────────┤
+	//                          │              ...               │
+	//                          └─────┬──────────────────────────┘
+	//                                │
+	//                                │ next 指针
+	//                                │
+	//                                ▼
+	//                          ┌────────────────────────────────┐ <─── ctx->ulog_curr
+	//                          │  struct ulog header (64B)      │
+	//                          ├────────────────────────────────┤ <─── ctx->ulog_curr->data[0]
+	//                          │////////////////////////////////│   ▲
+	//                          │////  used (本 page 已用) //////│   │ ctx->ulog_curr_offset
+	//                          │////////////////////////////////│   ▼
+	//                          ├────────────────────────────────┤ <─── 本次写入的 current entry
+	//                          │  ulog_entry_buf {              │
+	//                          │    base.offset|type  (8B)      │
+	//                          │    size              (8B)      │ entry_size (cacheline 对齐)
+	//                          │    checksum          (8B)      │
+	//                          │    data[data_size]             │
+	//                          │  }                             │
+	//                          ├────────────────────────────────┤ <─── next_entry, 前面 ulog_clobber_entry 清零这里
+	//                          │   (next entry 占位,header=0)   │
+	//                          ├────────────────────────────────┤
+	//                          │         free area              │
+	//                          │    (剩余 ulog_curr_capacity)   │
+	//                          └─────┬──────────────────────────┘ <─── ctx->ulog_curr->data[capacity]
+	//                                │
+	//                                │ next 指针 (容量耗尽时指向新 page)
+	//                                │
+	//                                ▼
+	//                          ┌────────────────────────────────┐
+	//                          │   下一个 ulog page (扩展)      │
+	//                          └────────────────────────────────┘
 	struct ulog_entry_buf *e = ulog_entry_buf_create(ctx->ulog_curr,
 		ctx->ulog_curr_offset,
 		ctx->ulog_curr_gen_num,
