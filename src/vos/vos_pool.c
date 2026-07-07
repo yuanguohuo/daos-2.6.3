@@ -1222,6 +1222,8 @@ static int pool_open(void *ph, struct vos_pool_df *pool_df,
 //         - scm_sz = 0     注意不是200G/18 (可以获取path文件的size)
 //         - nvme_sz = 3000G/18
 //         - wal_sz = 0
+//
+//Yuanguo: pool 创建时执行一次
 int
 vos_pool_create_ex(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_t nvme_sz,
 		   daos_size_t wal_sz, unsigned int flags, uint32_t version, daos_handle_t *poh)
@@ -1343,7 +1345,18 @@ vos_pool_create_ex(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_
 
 	//Yuanguo: step-3: 修改ranges;
 	memset(pool_df, 0, sizeof(*pool_df));
-	//Yuanguo: 创建container btree (container table)
+	//Yuanguo:
+	//  1. 创建container btree (container table)
+	//  2. 将 class ID (VOS_BTR_CONT_TABLE) 写入持久化的 pd_cont_root.tr_class 字段。
+	//
+	//  注意：
+	//    - 本函数只在 pool 创建时执行一次；
+	//    - 以后每次重启时，都会调用 pool_open，其中
+	//
+	//              rc = dbtree_open_inplace_ex(&pool_df->pd_cont_root, &pool->vp_uma,
+	//              			    DAOS_HDL_INVAL, pool, &pool->vp_cont_th);
+	//
+	//      会从持久化的 tr_class 读回这个 class ID 来打开树，所以 vp_cont_th (container btree) 的 class 是 VOS_BTR_CONT_TABLE
 	rc = dbtree_create_inplace(VOS_BTR_CONT_TABLE, 0, VOS_CONT_ORDER,
 				   &uma, &pool_df->pd_cont_root, &hdl);
 	if (rc != 0)
@@ -1463,6 +1476,8 @@ close:
 //         - uuid = "c090c2fc"
 //         - scm_sz = 0     注意不是200G/18 (可以获取path文件的size)
 //         - nvme_sz = 3000G/18
+//
+//Yuanguo: pool 创建时执行一次
 int
 vos_pool_create(const char *path, uuid_t uuid, daos_size_t scm_sz, daos_size_t nvme_sz,
 		unsigned int flags, uint32_t version, daos_handle_t *poh)
@@ -1620,6 +1635,7 @@ lock_pool_memory(struct vos_pool *pool)
  * If successful, this function consumes ph, and closes it upon any error.
  * So the caller shall not close ph in any case.
  */
+//Yuanguo: 每次重启时，调用本函数打开pool;
 static int
 pool_open(void *ph, struct vos_pool_df *pool_df, unsigned int flags, void *metrics,
 	  daos_handle_t *poh)

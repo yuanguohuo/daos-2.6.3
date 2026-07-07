@@ -458,6 +458,7 @@ struct migrate_pool_tls_create_arg {
 	d_rank_list_t *svc_list;
 	ATOMIC uint32_t *obj_ult_cnts;
 	ATOMIC uint32_t *dkey_ult_cnts;
+	//Yuanguo: max_eph 的作用，见 struct rebuild_global_pool_tracker 字段 rgt_stable_epoch 的注释；
 	uint64_t max_eph;
 	unsigned int version;
 	unsigned int generation;
@@ -574,6 +575,9 @@ out:
 	return rc;
 }
 
+//Yuanguo:
+//  - 参数
+//      max_eph: 见 struct rebuild_global_pool_tracker 字段 rgt_stable_epoch 的注释；
 static int
 migrate_pool_tls_lookup_create(struct ds_pool *pool, unsigned int version, unsigned int generation,
 			       uuid_t pool_hdl_uuid, uuid_t co_hdl_uuid, uint64_t max_eph,
@@ -3695,6 +3699,9 @@ migrate_try_obj_insert(struct migrate_pool_tls *tls, uuid_t co_uuid,
 	return rc;
 }
 
+//Yuanguo:
+//  - 参数
+//      max_eph: 见 struct rebuild_global_pool_tracker 字段 rgt_stable_epoch 的注释；
 int
 ds_migrate_object(struct ds_pool *pool, uuid_t po_hdl, uuid_t co_hdl, uuid_t co_uuid,
 		  uint32_t version, unsigned int generation, uint64_t max_eph, uint32_t opc,

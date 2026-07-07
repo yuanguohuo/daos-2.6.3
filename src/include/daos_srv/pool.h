@@ -161,6 +161,21 @@ enum pool_child_state {
  * caches per-pool information, such as the pool map version, so that DAOS
  * object I/Os do not need to access global, parent ds_pool objects.
  */
+//Yuanguo: 上面注释中，per-thread 就是 per-target 的意思；
+//  ds_pool_child 存储在每个 target main xstream 的 TLS (pool_tls->dt_pool_list) 中。由于：
+//      - 每个 target 的 main xstream 是一个独立的 pthread
+//      - 每个 target 的 main xstream 对应一个 VOS target（tgt_id）
+//      - ds_pool_child 挂在该 xstream 的 TLS 链表上
+//  所以：
+//      - per-thread = per-(target main) xstream = per-target
+//      - 同一个 pool 在同一个 engine 的 N 个 target 上有 N 个 ds_pool_child 实例，各自独立，各自有自己的 spc_hdl（VOS pool handle）
+//      - 原始注释中 "Per-thread pool object" 用的是 Argobots/pthread 的视角来命名，但实际语义就是 per-target。
+//
+//Yuanguo:
+//  ds_pool_child 是一个 pool 在单个 target 上的本地实例（即 pool 的一个 shard/replica），层级关系：
+//      ds_pool          ← pool 全局元数据（pool map、IV namespace 等）
+//      └── ds_pool_child    ← pool 在当前 target 上的 VOS 实例 (spc_hdl = VOS pool handle)
+//          └── ds_cont_child    ← container 在当前 target 上的 VOS 实例 (sc_hdl = VOS container handle)
 struct ds_pool_child {
 	d_list_t		spc_list;
 	daos_handle_t		spc_hdl;	/* vos_pool handle */

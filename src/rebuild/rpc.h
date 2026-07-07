@@ -43,6 +43,14 @@ enum rebuild_operation {
 
 extern struct crt_proto_format rebuild_proto_fmt;
 
+//Yuanguo: rsi_rebuild_ver 是 rebuild 的目标版本；
+//  rebuild 就是让所有 object 在这个版本的 pool map 下，都放置在正确位置上。
+//          struct rebuild_tgt_pool_tracker  的 rt_rebuild_ver
+//          struct rebuild_scan_in 的 rsi_rebuild_ver
+//          struct rebuild_global_pool_tracker 的 rgt_rebuild_ver
+//          struct rebuild_task 的 dst_map_ver
+//          ds_rebuild_schedule 函数的 uint32_t map_ver 参数
+//  都是这个语义
 #define DAOS_ISEQ_REBUILD_SCAN	/* input fields */		 \
 	((uuid_t)		(rsi_pool_uuid)		CRT_VAR) \
 	((uint64_t)		(rsi_leader_term)	CRT_VAR) \

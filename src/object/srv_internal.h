@@ -67,6 +67,7 @@ struct migrate_pool_tls {
 	int			mpt_status;
 
 	/* Max epoch for the migration, used for migrate fetch RPC */
+	//Yuanguo: mpt_max_eph 的作用，见 struct rebuild_global_pool_tracker 字段 rgt_stable_epoch 的注释；
 	uint64_t		mpt_max_eph;
 
 	/* The ULT number on each target xstream, which actually refer

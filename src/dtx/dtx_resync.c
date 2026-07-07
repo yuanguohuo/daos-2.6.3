@@ -777,6 +777,7 @@ out:
 	return rc;
 }
 
+//Yuanguo: 待研究
 void
 dtx_resync_ult(void *data)
 {

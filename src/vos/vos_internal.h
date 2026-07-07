@@ -282,6 +282,25 @@ struct vos_pool {
 	/** Features enabled for this pool */
 	uint64_t		vp_feats;
 	/** btr handle for the container table */
+	//Yuanguo:  vp_cont_th 是 container 索引表 的 B-tree handle, 简记为 container btree
+	//  key 是 container UUID，通过它可以查找该 pool 下所有 container 的持久化描述 (vos_cont_df)
+	//
+	//      - tree class: VOS_BTR_CONT_TABLE
+	//      - 成员函数表: vct_ops, 见函数 vos_cont_tab_register
+	//      - 创建过程：
+	//          A. pool 创建时，执行一次：vos_pool_create_ex
+	//                  rc = dbtree_create_inplace(VOS_BTR_CONT_TABLE, 0, VOS_CONT_ORDER,
+	//                  			   &uma, &pool_df->pd_cont_root, &hdl);
+	//            它做 2 件事：
+	//                  1. 创建container btree (container table)，即这里的 vp_cont_th；
+	//                  2. 将 class ID (VOS_BTR_CONT_TABLE) 写入持久化的 pd_cont_root.tr_class 字段；
+	//
+	//          B. 以后每次重启时，都会调用 pool_open，其中
+	//                  rc = dbtree_open_inplace_ex(&pool_df->pd_cont_root, &pool->vp_uma,
+	//                  			    DAOS_HDL_INVAL, pool, &pool->vp_cont_th);
+	//             它会：
+	//                  从持久化的 tr_class 读回这个 class ID 来打开树，
+	//                  所以 vp_cont_th (container btree) 的 class 是 VOS_BTR_CONT_TABLE
 	daos_handle_t		vp_cont_th;
 	/** GC statistics of this pool */
 	struct vos_gc_stat       vp_gc_stat_global;

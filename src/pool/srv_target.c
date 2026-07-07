@@ -1777,6 +1777,40 @@ ds_pool_tgt_disconnect_aggregator(crt_rpc_t *source, crt_rpc_t *result,
 	return 0;
 }
 
+//Yuanguo:
+//  若：
+//      - 例如整个系统包含10个rank 0,1,2,3,...,9
+//      - PoolA 占 [0,2,4,6,8]
+//      - PoolB 占 [1,3,5,7,9]
+//
+//  全员都处于UP/UPIN/DRAIN状态：
+//      - primary group：[0,1,2,3,4,5,6,7,8,9]，是系统全部成员。
+//      - PoolA的secondary group：[0,2,4,6,8]，PoolA CaRT RPC 的成员范围
+//      - PoolB的secondary group：[1,3,5,7,9]，PoolB CaRT RPC 的成员范围
+//
+//  此时，rank 8 down；
+//
+//  PoolA 的 Leader Rank：
+//      - 通过 SWIM回调，或者 pool_svc_check_node_status() 主动扫描，触发 queue_event(...,CRT_EVT_DEAD);
+//      - 消费端：events_handler() -> handle_event() -> pool_svc_exclude_ranks() -> pool_svc_update_map() -> pool_svc_update_map_internal
+//          - 把新的pool map 持久化到 rdb (c语言raft): rdb_tx_commit(tx)
+//          - ds_pool_tgt_map_update():
+//              - 调用本函数update_pool_group()：把PoolA的secondary group更新为[0,2,4,6]；PoolA CaRT RPC 成员变为 [0,2,4,6]
+//              - 调用pl_map_update()：Leader自己更新本地的placement map;
+//          - ds_rsvc_request_map_dist(): 请求异步 pool map 分发；即通过条件变量 svc->s_map_dist_cv, 唤醒 map_distd：
+//              - rsvc_class(svc->s_class)->sc_map_dist(svc, &version); sc_map_dist指向函数 pool_svc_map_dist_cb()
+//              - pool_svc_map_dist_cb():
+//                  - read_map_buf() 从 rdb (c语言raft) 读取新的pool map；
+//                  - ds_pool_iv_map_update(): 调用pool_iv_update(..., CRT_IV_SYNC_EAGER, ...), 发起一次 IV 的 update + eager sync，
+//                    既更新 IV 命名空间里的缓存/状态，又通过 sync 把内容推到各节点；
+//
+//  PoolA 的 其它 Rank （Leader自己是否会再走一遍？待确认）：
+//      - 因为 Leader 调用pool_iv_update 时sync_mode = CRT_IV_SYNC_EAGER，即 走 sync 把 map 推到各节点；
+//      - 所以其它 Rank 得到 IV 回调 .ivc_pre_sync   = pool_iv_pre_sync
+//      - pool_iv_pre_sync() 调用 ds_pool_tgt_map_update():  和 Leader 一样，
+//      - ds_pool_tgt_map_update() 和 Leader 一样:
+//          - 调用本函数update_pool_group()：把自己内存里 PoolA 的secondary group更新为[0,2,4,6]；以后 CaRT RPC 只调用它们；
+//          - 调用pl_map_update()：更新本地的placement map;
 static int
 update_pool_group(struct ds_pool *pool, struct pool_map *map)
 {
@@ -1937,6 +1971,27 @@ ds_pool_put_map_bc(struct ds_pool_map_bc *map_bc)
 	map_bc_put(map_bc);
 }
 
+//Yuanguo:
+//  - 所有 daos_engine 都要执行（包括 PS leader 所在的 engine）：
+//      A. PS Leader:  pool_svc_update_map_internal()
+//              - ds_pool_tgt_map_update: 更新本地内存里的 pool map, placement map, CaRT group 成员, 各 xstream 的 cached version；
+//                见 src/pool/srv_target.c: update_pool_group() 注释；
+//              - ds_rsvc_request_map_dist：请求异步分发新版 pool map；仅设置标志s_map_dist 并唤醒专用线程 map_distd（异步排队，不阻塞当前事务路径）。
+//                Pool Service Leader 的 map_distd()（分发线程函数）：
+//                      1. 被唤醒之后，触发callback函数 rsvc_class(svc->s_class)->sc_map_dist，这里指向 pool_svc_map_dist_cb
+//                      2. pool_svc_map_dist_cb():
+//                          a. 从 RDB 读 pool map buf (struct pool_buf)
+//                          b. 下发 pool map buf: ds_pool_iv_map_update -> pool_iv_update(..., CRT_IV_SYNC_EAGER, ...) -> ds_iv_update(..., CRT_IV_SYNC_EAGER, ...)
+//
+//      B. 非 PS Leader engine:
+//              - 因为 Leader 调用pool_iv_update 时sync_mode = CRT_IV_SYNC_EAGER，即 走 sync 把 map 推到各节点；
+//              - 所以其它 Rank 得到 IV 回调 .ivc_pre_sync   = pool_iv_pre_sync
+//              - pool_iv_pre_sync() 调用 ds_pool_tgt_map_update();
+//              - ds_pool_tgt_map_update() 和 Leader 一样: 更新本地内存里的 pool map, placement map, CaRT group 成员, 各 xstream 的 cached version；
+//
+//  - 职责：
+//      - 更新本地内存里的 pool map, placement map, CaRT group 成员, 各 xstream 的 cached version；
+//      - 如果 map 有更新，还会触发 DTX resync；
 int
 ds_pool_tgt_map_update(struct ds_pool *pool, struct pool_buf *buf,
 		       unsigned int map_version)
@@ -2570,6 +2625,39 @@ ds_pool_collective(uuid_t pool_uuid, uint32_t exclude_status, int (*coll_func)(v
 	return ds_pool_collective_reduce(pool_uuid, exclude_status, &coll_ops, &coll_args, flags,
 					 thread);
 }
+
+//Yuanguo:
+//  4 个函数：
+//      - ds_pool_thread_collective_reduce
+//      - ds_pool_task_collective_reduce
+//      - ds_pool_thread_collective
+//      - ds_pool_task_collective
+//
+//  作用：在同一个 daos_engine 进程内，对给定 pool 的所有 (或部分) target xstream 执行一个 collective 操作。
+//
+//        注意：一个 daos_engine/rank 内有多个 target xstream；每个 target xstream 上都有同一个 pool 的一个 vos （典型部署）；
+//
+//  这 4 个函数分两个维度：
+//      1. thread vs task
+//      2. reduce vs no-reduce
+//
+//  thread vs task
+//      - thread: 创建 ABT_thread (ULT, user level thread) 来执行 collective 操作；
+//                ULT 有独立栈，可调用阻塞函数、yield/suspend、嵌套创建 ULT;
+//      - task: 创建 ABT_task (tasklet) 来执行 collective 操作；
+//                ABT_task 栈共享/极小，适合短任务，开销更低；不能调用会 yield/suspend 的操作（如 ABT_cond_wait、ABT_mutex_lock 等），
+//                因为它没有独立栈来保存上下文，
+//                所以 tasklet 必须一口气执行完，中间不能让出 CPU。适合纯 CPU 计算的短操作。
+//
+//  reduce vs no-reduce
+//      - reduce: 每个 target 产出局部结果，最后聚合 (reduce) 成全局结果；
+//                参数：dss_coll_ops + dss_coll_args（完整结构体）
+//                支持自定义 co_reduce 聚合回调
+//                完整 API
+//      - no-reduce: 每个 target 独立执行，只关心成功/失败
+//                参数：func + arg（简单函数指针）
+//                无 reduce 能力；
+//                本质上是完整 API 的语法糖；
 
 int
 ds_pool_thread_collective_reduce(uuid_t pool_uuid, uint32_t ex_status, struct dss_coll_ops *coll_ops,

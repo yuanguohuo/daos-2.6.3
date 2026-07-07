@@ -563,6 +563,7 @@ operation_add_buffer(struct operation_context *ctx,
 	} else {
 		//Yuanguo: 假设上面 reserve 了足够的 ulog 空间，会走到此分支
 		size_t next_entry_offset = ctx->ulog_curr_offset + entry_size;
+
 		//Yuanguo: 当前 entry 之后的一个 entry，要把它置零；
 		next_entry = (struct ulog_entry_base *)(ctx->ulog_curr->data +
 			next_entry_offset);

@@ -905,6 +905,34 @@ crt_swim_notify_rank_state(d_rank_t rank, struct swim_member_state *state_prev,
 	cbs_size = crt_plugin_gdata.cpg_event_size;
 	cbs_event = crt_plugin_gdata.cpg_event_cbs;
 
+	//Yuanguo: cb_func 指向 dss_crt_event_cb，见：
+	//  src/engine/init.c  server_init() -> crt_register_event_cb(dss_crt_event_cb, NULL);
+	//
+	//  dss_crt_event_cb() ->
+	//  ds_notify_swim_rank_dead() ->
+	//  raise_ras():
+	//      - 汇报给daos_server (golang)，见src/control/server/server_utils.go 里订阅 RASSwimRankDead
+	//      - daos_server在管控侧把rank设置为dead；
+	//
+	//  注意：上面不是pool-service (C语言raft) 把rank 标记为exclude 的流程。
+	//
+	//  pool-service exclude rank：
+	//      - Pool Service leader 升主时调用 init_events()
+	//          - crt_register_event_cb(ds_pool_crt_event_cb, svc)，注册cb，这里触发，参数cb_args = svc；queue_event(..., type)；
+	//          - pool_svc_check_node_status()：不依赖回调，主动扫描；
+	//            只查 map 里还是 UPIN 的 rank (crt_rank_state_get)
+	//            两种情况DER_NONEXIST/SWIM_MEMBER_DEAD 合成同一种后续动作：往 pool 事件队列里 queue_event(..., CRT_EVT_DEAD)
+	//          - 因此：若rank dead，可能会queue_event两次；init_events()内的注释也说了。
+	//      - 消费event：ool Service leader 升主时调用 init_events() -> dss_ult_create(events_handler, ...)
+	//          - events_handler消费event：handle_event() --> pool_svc_exclude_ranks()
+	//
+	// 总之，这里触发2个回调：
+	//   - dss_crt_event_cb + ds_notify_swim_rank_dead	给控制面 (MS, golang Raft) 报 RAS，更新 系统成员（如 MarkRankDead）
+	//   - ds_pool_crt_event_cb + queue_event	同一套 CaRT 事件，进入该pool的PoolService队列，经 pool_svc_exclude_ranks 驱动
+	//     pool map 里的 exclude。
+	//   - 另外，pool_svc_check_node_status	不替代 SWIM；轮询 map 与 crt_rank_state_get，补事件、纠偏（leader 切换、丢事件、不一致）；
+	//
+	// 参考：srv_pool.c : pool_svc_step_up_cb() 前的注释；
 	for (i = 0; i < cbs_size; i++) {
 		cb_func = cbs_event[i].cecp_func;
 		cb_args = cbs_event[i].cecp_args;

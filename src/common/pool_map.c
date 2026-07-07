@@ -85,6 +85,29 @@ struct pool_map {
 	 * Tree root of all components.
 	 * NB: All components must be stored in contiguous buffer.
 	 */
+	//Yuanguo:
+	//- without performance domain：
+	//  po_tree虽然布局上是紧凑的，实际上，也是一棵常规的、通过指针连接的树：
+	//       - root 和 server 节点：
+	//           - 指针 do_children 指向首个 child
+	//           - do_child_nr (do_comp.co_nr) 个 children 连续排在一起
+	//       - rank 节点：
+	//           - do_targets 指向首个 child (target)
+	//           - do_target_nr 个 children (targets) 连续排在一起
+	//  +--------------------------------------------------------------+
+	//  | pool_domain[0]  (root)                                       |  1 个 root
+	//  | pool_domain[1]  (serverA / NODE)                             |  3 个 node/server
+	//  | pool_domain[2]  (serverB / NODE)                             |
+	//  | pool_domain[3]  (serverC / NODE)                             |
+	//  | pool_domain[4]  (rank0 / RANK)                               |  6 个 rank
+	//  | pool_domain[5]  (rank1 / RANK)                               |
+	//  | pool_domain[6]  (rank2 / RANK)                               |
+	//  | pool_domain[7]  (rank3 / RANK)                               |
+	//  | pool_domain[8]  (rank4 / RANK)                               |
+	//  | pool_domain[9]  (rank5 / RANK)                               |
+	//  +--------------------------------------------------------------+
+	//  | pool_target[0..107]                                          |  target_nr=108
+	//  +--------------------------------------------------------------+
 	struct pool_domain	*po_tree;
 	/**
 	 * number of currently failed pool components of each type
@@ -358,6 +381,29 @@ comp_sorter_sort(struct pool_comp_sorter *sorter)
 }
 
 /** create a new pool buffer which can store \a nr components */
+//Yuanguo: 分配如下结构
+//
+//  +===========================================================+
+//  |                                                           |
+//  |                      struct pool_buf                      |
+//  |                                                           |
+//  | ...                                                       |
+//  | uint32_t  pb_nr        = nr   分配的空间                  |
+//  |  uint32_t  pb_domain_nr = 0                               |
+//  |  uint32_t  pb_node_nr   = 0                               |
+//  |  uint32_t  pb_target_nr = 0                               |
+//  | ...                                                       |
+//  |                                                           |
+//  | 柔性数组不占空间 struct pool_component  pb_comps[0];      |
+//  +===========================================================+  -----
+//  |    struct pool_component                                  |    ^
+//  +-----------------------------------------------------------+    |
+//  |    struct pool_component                                  |    |
+//  +-----------------------------------------------------------+   nr 个
+//  |    ......                                                 |    |
+//  +-----------------------------------------------------------+    |
+//  |    struct pool_component                                  |    |
+//  +===========================================================+  ----
 struct pool_buf *
 pool_buf_alloc(unsigned int nr)
 {
@@ -403,6 +449,58 @@ pool_buf_free(struct pool_buf *buf)
  *
  * TODO: add more description about pool map format.
  */
+//Yuanguo: buf 结构
+//  +===========================================================+
+//  |                                                           |
+//  |                      struct pool_buf                      |
+//  |  ...                                                      |
+//  |  uint32_t  pb_nr        = 3+6+108 = 117  分配的空间       |
+//  |  uint32_t  pb_domain_nr = 0                               |
+//  |  uint32_t  pb_node_nr   = 0                               |
+//  |  uint32_t  pb_target_nr = 0                               |
+//  |  ...                                                      |
+//  |                                                           |
+//  | 柔性数组不占空间 struct pool_component  pb_comps[0];      |
+//  +===========================================================+  -----
+//  |    struct pool_component                                  |    |
+//  |    struct pool_component                                  |    |  3 个 server/domain (num_domain_comps = 3)
+//  |    struct pool_component                                  |    |
+//  +===========================================================+  -----
+//  |    struct pool_component                                  |    |
+//  |    ......                                                 |    |
+//  |    ......                                                 |    | 6 个 engine/rank
+//  |    ......                                                 |    |
+//  |    ......                                                 |    |
+//  |    struct pool_component                                  |    |
+//  +===========================================================+  -----
+//  |    struct pool_component                                  |    |
+//  |    ......                                                 |    |
+//  |    ......                                                 |    |
+//  |    ......                                                 |    |
+//  |    ......                                                 |    |
+//  |    ......                                                 |    | 108 个 target
+//  |    ......                                                 |    |
+//  |    ......                                                 |    |
+//  |    ......                                                 |    |
+//  |    ......                                                 |    |
+//  |    ......                                                 |    |
+//  |    struct pool_component                                  |    |
+//  +===========================================================+  -----
+//
+// 注意：调用本函数(pool_buf_attach)，必须按树的层级，从上到下！
+//       因为 nr = 待填充的pos = 已填充过的 server/domain数 + engine/rank数 + target数
+//            - engine/rank数 = 0 且 target数 = 0：正在填充 server/domain
+//            - engine/rank数 > 0 且 target数 = 0：正在填充 engine/rank
+//            - engine/rank数 > 0 且 target数 > 0：正在填充 target
+//
+// 并且 prev->co_type < comps[0].co_type，就是强制如下成立：
+//
+//      prev->co_type(已经填充过的) >= comps[0].co_type(正在填充的)
+//      已经填充过(PO_COMP_TP_RANK) >= 正在填充的(PO_COMP_TP_RANK/PO_COMP_TP_TARGET)
+//
+//	        PO_COMP_TP_TARGET	= 0
+//	        PO_COMP_TP_RANK		= 1
+//	        PO_COMP_TP_NODE		= 2
 int
 pool_buf_attach(struct pool_buf *buf, struct pool_component *comps,
 		unsigned int comp_nr)
@@ -1003,14 +1101,42 @@ pool_buf_extract(struct pool_map *map, struct pool_buf **buf_pp)
  * Count number of domains, targets, and layers of domains etc in the
  * component tree.
  */
+//Yuanguo: 输入tree，布局上是紧凑的，实际上，也是一棵常规的、通过指针连接的树
+//  - root 和 server 节点：
+//      - 指针 do_children 指向首个 child
+//      - do_child_nr (do_comp.co_nr) 个 children 连续排在一起
+//  - rank 节点：
+//      - do_targets 指向首个 child (target)
+//      - do_target_nr 个 children (targets) 连续排在一起
+//  +--------------------------------------------------------------+
+//  | pool_domain[0]  (root)                                       |  1 个 root
+//  | pool_domain[1]  (serverA / NODE)                             |  3 个 node/server
+//  | pool_domain[2]  (serverB / NODE)                             |
+//  | pool_domain[3]  (serverC / NODE)                             |
+//  | pool_domain[4]  (rank0 / RANK)                               |  6 个 rank
+//  | pool_domain[5]  (rank1 / RANK)                               |
+//  | pool_domain[6]  (rank2 / RANK)                               |
+//  | pool_domain[7]  (rank3 / RANK)                               |
+//  | pool_domain[8]  (rank4 / RANK)                               |
+//  | pool_domain[9]  (rank5 / RANK)                               |
+//  +--------------------------------------------------------------+
+//  | pool_target[0..107]                                          |  target_nr=108
+//  +--------------------------------------------------------------+
+//
+//  本函数，从某层开始（不必从root开始，但必须从某一层的第一个元素开始），往下，统计各层的节点数，直至叶子层(target)
 static void
 pool_tree_count(struct pool_domain *tree, struct pool_comp_cntr *cntr)
 {
 	unsigned int	dom_nr;
 
 	if (tree[0].do_children != NULL) {
+		//Yuanguo:
+		//  若输入 tree 指向root：   tree[0].do_children 指向 serverA，       dom_nr = 1 (serverA指针 - root指针  -> 1)
+		//  若输入 tree 指向serverA：tree[0].do_children 指向 rank0，         dom_nr = 3 (rank0指针 - serverA指针 -> 3)
 		dom_nr = tree[0].do_children - tree;
 	} else {
+		//Yuanguo:
+		//  若输入 tree 指向rank0：  tree[0].do_targets 指向 pool_target[0]， dom_nr = 6 (pool_target0指针 - rank0指针 -> 6)
 		D_ASSERT(tree[0].do_targets != NULL);
 		dom_nr = (struct pool_domain *)tree[0].do_targets - tree;
 	}
@@ -1023,14 +1149,15 @@ pool_tree_count(struct pool_domain *tree, struct pool_comp_cntr *cntr)
 	//Yuanguo:
 	//  - without performance domain: 见pool_buf_parse()函数中的例子
 	//        外层循环遍历各个层；
-	//            - 第1次：tree指向root；内层循环遍历1个root，cntr->cc_domains累加root的children数(+3)；结束后，外层循环更新tree指向第一个node
-	//            - 第2次：tree指向第一个node；内层循环遍历3个root，cntr->cc_domains累加3个node的children数(+2 +2 +2)；结束后，外层循环更新tree指向第一个rank
+	//            - 第1次：tree指向root；内层循环遍历1个root，cntr->cc_domains累加root的children数(+3)；结束后，外层循环更新tree指向第一个node/server
+	//            - 第2次：tree指向第一个node/server；内层循环遍历3个node/server，
+	//                     cntr->cc_domains累加3个node/server的children数(+2 +2 +2)；结束后，外层循环更新tree指向第一个rank
 	//            - 第3次：tree指向第一个rank；rank的do_children为NULL，所以内层循环遍历所有rank，把它们的children(target)累加到cntr->cc_targets；
 	//                     结束后，外层循环更新tree指向第一个rank的do_children(rank的do_children都为NULL)；
 	//            - 第4次：tree为NULL，结束；
 	//        所以，对于pool_buf_parse()函数中的例子，
 	//            cntr->cc_top_doms = 1  1个root
-	//            cntr->cc_domains  = 1(root)+3(node)+6(rank) = 10
+	//            cntr->cc_domains  = 1(root)+3(node/server)+6(rank) = 10
 	//            cntr->cc_targets  = 108
 	//            cntr->cc_layers   = 3
 	//  - with performance domain:
@@ -1081,6 +1208,11 @@ pool_tree_size(struct pool_domain *tree)
 /**
  * Rebuild pointers for the component tree
  */
+//Yuanguo: tree 指向紧凑布局树（见struct pool_map 的 po_tree 字段前的注释）；各节点的孩子数（do_child_nr/do_target_nr）是正确的，
+//  但指针不正确；根据
+//    - 各节点的孩子数
+//    - cntr 中的辅助信息（cc_top_doms 指定起始修正的层；cc_domains 用于找到第一个target）
+//  修正指针
 static void
 pool_tree_build_ptrs(struct pool_domain *tree, struct pool_comp_cntr *cntr)
 {
@@ -1095,6 +1227,15 @@ pool_tree_build_ptrs(struct pool_domain *tree, struct pool_comp_cntr *cntr)
 
 	for (dom_nr = cntr->cc_top_doms; tree != NULL;
 	     tree = tree[0].do_children) {
+		//Yuanguo:
+		//  外层for第一轮(root)：dom_nr=1 (1个root)
+		//      children初始化：指向 第0个server (tree[1])
+		//Yuanguo:
+		//  外层for第二轮(server)：tree (tree[0].do_children) 在第一轮中设置 指向第0个server；dom_nr=6(假如共有6个server)
+		//      children初始化：指向第0个rank (tree 指向第0个server，&tree[6]指向第0个rank)
+		//Yuanguo:
+		//  外层for第三轮(rank)：tree (tree[0].do_children) 在第二轮中设置 指向第0个rank；dom_nr=12(假如共有12个rank)
+		//      children初始化：指向第0个target (tree 指向第0个rank，&tree[12]指向第0个target)
 		struct pool_domain *children = &tree[dom_nr];
 		struct pool_target *tgs	     = targets;
 		int		    child_nr = 0;
@@ -1102,10 +1243,53 @@ pool_tree_build_ptrs(struct pool_domain *tree, struct pool_comp_cntr *cntr)
 
 		for (i = 0; i < dom_nr; i++) {
 			if (tree[i].do_children != NULL) {
+				//Yuanguo:
+				//  外层for第一轮(root)：i 只能为0 (1个root)
+				//          root.do_children 指向第0个server
+				//          child_nr = root的孩子数，即server数，假如共有6个server
+				//          children 向前移动6个元素，即跳过6个server，指向第0个rank
+				//Yuanguo:
+				//  外层for第二轮(server)：i = 0~5
+				//      i = 0，tree[i] 是 第0个server
+				//          server0.do_children <- rank0
+				//          child_nr            <- 0 + server0的孩子数 = 2
+				//          children            <- rank2  (向前移动 2 个元素，跳过server0的2个孩子，所以指向rank2)
+				//      i = 1，tree[i] 是 第1个server
+				//          server1.do_children <- rank2
+				//          child_nr            <- 2 + server1的孩子数 = 4
+				//          children            <- rank4  (再向前移动 2 个元素，跳过server1的2个孩子，所以指向rank4)
+				//      i = 2，tree[i] 是 第2个server
+				//          server2.do_children <- rank4
+				//          child_nr            <- 4 + server2的孩子数 = 6
+				//          children            <- rank6  (再向前移动 2 个元素，跳过server2的2个孩子，所以指向rank6)
+				//      ......
+				//Yuanguo:
+				//  外层for第三轮(rank)：不走这里
 				tree[i].do_children = children;
 				child_nr += tree[i].do_child_nr;
 				children += tree[i].do_child_nr;
 			}
+			//Yuanguo:
+			//  外层for第一轮(root)：i 只能为0 (1个root)
+			//          root.do_targets 指向 第0个target
+			//Yuanguo:
+			//  外层for第二轮(server)：i = 0~5
+			//      i = 0，tree[i] 是 第0个server
+			//          server0.do_targets <- target0
+			//          tgs                <- target36 向前移动 server0 的 target 数(36)，所以指向 target36
+			//      i = 1，tree[i] 是 第1个server
+			//          server1.do_targets <- target36
+			//          tgs                <- target72 再向前移动 server1 的 target 数(36)，所以指向 target72
+			//      ......
+			//Yuanguo:
+			//  外层for第三轮(rank)：i = 0~11
+			//      i = 0, tree[i] 是 rank0
+			//          rank0.do_targets <- target0
+			//          tgs              <- target18 前移动 rank0 的 target 数(18)，所以指向 target18
+			//      i = 1, tree[i] 是 rank1
+			//          rank1.do_targets <- target18
+			//          tgs              <- target36 前移动 rank1 的 target 数(18)，所以指向 target36
+			//      ......
 			tree[i].do_targets = tgs;
 			tgs += tree[i].do_target_nr;
 		}
@@ -1231,12 +1415,40 @@ pool_tree_sane(struct pool_domain *tree, uint32_t version)
 }
 
 /** copy a components tree */
+//Yuanguo:
+//- without performance domain：
+//  拷贝这样的结构：
+//
+//    +--------------------------------------------------------------+
+//    | pool_domain[0]  (root)                                       |  1 个 root
+//    | pool_domain[1]  (serverA / NODE)                             |  3 个 node/server
+//    | pool_domain[2]  (serverB / NODE)                             |
+//    | pool_domain[3]  (serverC / NODE)                             |
+//    | pool_domain[4]  (rank0 / RANK)                               |  6 个 rank
+//    | pool_domain[5]  (rank1 / RANK)                               |
+//    | pool_domain[6]  (rank2 / RANK)                               |
+//    | pool_domain[7]  (rank3 / RANK)                               |
+//    | pool_domain[8]  (rank4 / RANK)                               |
+//    | pool_domain[9]  (rank5 / RANK)                               |
+//    +--------------------------------------------------------------+
+//    | pool_target[0..107]                                          |  target_nr=108
+//    +--------------------------------------------------------------+
+//
+//  虽然布局上是紧凑的，实际上，也是一棵常规的、通过指针连接的树：
+//    - root 和 server 节点：
+//        - 指针 do_children 指向首个 child
+//        - do_child_nr (do_comp.co_nr) 个 children 连续排在一起
+//    - rank 节点：
+//        - do_targets 指向首个 child (target)
+//        - do_target_nr 个 children (targets) 连续排在一起
 static void
 pool_tree_copy(struct pool_domain *dst, struct pool_domain *src)
 {
 	struct pool_comp_cntr	cntr;
 
+	//Yuaguo: 直接内存拷贝（因为布局是紧凑的），但拷贝之后，指针关系是错的
 	memcpy(dst, src, pool_tree_size(src));
+	//Yuaguo: 统计各层节点数，然后 fix 指针
 	pool_tree_count(src, &cntr);
 	pool_tree_build_ptrs(dst, &cntr);
 }
@@ -1298,6 +1510,23 @@ pool_map_init_in_fseq(struct pool_map *map)
  * \param map		[IN]	The pool map to be initialized.
  * \param tree		[IN]	Component tree for the pool map.
  */
+//Yuanguo:
+//- without performance domain：
+//  参数tree：
+//  +--------------------------------------------------------------+
+//  | pool_domain[0]  (root)                                       |  1 个 root
+//  | pool_domain[1]  (serverA / NODE)                             |  3 个 node/server
+//  | pool_domain[2]  (serverB / NODE)                             |
+//  | pool_domain[3]  (serverC / NODE)                             |
+//  | pool_domain[4]  (rank0 / RANK)                               |  6 个 rank
+//  | pool_domain[5]  (rank1 / RANK)                               |
+//  | pool_domain[6]  (rank2 / RANK)                               |
+//  | pool_domain[7]  (rank3 / RANK)                               |
+//  | pool_domain[8]  (rank4 / RANK)                               |
+//  | pool_domain[9]  (rank5 / RANK)                               |
+//  +--------------------------------------------------------------+
+//  | pool_target[0..107]                                          |  target_nr=108
+//  +--------------------------------------------------------------+
 static int
 pool_map_initialise(struct pool_map *map, struct pool_domain *tree)
 {
@@ -1343,16 +1572,16 @@ pool_map_initialise(struct pool_map *map, struct pool_domain *tree)
 
 	/* pointer arrays for binary search of domains */
 	//Yuanguo:
-	//  - without performance domain：pool_buf_parse()中的例子，po_domain_layers = 3 (3层: root, node, rank; target层不算)
+	//  - without performance domain：pool_buf_parse()中的例子，po_domain_layers = 3 (3层: root, node/server, rank; target层不算)
 	//        第1次(i=0)：root层
 	//            pool_tree_count(root, &cntr)；得到cntr.cc_top_doms=1;
 	//            sorter->cs_nr=1;
 	//            所以sorter->cs_comps数组只有1个元素，排序(comp_sorter_sort函数)无意义
-	//            更新tree = 第一个node
-	//        第2次(i=1)：node层
-	//            pool_tree_count(pointer-of-first-node, &cntr)；得到cntr.cc_top_doms=3;
+	//            更新tree = 第一个node/server
+	//        第2次(i=1)：node/server层
+	//            pool_tree_count(pointer-of-first-node/server, &cntr)；得到cntr.cc_top_doms=3;
 	//            sorter->cs_nr=3;
-	//            所以sorter->cs_comps数组有3个元素(3个node)，排序：按node的co_id排序；
+	//            所以sorter->cs_comps数组有3个元素(3个node/server)，排序：按node/server的co_id排序；
 	//            更新tree = 第一个rank
 	//        第3次(i=2)：rank层
 	//            pool_tree_count(pointer-of-first-rank, &cntr)；得到cntr.cc_top_doms=6;
@@ -1361,6 +1590,9 @@ pool_map_initialise(struct pool_map *map, struct pool_domain *tree)
 	//            更新tree = 第一个target
 	//        i=3，循环结束；
 	//  - with performance domain:
+	//
+	//Yuanguo: 这个循环把 root层、node/server层、rank层都排序了（初始化对应sorter）；
+	//  但没有处理target层（target层见下面）
 	for (i = 0; i < map->po_domain_layers; i++) {
 		struct pool_comp_sorter	*sorter = &map->po_domain_sorters[i];
 		unsigned int		 j;
@@ -1375,7 +1607,8 @@ pool_map_initialise(struct pool_map *map, struct pool_domain *tree)
 		D_DEBUG(DB_TRACE, "domain %s, ndomains %d\n",
 			pool_domain_name(&tree[0]), sorter->cs_nr);
 
-		//Yuanguo: sorter->cs_comps 以及下面的 map->po_target_sorter.cs_comps 都是指针的数组；
+		//Yuanguo: sorter->cs_comps 以及下面的 map->po_target_sorter.cs_comps 都是指针的数组，
+		//  指向 map->po_tree 空间中的结构；
 		//  排序不会修改map->po_tree;
 		for (j = 0; j < sorter->cs_nr; j++)
 			sorter->cs_comps[j] = &tree[j].do_comp;
@@ -1386,6 +1619,8 @@ pool_map_initialise(struct pool_map *map, struct pool_domain *tree)
 
 		tree = &tree[sorter->cs_nr];
 	}
+
+	//Yuanguo: 初始化target层的sorter，即对target层排序
 
 	//Yuanguo:
 	//  - without performance domain：pool_buf_parse()中的例子，cntr.cc_targets = 108
@@ -1593,6 +1828,30 @@ pool_domain_tgt_count(struct pool_domain *tree)
  * Merge all new components from \a tree into \a map.
  * Already existent components will be ignored.
  */
+//Yuanguo:
+// - without performance domain
+//   参数tree:  扩容新增的 tree (3个server, 3*2=6个rank, 6*18=108个target)
+//   tree虽然布局上是紧凑的，实际上，也是一棵常规的、通过指针连接的树：
+//       - root 和 server 节点：
+//           - 指针 do_children 指向首个 child
+//           - do_child_nr (do_comp.co_nr) 个 children 连续排在一起
+//       - rank 节点：
+//           - do_targets 指向首个 child (target)
+//           - do_target_nr 个 children (targets) 连续排在一起
+//   +--------------------------------------------------------------+
+//   | pool_domain[0]  (root)                                       |  1 个 root
+//   | pool_domain[1]  (serverA / NODE)                             |  3 个 node/server
+//   | pool_domain[2]  (serverB / NODE)                             |
+//   | pool_domain[3]  (serverC / NODE)                             |
+//   | pool_domain[4]  (rank0 / RANK)                               |  6 个 rank
+//   | pool_domain[5]  (rank1 / RANK)                               |
+//   | pool_domain[6]  (rank2 / RANK)                               |
+//   | pool_domain[7]  (rank3 / RANK)                               |
+//   | pool_domain[8]  (rank4 / RANK)                               |
+//   | pool_domain[9]  (rank5 / RANK)                               |
+//   +--------------------------------------------------------------+
+//   | pool_target[0..107]                                          |  108 个 target
+//   +--------------------------------------------------------------+
 static int
 pool_map_merge(struct pool_map *map, uint32_t version,
 	       struct pool_domain *tree)
@@ -1615,6 +1874,8 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 		return -DER_NOMEM;
 	}
 
+	//Yuanguo: 把 扩容新增的 tree (3个server, 3*2=6个rank, 6*18=108个target)
+	//  初始化成一个完整的独立的 struct pool_map，即 src_map，用于和 map 合并；
 	rc = pool_map_initialise(src_map, tree);
 	if (rc != 0) {
 		D_DEBUG(DB_MGMT, "Failed to create scratch map for buffer: "
@@ -1641,10 +1902,31 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 		/* source map may have less levels because it could be in
 		 * a subtree, skip the fake root in this case.
 		 */
+		//Yuanguo: Case-1 扩容新增的 tree 比原 map->po_tree 层数少，例如：
+		//  原map->po_tree
+		//    0. root
+		//    1. server/node
+		//    2. rank
+		//    3. target
+		//  扩容新增的 tree
+		//    0. root
+		//    1. rank
+		//    2. target
+		//  新 tree 层级更少（只有 rank 和 target，没有 server/node 层），跳过新 tree 的 fake root（tree[0]），
+		//  取 tree[1].do_comp.co_type（PO_COMP_TP_RANK），在现有 map 中找到该层的起始位置，让 cur_doms 指向它（即指向 map->po_tree 中的 rank0）
+		//  下面 cur_doms - map->po_tree 结果为 4 (1个root，3个server/node)，dst_doms 指向 dst_tree 中的 rank0，意味着从 rank 层开始合并；
 		D_ASSERT(src_map->po_domain_layers < map->po_domain_layers);
 		rc = pool_map_find_domain(map, tree[1].do_comp.co_type,
 					  PO_COMP_ID_ALL, &cur_doms);
 	} else {
+		//Yuanguo: Case-2 扩容新增的 tree 和原 map->po_tree 层数相同，例如都是：
+		//    0. root
+		//    1. server/node
+		//    2. rank
+		//    3. target
+		//  在原 map->po_tree 中找 PO_COMP_TP_ROOT (tree[0].do_comp.co_type) 层，让 cur_doms 指向它；
+		//  实际上，找到的是 map->po_tree 本身，即返回的 cur_doms 和 map->po_tree 相等；
+		//  下面 cur_doms - map->po_tree 结果为 0，dst_doms = dst_tree，意味着从 root 开始合并。
 		rc = pool_map_find_domain(map, tree[0].do_comp.co_type,
 					  PO_COMP_ID_ALL, &cur_doms);
 	}
@@ -1653,14 +1935,40 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 		goto failed;
 	}
 
+	//Yuanguo: 见上面
+	// Case-1:
+	//    - cur_doms 指向 map->po_tree 中的 rank0
+	//    - dst_doms 指向 dst_tree 中的 rank0
+	// Case-2:
+	//    - cur_doms 和 map->po_tree 相等
+	//    - dst_doms 和 dst_tree 相等
 	dst_doms = dst_tree;
 	dst_doms += cur_doms - map->po_tree;
+	//Yuanguo: 统计从 合并起始层往下（包括），各层的节点数；
 	pool_tree_count(dst_doms, &cntr);
 	dom_nr = cntr.cc_top_doms;
 
 	/* overwrite the components after the top layer domains */
+	//Yuanguo: addr 是顺序填充的游标，初始化：
+	// Case-1: 指向 [rank0-rank5] 之后的地，将要填入新扩容的rank
+	// Case-2: 指向 [root] 之后的地方，将要填入server（包括旧server）
 	addr = (void *)&dst_doms[dom_nr];
+	//Yuanguo: 又统计一次，从 dst root开始！
+	// 目的是初始化 cntr 的基准计数（旧树当前有多少 domains 和 targets），在合并循环中新增节点时会在这个基础上累加：
 	pool_tree_count(dst_tree, &cntr);
+
+	//Yuanguo: 假设原map已有 serverX，serverY, serverZ，现在新增serverA, serverB, serverC
+	//  (每个server有2个rank，每个rank有18个target，共6个rank, 108个target)
+	//
+	//  pool_tree_copy 后 dst_tree（旧布局）：
+	//    [root] [X] [Y] [Z] [rank0] [rank1] [rank2] [rank3] [rank4] [rank5] [targets...]
+	//                         ↑ X的children   ↑ Y的children   ↑ Z的children
+	//
+	//  合并后需要的 dst_tree（新布局）：
+	//    [root] [X] [Y] [Z] [A] [B] [C] [rank0] [rank1] [rank2] [rank3] [rank4] [rank5] [rank6]...[rank11] [targets...]
+	//                                     ↑ X的children           ↑ 新位置
+	//
+	//  下面复杂的逻辑，就是做这个事，可以不看！
 
 	/* complex buffer manipulating... */
 	for (; dst_doms != NULL;
@@ -1669,6 +1977,10 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 		struct pool_domain *cdom = &cur_doms[0];
 		int		    child_nr = 0;
 
+		//Yuanguo: 一层看完再看另一层，不要并行看!
+		//  外层for第一轮：root 层，dom_nr=1
+		//  外层for第二轮：server/node 层，dom_nr=6（注意包含X,Y,Z，加上新扩容的A,B,C，共6个server），下面遍历 dst_doms[0..5]，即 [X] [Y] [Z] [A] [B] [C]：
+		//  外层for第三轮：rank层，dom_nr=12（注意包含X,Y,Z的6个rank，加上新扩容的A,B,C的6个rank，共12个rank）
 		for (i = 0; i < dom_nr; i++) {
 			struct pool_domain *ddom = &dst_doms[i];
 			struct pool_domain *sdom;
@@ -1676,6 +1988,10 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 			int		    j;
 
 			if (ddom->do_comp.co_ver == version) {
+				//Yuanguo:
+				//  外层for第二轮：i=3,4,5, ddom=server A,B,C （新server），它们是从 src_map 拷贝过来的，指针指向 src_map->po_tree 中，是无意义的，清空重建；
+				//Yuanguo:
+				//  外层for第三轮：i= 6~11, ddom=rank 6~11 （新rank），它们是从 src_map 拷贝过来的，指针指向 src_map->po_tree 中，是无意义的，清空重建；
 				ddom->do_children  = NULL;
 				ddom->do_targets   = NULL;
 				ddom->do_child_nr  = 0;
@@ -1683,6 +1999,17 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 				D_DEBUG(DB_TRACE, "Add new domain %s[%d] idx/nr %d/%u\n",
 					pool_domain_name(ddom), ddom->do_comp.co_id, i, dom_nr);
 			} else {
+				//Yuanguo:
+				//  外层for第一轮：i=0, ddom = 旧root，co_ver=5 < 6 → else 分支
+				//  下面拷贝 server X,Y,Z，即 dst_tree[X,Y,Z] <- map->po_tree[X,Y,Z]
+				//  (这点其实是重复的，pool_tree_copy已经拷贝过；但后续过程，这个拷贝就不是冗余的了)
+				//Yuanguo:
+				//  外层for第二轮：i=0,1,2, ddom=server X,Y,Z （旧server），co_ver=5 < 6  → else 分支
+				//  下面拷贝它们的 children  (rank0,rank1 / rank2,rank3 / rank4,rank5)，拷贝之后，addr 指向 rank6 处
+				//Yuanguo:
+				//  外层for第三轮：i = 0~5, ddom=rank 0~5 （旧rank），co_ver=5 < 6  → else 分支
+				//  下面拷贝它们的 children  (target 0~17 / 18~35 / 36~53 / 54~71 / 72~89 / 90~107 )，拷贝之后，addr 指向 target 108 处
+
 				/* Domain existed, copy its children/targets
 				 * from current pool map.
 				 */
@@ -1703,6 +2030,8 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 					     sizeof(struct pool_target);
 					memcpy(addr, cdom->do_targets, nb);
 				}
+				//Yuanguo:
+				//  外层for第一轮：addr 指向[Z] 之后的字节，即，要填入 server [A,B,C] 的地方
 				addr += nb;
 				cdom++;
 			}
@@ -1710,11 +2039,17 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 			D_DEBUG(DB_TRACE, "Check changes for %s[%d]\n",
 				pool_domain_name(ddom), ddom->do_comp.co_id);
 
+			//Yuanguo:
+			//  外层for第一轮：在 src_map/tree 中，找 ddom->do_comp.co_type，即 src_map/tree 的 root
 			rc = pool_map_find_domain(src_map,
 						  ddom->do_comp.co_type,
 						  ddom->do_comp.co_id, &sdom);
 			if (rc == 0) {
 				child_nr += ddom->do_child_nr;
+				//Yuanguo:
+				//  外层for第二轮：i=0,1,2, ddom=server X,Y,Z （旧server），这里continue
+				//Yuanguo:
+				//  外层for第三轮：i = 0~5, ddom=rank 0~5 （旧rank），这里continue
 				continue; /* no change for this domain */
 			}
 
@@ -1723,6 +2058,12 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 				struct pool_domain *child = addr;
 				uint32_t	tgt_nr;
 
+				//Yuanguo:
+				//  外层for第一轮：sdom 指向 src_map/tree 的 root；tgt_nr 是它的子孙 target 数，即 108，即 新扩的 target 数
+				//Yuanguo:
+				//  外层for第二轮：i=3,4,5, ddom=server A,B,C （新server），sdom指向 src_map->po_tree中对应server。以i=3为例:
+				//                 tgt_nr = 36
+				//                 此时 child/addr 指向 rank6 处，下面 ddom->do_children = child，让 serverA 指向它的孩子（前面 ddom->do_comp.co_ver == version 分支清理了）
 				tgt_nr = pool_domain_tgt_count(sdom);
 				D_DEBUG(DB_TRACE, "Scan children of %s[%d] tgt_nr %u\n",
 					pool_domain_name(ddom),
@@ -1731,8 +2072,24 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 				if (ddom->do_children == NULL)
 					ddom->do_children = child;
 
+				//Yuanguo:
+				//  外层for第一轮：ddom 此时指向 dst_tree 的 root；它子孙 target 数增加：新扩的 target 数
+				//Yuanguo:
+				//  外层for第二轮：i=3,4,5, ddom=server A,B,C （新server）。以i=3为例:
+				//                 tgt_nr = 36
+				//                 前面 ddom->do_comp.co_ver == version 分支，将 do_target_nr 置 0，这里设置正确的值
 				ddom->do_target_nr += tgt_nr;
 				/* copy new child domains to dest buffer */
+				//Yuanguo:
+				//  外层for第一轮：sdom 指向 src_map/tree 的 root，它的孩子是 server A,B,C，这里拷贝到 child(addr) 处，并更新 addr；
+				//  即 dst_tree[A,B,C] <- src_map[A,B,C]
+				//    [root] [X] [Y] [Z] [A] [B] [C] [rank0] [rank1] [rank2] [rank3] [rank4] [rank5] [rank6]...[rank11] [targets...]
+				//                       ↑           ↑
+				//              上面addr+=nb之后   下面循环结束后
+				//              addr指向这里       addr将指向这里
+				//Yuanguo:
+				//  外层for第二轮：i=3,4,5, ddom=server A,B,C （新server），以i=3为例，sdom指向 src_map->po_tree中serverA，ddom指向 dst_tree 中 serverA；
+				//                 这里拷贝 serverA 的 2 个孩子 (rank6,rank7)，拷贝之后，addr 指向rank8，为i=4 serverB 作准备；
 				for (j = 0; j < sdom->do_child_nr; j++) {
 					struct pool_component *dc;
 
@@ -1753,12 +2110,19 @@ pool_map_merge(struct pool_map *map, uint32_t version,
 				}
 				addr = child;
 			} else {
+				//Yuanguo:
+				//  外层for第三轮：i= 6~11, ddom=rank 6~11 （新rank），以 rank6 为例
+				//  前面 拷贝完 rank 0~5 的孩子之后，addr 指向 target 108 处
 				struct pool_target *target = addr;
 
 				D_DEBUG(DB_TRACE, "Scan targets of %s[%d]\n",
 					pool_domain_name(ddom),
 					ddom->do_comp.co_id);
 
+				//Yuanguo:
+				//  外层for第三轮：i= 6~11, ddom=rank 6~11 （新rank），以 rank6 为例
+				//                 前面 ddom->do_comp.co_ver == version 分支，将 do_targets 置 NULL，这里设置正确地址 (target 108 处)
+				//                 下面 for 循环，拷贝 18 个 target，拷贝完之后，addr 指向 target 126 处；为 i=7 rank7 拷贝孩子作准备；
 				if (ddom->do_targets == NULL)
 					ddom->do_targets = target;
 
@@ -1988,6 +2352,20 @@ add_domain_tree_to_pool_buf(struct pool_map *map, struct pool_buf *map_buf,
 	return rc;
 }
 
+//Yuanguo: 例如扩容
+//  3 个 server（domain，类型 PO_COMP_TP_NODE）
+//  每个 server 有 2 个 rank/engine（类型 PO_COMP_TP_RANK）
+//  每个 rank 有 18 个 target
+//  合计：3 域 × 2 rank = 6 rank；
+//        6 rank × 18 target = 108 target
+//
+//  所以，参数：
+//    - nnodes         // 6 (rank数)
+//    - ntargets       // 6*18=108 (target数)
+//    - dss_tgt_nr     // dss_tgt_nr=18
+//    - ndomains = 19  // 压缩故障域树的长度，单位 uint32_t
+//    - domains        // 压缩故障域树，19 个 uint32_t
+//  ndomains 和 domains 是 Extend RPC 传来的 IN 参数，见 ds_pool_extend_handler 函数的注释；
 int
 gen_pool_buf(struct pool_map *map, struct pool_buf **map_buf_out, int map_version, int ndomains,
 	     int nnodes, int ntargets, const uint32_t *domains, uint32_t dss_tgt_nr)
@@ -2011,14 +2389,67 @@ gen_pool_buf(struct pool_map *map, struct pool_buf **map_buf_out, int map_versio
 	D_ASSERT(num_domain_comps > 0);
 	num_domain_comps--; /* remove the root domain - allocated separately */
 
+	//Yuanguo: 现在 num_domain_comps = 3
+	//
+	//   基于 ds_pool_extend_handler 函数的注释，ndomains 是压缩故障域树所占空间；
+	//   d_fd_get_exp_num_domains() 中，ndomains 先减去 rank (叶子节点) 占的空间，再除以单个内部节点占的空间，得到内部节点数(4)，即4个内部节点：
+	//        root
+	//        serverA
+	//        serverB
+	//        serverC
+	//   上面又减1，即减去root，得到的是 3，即 server A,B,C
+
+	//Yuanguo: 分配容量为6的rank列表（用于收集新rank）
 	ordered_ranks = d_rank_list_alloc(nnodes);
 	if (ordered_ranks == NULL)
 		return -DER_NOMEM;
 
+	//Yuanguo: map_buf 结构
+	//  +===========================================================+
+	//  |                                                           |
+	//  |                      struct pool_buf                      |
+	//  |                                                           |
+	//  |  ...                                                      |
+	//  |  uint32_t  pb_nr        = 3+6+108 = 117  分配的空间       |
+	//  |  uint32_t  pb_domain_nr = 0                               |
+	//  |  uint32_t  pb_node_nr   = 0                               |
+	//  |  uint32_t  pb_target_nr = 0                               |
+	//  |  ...                                                      |
+	//  |                                                           |
+	//  | 柔性数组不占空间 struct pool_component  pb_comps[0];      |
+	//  +===========================================================+  -----
+	//  |    struct pool_component                                  |    |
+	//  |    struct pool_component                                  |    |  3 个 server/domain (num_domain_comps = 3)
+	//  |    struct pool_component                                  |    |
+	//  +===========================================================+  -----
+	//  |    struct pool_component                                  |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    | 6 个 engine/rank
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    struct pool_component                                  |    |
+	//  +===========================================================+  -----
+	//  |    struct pool_component                                  |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    | 108 个 target
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    struct pool_component                                  |    |
+	//  +===========================================================+  -----
 	map_buf = pool_buf_alloc(num_domain_comps + nnodes + ntargets);
 	if (map_buf == NULL)
 		D_GOTO(out_ranks, rc = -DER_NOMEM);
 
+	//Yuanguo: 是把压缩故障域树 (Extend Cart RPC IN 参数) 展开到前面分配的内存中 (逐节点展开为 pool_component，填入 map_buf)
+	//  同时收集所有新 rank 号到 ordered_ranks 列表。
+	//  注意：压缩故障域树中不包含 target，rank就是叶子节点了；
+	//        下面 fill targets 处，才填充 targets;
 	rc = add_domain_tree_to_pool_buf(map, map_buf, map_version, dss_tgt_nr, ndomains,
 					 domains, ordered_ranks);
 	if (rc != 0) {
@@ -2028,15 +2459,24 @@ gen_pool_buf(struct pool_map *map, struct pool_buf **map_buf_out, int map_versio
 		D_GOTO(out_map_buf, rc);
 	}
 
+	//Yuanguo: 确定新 target 的状态和 ID 起始值
 	if (map != NULL) {
+		//Yuanguo: 扩容场景
+		//    - new_status = PO_COMP_ST_NEW（后续 ds_pool_map_tgts_update 会将其从 NEW → UP）
+		//    - num_comps = 现有 pool map 中所有 target 的总数（用作新 target ID 的偏移基数）
+		//      例如：现有 pool 已有 200 个 target，则新 target ID 从 200 开始编号
 		new_status = PO_COMP_ST_NEW;
 		num_comps = pool_map_find_target(map, PO_COMP_ID_ALL, NULL);
 	} else {
+		//Yuanguo: 初始创建场景
+		//    - new_status = PO_COMP_ST_UPIN（直接可用）
+		//    - num_comps = 0（ID 从 0 开始）
 		new_status = PO_COMP_ST_UPIN;
 		num_comps = 0;
 	}
 
 	/* fill targets */
+	//Yuanguo: 填充 108 个 target
 	for (i = 0; i < ordered_ranks->rl_nr; i++) {
 		int j;
 
@@ -2084,16 +2524,85 @@ pool_map_extend(struct pool_map *map, uint32_t version, struct pool_buf *buf)
 	struct pool_domain *tree = NULL;
 	int		    rc;
 
+	//Yuanguo: 扁平数组(pool_map) → 内存树
+	//例如扩容
+	//  3 个 server（domain，类型 PO_COMP_TP_NODE）
+	//  每个 server 有 2 个 rank/engine（类型 PO_COMP_TP_RANK）
+	//  每个 rank 有 18 个 target
+	//  合计：3 域 × 2 rank = 6 rank；
+	//        6 rank × 18 target = 108 target
+	//buf 结构
+	//  +===========================================================+
+	//  |                                                           |
+	//  |                      struct pool_buf                      |
+	//  |                                                           |
+	//  |  ...                                                      |
+	//  |  uint32_t  pb_nr        = 3+6+108 = 117  分配的空间       |
+	//  |  uint32_t  pb_domain_nr = 3    (3 个 node/server)         |
+	//  |  uint32_t  pb_node_nr   = 6    (6 个 rank)                |
+	//  |  uint32_t  pb_target_nr = 108  (108 个 target)            |
+	//  |  ...                                                      |
+	//  |                                                           |
+	//  | 柔性数组不占空间 struct pool_component  pb_comps[0];      |
+	//  +===========================================================+  -----
+	//  |    struct pool_component                                  |    |
+	//  |    struct pool_component                                  |    |  3 个 server/domain (num_domain_comps = 3)
+	//  |    struct pool_component                                  |    |
+	//  +===========================================================+  -----
+	//  |    struct pool_component                                  |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    | 6 个 engine/rank
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    struct pool_component                                  |    |
+	//  +===========================================================+  -----
+	//  |    struct pool_component                                  |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    | 108 个 target
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    ......                                                 |    |
+	//  |    struct pool_component                                  |    |
+	//  +===========================================================+  -----
+	//
+	//输出：tree，虽然布局上是紧凑的，实际上，也是一棵常规的、通过指针连接的树：
+	//  - root 和 server 节点：
+	//      - 指针 do_children 指向首个 child
+	//      - do_child_nr (do_comp.co_nr) 个 children 连续排在一起
+	//  - rank 节点：
+	//      - do_targets 指向首个 child (target)
+	//      - do_target_nr 个 children (targets) 连续排在一起
+	//  +--------------------------------------------------------------+
+	//  | pool_domain[0]  (root)                                       |
+	//  | pool_domain[1]  (serverA / NODE)                             |
+	//  | pool_domain[2]  (serverB / NODE)                             |
+	//  | pool_domain[3]  (serverC / NODE)                             |  domain_nr+1=4
+	//  | pool_domain[4]  (rank0 / RANK)                               |
+	//  | pool_domain[5]  (rank1 / RANK)                               |
+	//  | pool_domain[6]  (rank2 / RANK)                               |
+	//  | pool_domain[7]  (rank3 / RANK)                               |  node_nr=6
+	//  | pool_domain[8]  (rank4 / RANK)                               |
+	//  | pool_domain[9]  (rank5 / RANK)                               |
+	//  +--------------------------------------------------------------+
+	//  | pool_target[0..107]                                          |  target_nr=108
+	//  +--------------------------------------------------------------+
 	rc = pool_buf_parse(buf, &tree);
 	if (rc != 0)
 		return rc;
 
+	//Yuanguo: 校验树结构完整性（层级关系、target 归属等）
 	if (!pool_tree_sane(tree, version)) {
 		D_DEBUG(DB_MGMT, "Insane buffer format\n");
 		rc = -DER_INVAL;
 		goto error_tree;
 	}
 
+	//Yuanguo: 校验新树与现有 map 兼容性（域类型层次一致）
 	rc = pool_map_compat(map, version, tree);
 	if (rc != 0) {
 		D_DEBUG(DB_MGMT, "Buffer is incompatible with pool map\n");

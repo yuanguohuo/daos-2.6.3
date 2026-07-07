@@ -77,6 +77,9 @@ agg_rate_ctl(void *arg)
 	return 1;
 }
 
+//Yuanguo: 通过 IV 框架向 PS leader 获取 container 的 properties，
+//  包括 checksum 配置、EC 参数、冗余因子、压缩/加密设置等属性，
+//  然后转换为struct cont_props；
 int
 ds_cont_get_props(struct cont_props *cont_props, uuid_t pool_uuid,
 		  uuid_t cont_uuid)

@@ -1490,6 +1490,31 @@ resume_event_handling(struct pool_svc *svc)
  * In that case should recover the rebuild task on engine \a rank, to simplify it now just
  * abort and retry the global rebuild task.
  */
+//Yuanguo: 上面注释: "..., to simplify it now just abort and retry the global rebuild task."
+//  意思是，待简化（应该只需一个target重试）；但现在只是 abort 然后全局重试。
+
+//Yuanguo:
+//  t1: target 2 故障 → map version 变为 V6, target 2 标记为 DOWN
+//      → rebuild 启动, 目标: 把 target 2 的数据迁移到其他 target (包括 target 3)
+//
+//  t2: target 3 参与 rebuild (作为接收方, 接收 target 2 的数据)
+//
+//  t3: target 3 在 rebuild 中途 down；但故障数超过了容错数，这种情况下，pool map 不发生变化，还是 V6;
+//
+//  t4: 管理员启动 target 3；
+//
+//  t5: target 3 重启后重新加入, Pool service Leader 收到 CRT_EVT_ALIVE 事件，触发
+//      → handle_event() 调用 pool_restart_rebuild_if_rank_wip(pool, rank=3)
+//      → target 3 在 pool map 中仍然是 UPIN (map 没变, 还是 V6)
+//      → ds_rebuild_restart_if_rank_wip() 发现:
+//          - rgt 存在, rebuild 正在进行 (DRS_IN_PROGRESS)
+//          - rank 3 在 rgt_servers 中
+//          - pull_done == false (rebuild 还没完成)
+//      → 设置 rgt_abort=1, rs_errno=-DER_STALE
+//      → rebuild_task_ult 检测到 abort → 重新调度 rebuild
+//
+//  t6: 新一轮 rebuild 发起 (gen=2 或更高, 同一个 leader L, 同一个 term T, 同一个 map_ver=V6)
+//      → SCAN RPC 广播: rsi_rebuild_ver=V6, rsi_rebuild_gen=2
 static void
 pool_restart_rebuild_if_rank_wip(struct ds_pool *pool, d_rank_t rank)
 {
@@ -1610,6 +1635,40 @@ stop_event_timer(struct event_timer_arg *arg)
 	events->pse_timer = NULL;
 }
 
+//Yuanguo: 当前 daos_engine 是某个 pool 的 pool serve Leader, events_handler 是 PS Leader 的核心后台 ULT。
+//  - 本函数被调用路径：
+//    当前 rank 从 Pool Service Follower 升为 Leader 时，触发 rdb_callbackd() ->  rdb_raft_process_event():
+//       case RDB_RAFT_STEP_UP: 当前 daos_engine 被选举成 Raft Leader
+//         - 调用 db->d_cbs->dc_step_up，即rsvc_step_up_cb()
+//         - rsvc_step_up_cb() 调用 rsvc_class(svc->s_class)->sc_step_up，指向 pool_svc_step_up_cb;
+//         - pool_svc_step_up_cb():
+//             -> 调用 init_events;
+//                 -> 调用 crt_register_event_cb(ds_pool_crt_event_cb, svc) 注册 crt event 的回调函数 (例如 SWIM 发现 rank down 时触发)；
+//                 -> 在当前 xstream (xs_id=0, SYS xstream) 上创建 ULT events_handler, 处理 pool 的事件；
+//
+//  - 本函数职责：
+//      - 负责收集和处理 pool 事件（如 rank down/up 通知）
+//      - 然后触发相应的 pool map 变更（exclude/reintegrate 等）
+//
+//  - 非本函数职责：
+//    events_handler 只处理 SWIM 检测到的自动事件（dead/alive）；管理员主动发起的 RPC，直接由对应的 RPC handler 处理：
+//
+//           ds_pool_update_handler_v6(crt_rpc_t *rpc) --> ds_pool_update_handler --> pool_svc_update_map(..., MUS_DMG)
+//               dmg pool exclude
+//               dmg pool drain
+//               dmg pool reintegrate
+//
+//           ds_pool_extend_handler(crt_rpc_t *rpc) --> pool_svc_update_map(..., MUS_DMG)
+//               dmg pool extend
+//
+//           所有发给 pool service leader 的管理类 RPC（exclude、reintegrate、drain、extend、connect、query 等），全部落在 SYS xstream 上处理。
+//           这与 events_handler、pool_svc_step_up_cb、ds_rsvc_start 等在同一个 xstream 上是一致的，即所有 pool service（Raft）相关逻辑都集中
+//           在 xstream 0。原因：在客户端发送 RPC 时确定。在 rsvc_client_choose（src/common/rsvc.c）中：
+//               ep->ep_rank = client->sc_ranks->rl_ranks[chosen];
+//               ep->ep_tag = 0;   // ← 固定为 0
+//
+//  - 本函数运行环境：
+//    一定运行在 xs_id=0 的 xstream （SYS xstream）上
 static void
 events_handler(void *arg)
 {
@@ -2257,6 +2316,49 @@ static int pool_svc_schedule_reconf(struct pool_svc *svc, struct pool_map *map,
 				    uint32_t map_version_for, bool sync_remove);
 static void pool_svc_rfcheck_ult(void *arg);
 
+//Yuanguo:
+//  - struct ds_rsvc_class 定义了 raft 事件的回调函数：
+//      - sc_bootstrap
+//      - sc_step_up
+//      - sc_step_down
+//      - ...
+//
+//  - 本函数就是 sc_step_up 的实现：当前 daos_engine 是某个pool 的 pool service 成员，且被选举为 Raft Leader时，由 Raft 框架自动调用；
+//    the longer story:
+//        - 当 daos_engine 成为某个pool 的 pool service  成员（无论是新建pool选择了某个daos_engine作为pool service 成员，还是daos_engine重启时发现自己是pool service成员），
+//          会调用 ds_rsvc_start()，启动 pool service 实例；
+//        - ds_rsvc_start() -> start() -> rdb_start() -> rdb_raft_start():
+//        - rdb_raft_start()：在当前 xstream 上创建如下ULT: 所以，这些 ULT 都在 xs_id=0 (SYS xstream) 上
+//            - rdb_recvd
+//            - rdb_timerd
+//            - rdb_callbackd
+//            - rdb_compactd
+//            - ...
+//            这些都是 raft 的日常工作
+//
+//        - 若当前 daos_engine 从 Follower 升为 Leader，则触发 rdb_callbackd() ->  rdb_raft_process_event():
+//            case RDB_RAFT_STEP_UP:
+//               - 调用 db->d_cbs->dc_step_up，即rsvc_step_up_cb()
+//               - rsvc_step_up_cb() 调用 rsvc_class(svc->s_class)->sc_step_up，指向本函数;
+//
+//  - 本函数一定在 xs_id=0 的 xstream （SYS xstream）上；见 ds_rsvc_start() 内的 assert 以及上面的调用链；
+//
+//  - 本函数核心工作是（准备成为 Leader）：
+//      - read_db_for_stepping_up(): 从 RDB 读取 pool map 和属性
+//      - update_svc_pool(): 更新本地 svc->ps_pool
+//      - ds_rsvc_request_map_dist(): 触发 pool map 分发，以防前一任 Leader 没有分发
+//      - ds_cont_svc_step_up(): 启动 container service
+//      - init_events(): 启动后台 ULT (leader 的后台工作)
+//          -> crt_register_event_cb(ds_pool_crt_event_cb, svc): 注册 crt/SWIM event 的回调函数 (例如 SWIM 发现 rank down 时触发)
+//          -> 在当前 xstream (xs_id=0, SYS xstream) 上创建 ULT events_handler，处理 pool 的事件；
+//
+//  - 举例：服务器停机，rank down 时：
+//         - Pool 事件生产者 crt_swim.c : crt_swim_notify_rank_state() (在 xs_id=1 的 SWIM xstream 上，见crt_context_provider_create -> crt_swim_init(crt_gdata.cg_swim_crt_idx=CRT_DEFAULT_PROGRESS_CTX_IDX))
+//           它触发 crt/SWIM event 回调函数 ds_pool_crt_event_cb() -> queue_event()
+//         - Pool 事件消费者：即上面提到的 ULT events_handler，运行在 SYS xstream（xs_id=0）上。
+//           events_handler() -> handle_event() -> pool_svc_exclude_ranks() -> pool_svc_update_map() -> ds_rebuild_schedule() assert xs_id 为 0；
+//
+//   参考：crt_swim.c : crt_swim_notify_rank_state() 内的注释；
 static int
 pool_svc_step_up_cb(struct ds_rsvc *rsvc)
 {
@@ -2514,6 +2616,9 @@ pool_svc_lookup(uuid_t uuid, struct pool_svc **svcp)
 	return 0;
 }
 
+//Yuanguo:
+//  只有当前 daos_engine 是给定 pool 的 service leader，ds_rsvc_lookup_leader 才返回成功(rc=0)
+//  若为follower，则返回 -DER_NOTLEADER，且通过 hint 返回当前leader (非this daos_engine)
 static int
 pool_svc_lookup_leader(uuid_t uuid, struct pool_svc **svcp, struct rsvc_hint *hint)
 {
@@ -2529,6 +2634,9 @@ pool_svc_lookup_leader(uuid_t uuid, struct pool_svc **svcp, struct rsvc_hint *hi
 	}
 
 	d_iov_set(&id, uuid, sizeof(uuid_t));
+	//Yuanguo:
+	//  只有当前 daos_engine 是给定 pool 的 service leader，ds_rsvc_lookup_leader 才返回成功(rc=0)
+	//  若为follower，则返回 -DER_NOTLEADER，且通过 hint 返回当前leader (非this daos_engine)
 	rc = ds_rsvc_lookup_leader(DS_RSVC_CLASS_POOL, &id, &rsvc, hint);
 	if (rc != 0)
 		return rc;
@@ -2566,6 +2674,9 @@ pool_svc_put_leader(struct pool_svc *svc)
 	ds_rsvc_put_leader(&svc->ps_rsvc);
 }
 
+//Yuanguo:
+//  只有当前 daos_engine 是给定 pool 的 service leader，ds_rsvc_lookup_leader 才返回成功(rc=0)
+//  若为follower，则返回 -DER_NOTLEADER，且通过 hint 返回当前leader (非this daos_engine)
 int
 ds_pool_svc_lookup_leader(uuid_t uuid, struct ds_pool_svc **ds_svcp, struct rsvc_hint *hint)
 {
@@ -6949,6 +7060,29 @@ pool_map_crit_prompt(struct pool_svc *svc, struct pool_map *map)
  *				\a tgts is nonempty; if specified, must be
  *				initialized to empty and freed by the caller)
  */
+//Yuanguo: 当前daos_engine是 Pool Service Leader；本函数：
+//  - 主要：在 RDB 事务里读出当前 pool map、在内存里改好、再写回并提交，从而更新持久化的 pool map （直到rdb_tx_commit）
+//  - 除此之外，rdb_tx_commit 成功之后，同函数还会继续做例如：
+//      - ds_pool_tgt_map_update: 更新自己内存里的 pool 缓存, placement map, cart group 成员等；
+//        见 src/pool/srv_target.c: update_pool_group() 注释；
+//      - ds_rsvc_request_map_dist：请求异步分发新版 pool map；仅设置标志s_map_dist 并唤醒专用线程 map_distd（异步排队，不阻塞当前事务路径）。
+//
+//          Pool Service Leader 的 map_distd()（分发线程函数）：
+//              1. 被唤醒之后，触发callback函数 rsvc_class(svc->s_class)->sc_map_dist，这里指向 pool_svc_map_dist_cb
+//              2. pool_svc_map_dist_cb():
+//                  a. 从 RDB 读 pool map buf (struct pool_buf)
+//                  b. 下发 pool map buf: ds_pool_iv_map_update -> pool_iv_update(..., CRT_IV_SYNC_EAGER, ...) -> ds_iv_update(..., CRT_IV_SYNC_EAGER, ...)
+//
+//          Pool 的其它 Rank：
+//              1. 因为 Leader 调用pool_iv_update 时sync_mode = CRT_IV_SYNC_EAGER，即 走 sync 把 map 推到各节点；
+//              2. 所以其它 Rank 得到 IV 回调 .ivc_pre_sync   = pool_iv_pre_sync
+//              3. pool_iv_pre_sync() 调用 ds_pool_tgt_map_update();
+//              4. ds_pool_tgt_map_update() 和 Leader 一样: 更新自己内存里的 pool 缓存, placement map, cart group 成员等。见 update_pool_group() 注释；
+//
+//      - resume_event_handling：当前 event 处理已经完成，唤醒 events_handler，继续处理其它event；
+//      - pool_svc_schedule_reconf: 在 pool map 变化后，Pool Service（RDB）成员可能发生变化。本函数调整 RBD 成员（若必要），
+//        并在成员变化时通知 Management Service。
+//      - pool_svc_update_map_metrics: 更新 disabled_targets, draining_targets, total_targets, degraded_ranks 等 metrics；
 static int
 pool_svc_update_map_internal(struct pool_svc *svc, unsigned int opc,
 			     bool exclude_rank, d_rank_list_t *extend_rank_list,
@@ -6973,6 +7107,7 @@ pool_svc_update_map_internal(struct pool_svc *svc, unsigned int opc,
 		DP_UUID(svc->ps_uuid), opc, exclude_rank, tgts->pti_number,
 		tgt_addrs == NULL ? 0 : tgt_addrs->pta_number);
 
+	//Yuanguo: 开启一个 raft replicated database (rdb) 事务，用于 read-modify-write pool_map;
 	rc = rdb_tx_begin(svc->ps_rsvc.s_db, svc->ps_rsvc.s_term, &tx);
 	if (rc != 0)
 		goto out;
@@ -6986,6 +7121,20 @@ pool_svc_update_map_internal(struct pool_svc *svc, unsigned int opc,
 	if (opc == MAP_EXTEND) {
 		D_ASSERT(extend_rank_list != NULL);
 		map_version = pool_map_get_version(map) + 1;
+
+		//Yuanguo: 例如扩容
+		//  3 个 server（domain，类型 PO_COMP_TP_NODE）
+		//  每个 server 有 2 个 rank/engine（类型 PO_COMP_TP_RANK）
+		//  每个 rank 有 18 个 target
+		//  合计：3 域 × 2 rank = 6 rank；
+		//        6 rank × 18 target = 108 target
+		//
+		//  extend_rank_list->rl_nr               // 6 (rank数)
+		//  extend_rank_list->rl_nr * dss_tgt_nr  // 6*18=108 (target数)
+		//  dss_tgt_nr                            // dss_tgt_nr=18
+		//  extend_domains_nr                     // 19，压缩故障域树的长度，单位 uint32_t
+		//  extend_domains                        // 压缩故障域树，19 个 uint32_t
+		//  extend_domains_nr 和 extend_domains 是 Extend RPC 传来的 IN 参数，见 ds_pool_extend_handler 函数的注释；
 		rc = gen_pool_buf(map, &map_buf, map_version, extend_domains_nr,
 				  extend_rank_list->rl_nr, extend_rank_list->rl_nr * dss_tgt_nr,
 				  extend_domains, dss_tgt_nr);
@@ -7040,6 +7189,35 @@ pool_svc_update_map_internal(struct pool_svc *svc, unsigned int opc,
 	 * Attempt to modify the temporary pool map and save its versions
 	 * before and after. If the version hasn't changed, we are done.
 	 */
+	//Yuanguo: 更新发生变化的 target 的 co_in_ver/co_out_ver/co_fseq，每个 target 不同 (见 ++(*version))；(co_ver 是 target 被加到map中的版本号，一批加入的 target 都相同)
+	//  对于 extend：
+	//      - 假如进入本函数时 map->po_version = 5
+	//      - 上面 pool_map_extend 之后，map->po_version = 6
+	//      - 下面 map_version_before = 6
+	//      - ds_pool_map_tgts_update
+	//        for each target:
+	//          -> update_one_tgt:   target->ta_comp.co_in_ver = ++(*version); 假设扩容 108 个target，循环108次，version = 6+108 = 114
+	//          -> update_one_dom: 可能继续增加版本
+	//        循环结束后（假如增加到 118）
+	//          -> pool_map_set_version(map, version):  map->po_version = 118
+	//      - 下面 map_version = 118，和map_version_before不相等，不会goto out_map
+	//  对于 exclude：
+	//      - 假如进入本函数时 map->po_version = 5
+	//      - 下面 map_version_before = 5
+	//      - ds_pool_map_tgts_update:
+	//        for each target:
+	//          -> update_one_tgt: target->ta_comp.co_fseq = ++(*version);   若 exlude 了 36 个 target 循环36次，version = 5 + 36 = 41
+	//          -> update_one_dom: 可能继续增加版本
+	//        循环结束后（假如增加到 45）
+	//              -> pool_map_set_version(map, version):  map->po_version = 45
+	//            下面 map_version = 45，和map_version_before不相等，不会goto out_map
+	//          - 若重复 exclude 这 36 个 target：
+	//            不更新
+	//            下面 map_version = 5，和map_version_before相等，goto out_map
+	//      - 总之，重复 exclude，或者 exclude 已经 out 的 target：goto out_map (do nothing)
+	//   对于 reintegrate: 类似于 exclude
+	//        - 重复 reintegrate，或者 reintegrate 已经 upin 的 target：goto out_map (do nothing)
+	//        - 否则，更新map 以及 map->po_version，继续往下（把更新写入rdb，触发rebuild，...）
 	map_version_before = pool_map_get_version(map);
 	rc = ds_pool_map_tgts_update(svc->ps_uuid, map, tgts, opc, exclude_rank, tgt_map_ver, true);
 	if (rc != 0)
@@ -7054,6 +7232,9 @@ pool_svc_update_map_internal(struct pool_svc *svc, unsigned int opc,
 	 * If the map modification affects myself, leave it to a new PS leader
 	 * if there's another PS replica, or reject it.
 	 */
+	//Yuanguo: 如果 map 变更影响到自己（自己是 PS Leader），则把 leadership transfer 给其它成员，然后 goto out_map 退出；
+	//    node == NULL || !(node->do_comp.co_status & DC_POOL_SVC_MAP_STATES)
+	// 含义是：本次 map 变更后，自己的 rank 要么已不存在、要么不再处于 UPIN 状态（比如被 exclude 变成 DOWN）→ 自己不再适合当 PS leader。
 	node = pool_map_find_dom_by_rank(map, dss_self_rank());
 	if (node == NULL || !(node->do_comp.co_status & DC_POOL_SVC_MAP_STATES)) {
 		d_rank_list_t *replicas;
@@ -7070,6 +7251,12 @@ pool_svc_update_map_internal(struct pool_svc *svc, unsigned int opc,
 			 * requires the currently unavailable Raft leadership
 			 * transfer support.
 			 */
+			//Yuanguo:
+			//  如果这个 rank 又被选为 PS leader：
+			//  RDB 中的 map 仍是旧版本（self 还是 UPIN），因为新 map 没有持久化；
+			//  SWIM 再次检测到故障，再次触发 pool_svc_update_map
+			//  再次走到同样的位置，再次 resign
+			//  循环往复 → 活锁（livelock）
 			D_INFO(DF_UUID": resigning PS leadership: self removal requested\n",
 			       DP_UUID(svc->ps_uuid));
 			rdb_resign(svc->ps_rsvc.s_db, svc->ps_rsvc.s_term);
@@ -7110,9 +7297,11 @@ pool_svc_update_map_internal(struct pool_svc *svc, unsigned int opc,
 	}
 
 	/* Write the new pool map. */
+	//Yuanguo:  把最新版的 pool map 保存成 pool buf 格式（rdb 存储格式）;
 	rc = pool_buf_extract(map, &map_buf);
 	if (rc != 0)
 		D_GOTO(out_map, rc);
+	//Yuanguo: 更新到事务(tx)中，还未提交
 	rc = write_map_buf(&tx, &svc->ps_root, map_buf, map_version);
 	if (rc != 0)
 		goto out_map_buf;
@@ -7140,6 +7329,8 @@ pool_svc_update_map_internal(struct pool_svc *svc, unsigned int opc,
 	updated = true;
 
 	/* Update svc->ps_pool to match the new pool map. */
+	//Yuanguo: 使新版 pool map 本地（pool service Leader）可见。
+	//  其它 daos_engine：后面 ds_rsvc_request_map_dist 通过 IV push 异步分发
 	rc = ds_pool_tgt_map_update(svc->ps_pool, map_buf, map_version);
 	if (rc != 0) {
 		D_ERROR(DF_UUID": failed to update pool map cache: %d\n",
@@ -7416,6 +7607,52 @@ ds_pool_extend_handler(crt_rpc_t *rpc)
 	uuid_copy(pool_uuid, in->pei_op.pi_uuid);
 	rank_list.rl_nr = in->pei_tgt_ranks->rl_nr;
 	rank_list.rl_ranks = in->pei_tgt_ranks->rl_ranks;
+	//Yuanguo: 假设扩容 3 个 server，每个server 2 个 rank/engine，每个 rank 有 18 个 target
+	//
+	//  逻辑故障域树：
+	//      root (ID=1)
+	//      ├── serverA (ID=2)
+	//      │   ├── rank0 (ID=3)
+	//      │   └── rank1 (ID=4)
+	//      ├── serverB (ID=5)
+	//      │   ├── rank2 (ID=6)
+	//      │   └── rank3 (ID=7)
+	//      └── serverC (ID=8)
+	//          ├── rank4 (ID=9)
+	//          └── rank5 (ID=10)
+	//
+	//  压缩故障域树 (Extend Cart RPC 的 IN 参数，紧凑连续便于传输，相当于序列化)：
+	//
+	//      in->pei_ndomains = 19
+	//      in->pei_domains.ca_arrays:
+	//
+	//      索引    值     含义
+	//      ────────────────────────────────────
+	//      [0]     0      metadata (无 perf domain, 无 fault domain)
+	//      ────────────────────────────────────
+	//      [1]     2      root: level = 2 (树深度)
+	//      [2]     1      root: ID = 1 (FaultDomainRootID)
+	//      [3]     3      root: children = 3 (3 个 server)
+	//      ────────────────────────────────────
+	//      [4]     1      serverA: level = 1
+	//      [5]     2      serverA: ID = 2
+	//      [6]     2      serverA: children = 2 (2 个 rank)
+	//      ────────────────────────────────────
+	//      [7]     1      serverB: level = 1
+	//      [8]     5      serverB: ID = 5
+	//      [9]     2      serverB: children = 2
+	//      ────────────────────────────────────
+	//      [10]    1      serverC: level = 1
+	//      [11]    8      serverC: ID = 8
+	//      [12]    2      serverC: children = 2
+	//      ────────────────────────────────────   下面都是叶子，直接存 rank 号
+	//      [13]    0      rank 0
+	//      [14]    1      rank 1
+	//      [15]    2      rank 2
+	//      [16]    3      rank 3
+	//      [17]    4      rank 4
+	//      [18]    5      rank 5
+	//      ────────────────────────────────────
 	ndomains = in->pei_ndomains;
 	domains = in->pei_domains.ca_arrays;
 
@@ -7495,6 +7732,32 @@ out:
 	return rc;
 }
 
+//Yuanguo:
+//  1. 本函数处理 dmg 命令
+//      dmg pool exclude
+//      dmg pool drain
+//      dmg pool reintegrate
+//
+//  2. 本函数还处理两个额外的 opcode（非 dmg 直接发起）：
+//      POOL_EXCLUDE_OUT — rebuild 完成后内部调用，将 target 状态从 DOWN 改为 DOWNOUT
+//      POOL_ADD_IN — 类似，内部用途
+//
+//  3. dmg pool extend 由 ds_pool_extend_handler 处理，而不是本函数；
+//
+//  4. 处理这些时，本 daos_engine 的角色都是 PS (pool service) Leader
+//
+//  5. 这些命令的发转发径：
+//       dmg pool exclude (drain/reintegrate/extend 一样)
+//           → gRPC → daos_server (MS leader, Go)
+//             → dRPC → 本地 daos_engine (mgmt module, C)
+//               → ds_mgmt_drpc_pool_exclude()
+//                 → pool_change_target_state()
+//                   → ds_mgmt_pool_target_update_state()
+//                     → dsc_pool_svc_update_target_state()
+//                       → dsc_pool_svc_call()
+//                         → rsvc_client_choose() (ep_tag=0)
+//                           → CaRT RPC (POOL_EXCLUDE)
+//                             → PS Leader 的 pool_update_handler()
 static void
 ds_pool_update_handler(crt_rpc_t *rpc, int handler_version)
 {
@@ -7545,6 +7808,10 @@ out:
 	pool_target_addr_list_free(&inval_list_out);
 }
 
+//Yuanguo: dmg命令行可能触发这些函数。见 src/pool/rpc.h
+//   dmg pool exclude
+//   dmg pool drain
+//   dmg pool reintegrate
 void
 ds_pool_update_handler_v6(crt_rpc_t *rpc)
 {
@@ -8136,6 +8403,9 @@ ds_pool_svc_query_map_dist(uuid_t uuid, uint32_t *version, bool *idle)
 	struct pool_svc	*svc;
 	int		rc;
 
+	//Yuanguo:
+	//  只有当前 daos_engine 是给定 pool 的 service leader，ds_rsvc_lookup_leader 才返回成功(rc=0)
+	//  若为follower，则返回 -DER_NOTLEADER，且通过 hint 返回当前leader (非this daos_engine)
 	rc = pool_svc_lookup_leader(uuid, &svc, NULL /* hint */);
 	if (rc != 0)
 		return rc;

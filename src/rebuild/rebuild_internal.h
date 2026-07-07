@@ -25,12 +25,23 @@
  * status to the global pool tracker(see below) on the master node,
  * which is used to track the rebuild status globally.
  */
+//Yuanguo:
+//  per pool, per rebuild operation, 一个 daos_engine 一个 rebuild_tgt_pool_tracker 实例;
+//  挂在 daos_engine 级别的全局链表 rebuild_gst.rg_tgt_tracker_list 上；
 struct rebuild_tgt_pool_tracker {
 	/** pin the pool during the rebuild */
 	struct ds_pool		*rt_pool;
 	struct sched_request	*rt_ult;
 
 	/** the current version being rebuilt, only used by leader */
+	//Yuanguo: rebuild 的目标版本；
+	//  rebuild 就是让所有 object 在这个版本的 pool map 下，都放置在正确位置上。
+	//          struct rebuild_tgt_pool_tracker  的 rt_rebuild_ver
+	//          struct rebuild_scan_in 的 rsi_rebuild_ver
+	//          struct rebuild_global_pool_tracker 的 rgt_rebuild_ver
+	//          struct rebuild_task 的 dst_map_ver
+	//          ds_rebuild_schedule 函数的 uint32_t map_ver 参数
+	//  都是这个语义
 	uint32_t		rt_rebuild_ver;
 
 	/* rebuild generation, will increase for each re-schedule */
@@ -124,6 +135,14 @@ struct rebuild_global_pool_tracker {
 	struct rebuild_server_status *rgt_servers;
 
 	/** the current version being rebuilt */
+	//Yuanguo: rebuild 的目标版本；
+	//  rebuild 就是让所有 object 在这个版本的 pool map 下，都放置在正确位置上。
+	//          struct rebuild_tgt_pool_tracker  的 rt_rebuild_ver
+	//          struct rebuild_scan_in 的 rsi_rebuild_ver
+	//          struct rebuild_global_pool_tracker 的 rgt_rebuild_ver
+	//          struct rebuild_task 的 dst_map_ver
+	//          ds_rebuild_schedule 函数的 uint32_t map_ver 参数
+	//  都是这个语义
 	uint32_t	rgt_rebuild_ver;
 
 	/** global resync dtx version */
@@ -142,6 +161,64 @@ struct rebuild_global_pool_tracker {
 	/* Stable epoch of the rebuild, the minimum epoch from
 	 * all rebuilding targets
 	 */
+	//Yuanguo:
+	//  核心作用： stable_epoch 是 rebuild 的数据一致性分界线——
+	//    epoch ≤ stable_epoch 的数据：属于"旧世界"，按旧 pool map 布局存储，需要扫描并迁移到新布局
+	//    epoch > stable_epoch 的数据：属于"新世界"，client 已经按新 pool map 路由写入，不需要迁移
+	//
+	//  - rgt_stable_epoch 如何设置？
+	//    Step-1: Leader 调用 rebuild_scan_broadcast，广播 scan RPC (REBUILD_OBJECTS_SCAN) 到所有 target
+	//
+	//    Step-2: 各target 在 scan handler (rebuild_tgt_scan_handler) 中设置本地 HLC 时间戳，作为回复
+	//            ro->rso_stable_epoch = d_hlc_get();
+	//
+	//    Step-3: Leader 在 CaRT aggregator 取所有 target 返回值的最大值
+	//            rebuild_tgt_scan_aggregator():
+	//                   if (src->rso_status == 0 &&
+	//                       dst->rso_stable_epoch < src->rso_stable_epoch)
+	//                     dst->rso_stable_epoch = src->rso_stable_epoch;        // 取最大值
+	//
+	//    Step-4: Leader 在 rebuild_scan_broadcast 中取聚合得到的最大值
+	//            rgt->rgt_stable_epoch = rso->rso_stable_epoch;
+	//
+	//    Step-5: Leader 在 rebuild_leader_status_check 中，通过 IV 周期性广播到各 target
+	//            rebuild_leader_status_notify():
+	//                   iv.riv_stable_epoch = rgt->rgt_stable_epoch;
+	//
+	//    Step-6: 各 target 收到 IV refresh 后更新本地
+	//            rebuild_iv_ent_refresh():
+	//                rpt->rt_stable_epoch = dst_iv->riv_stable_epoch;
+	//
+	//  - 为什么取各 target HLC 的最大值？
+	//    确保 stable_epoch 大于所有 target 在 scan 启动时刻的 HLC，
+	//    这样所有 target 在该时间点之前已经提交的数据都会被扫描到。
+	//
+	//  - rgt_stable_epoch / rt_stable_epoch 如何使用？
+	//    误解：各 target 只扫描 stable_epoch 之前写入的数据，然后告诉 pull data 方 (即需要重建数据的 target) 列表，
+	//          这样 pull data 方就只能 pull 到 stable_epoch 之前的数据；
+	//    实际：
+	//        - 各 target 的 scan 阶段不依赖 stable_epoch（待确认，涉及到 分布式mvcc epoch/epoch_bound）：
+	//          见 rebuild_container_scan_cb -> dtx_begin；虽然 epoch 使用了 rpt->rt_stable_epoch，但
+	//              - 此时可能还未设置（并发、未执行到 Step-6）
+	//              - 即使已经设置，scan 也未使用；遍历范围由 param.ip_epr = [0, DAOS_EPOCH_MAX] 控制，不受 dtx_begin 的 epoch 影响；
+	//          应该这么理解：epoch.oe_value = rpt->rt_stable_epoch 是给这个扫描 DTX 打上时间戳标记，不控制数据遍历范围
+	//
+	//        - 各 target 发给 pull data 方 object 列表时，使用 rpt->rt_stable_epoch；见
+	//              rebuild_obj_send_cb
+	//              -> ds_object_migrate_send(..., max_eph = rpt->rt_stable_epoch, ...)
+	//              -> 发送 RPC DAOS_OBJ_RPC_MIGRATE (migrate_in->om_max_eph = max_eph)
+	//
+	//        - pull data 方 (即需要重建数据的 target):  收到 RPC DAOS_OBJ_RPC_MIGRATE，处理:
+	//              ds_obj_migrate_handler
+	//              -> ds_migrate_object(..., max_eph = migrate_in->om_max_eph, ...)
+	//              -> migrate_pool_tls_lookup_create(..., max_eph = max_eph, ...)
+	//              -> migrate_pool_tls_create_one(struct migrate_pool_tls_create_arg* data{max_eph=max_eph})
+	//                    存储在 TLS struct migrate_pool_tls 字段 mpt_max_eph 中；
+	//          最终使用：
+	//              1. migrate_obj_ult()
+	//                 epr.epr_hi = tls->mpt_max_eph — fetch 数据的 epoch 上界
+	//              2. migrate_punch()
+	//                 过滤 dkey/akey/record punch：只迁移 ≤ mpt_max_eph 的 punch
 	uint64_t	rgt_stable_epoch;
 
 	/* reclaim epoch of the rebuild, which is used to discard
@@ -173,6 +250,15 @@ struct rebuild_status_completed {
 };
 
 /* Structure on all targets to track all pool rebuilding */
+//Yuanguo:
+//  注意有两种跟踪信息：
+//      - rgt (struct rebuild_global_pool_tracker 类型) ：只有 pool service leader 维护，跟踪 rebuild 全局状态，
+//        挂在 rebuild_gst.rg_global_tracker_list 链表上（它是 daos_engine 级别的全局链表）
+//      - rpt (struct rebuild_tgt_pool_tracker 类型)    ：每个 rank 都维护，跟踪当前 engine 上的 rebuild 状态，
+//        挂在 rebuild_gst.rg_tgt_tracker_list 链表上（它是 daos_engine 级别的全局链表）
+//  此外 leader 还是维护rebuild task (struct rebuild_task)
+//      - 运行中task：挂在 rebuild_gst.rg_running_list 链表上
+//      - 排队中task：挂在 rebuild_gst.rg_queue_list 链表上
 struct rebuild_global {
 	/* Link rebuild_tgt_pool_tracker on all targets.
 	 * Can be inserted/deleted by system XS, be lookup by system XS or VOS target main XS.
@@ -180,12 +266,20 @@ struct rebuild_global {
 	 * system XS takes wrlock to insert/delete, VOS TGT XS takes rdlock to lookup,
 	 * no lock needed for system XS to lookup.
 	 */
+	//Yuanguo: daos_engine 级别的全局链表
+	//         SYS xstream (xs_id=0)：
+	//             - 插入、删除：需加 write-lock;
+	//             - 查找：无需加锁，因为没有其它线程(xstream)会并发修改；
+	//         VOS TGT xstream：
+	//             - 只查找：需加 read-lock;
 	d_list_t	rg_tgt_tracker_list;
 
 	/* Linked rebuild_global_pool_tracker on the master node,
 	 * empty on other nodes.
 	 * Only operated by stream 0, no need lock.
 	 */
+	//Yuanguo: daos_engine 级别的全局链表
+	//  仅 SYS xstream (xs_id=0) 操作，无需加锁；
 	d_list_t	rg_global_tracker_list;
 
 	/**
@@ -204,6 +298,7 @@ struct rebuild_global {
 	d_list_t	rg_queue_list;
 
 	/* rwlock to protect rg_tgt_tracker_list */
+	//Yuanguo: 见 rg_tgt_tracker_list 的注释；
 	ABT_rwlock	rg_ttl_rwlock;
 
 	ABT_mutex	rg_lock;
@@ -228,6 +323,14 @@ struct rebuild_task {
 	 */
 	daos_epoch_t			dst_reclaim_eph;
 	uint64_t			dst_schedule_time;
+	//Yuanguo: rebuild 的目标版本；
+	//  rebuild 就是让所有 object 在这个版本的 pool map 下，都放置在正确位置上。
+	//          struct rebuild_tgt_pool_tracker  的 rt_rebuild_ver
+	//          struct rebuild_scan_in 的 rsi_rebuild_ver
+	//          struct rebuild_global_pool_tracker 的 rgt_rebuild_ver
+	//          struct rebuild_task 的 dst_map_ver
+	//          ds_rebuild_schedule 函数的 uint32_t map_ver 参数
+	//  都是这个语义
 	uint32_t			dst_map_ver;
 	uint32_t			dst_new_layout_version;
 	/* Once the task fail, it will use reclaim version to

@@ -814,6 +814,23 @@ rebuild_container_scan_cb(daos_handle_t ih, vos_iter_entry_t *entry,
 		return 0;
 	}
 
+	//Yuanguo:
+	// - coh：用于 VOS 数据遍历
+	// - cont_child：container 在当前 target 上的 VOS 实例，用于状态管理
+	//     - cont_child->sc_dtx_delay_reset — 检查是否需要延迟释放 DTX 资源
+	//     - cont_child->sc_rebuilding = 1  — 通知其他 ULT "该 container 正在 rebuild"
+	//     - cont_child->sc_ec_agg_active   — 等待 EC aggregation 完成
+	//     - 结束后：sc_rebuilding = 0 并 ABT_cond_broadcast(sc_rebuild_cond) — 唤醒其他等待者
+	//     - ds_cont_child_put(cont_child) — 释放引用
+	//
+	//Yuanguo:
+	// - coh 和 cont_child->sc_hdl 其实指向同一个 struct vos_container 实例；
+	// - 这里涉及 2 层存储:
+	//     - 底层（vos_tls->vtl_cont_hhash）：存放 struct vos_container 实例，per-xstream 的 hash table。同一 container 在同一 xstream 上
+	//       只有这里的一个 vos_container 对象，通过 vc_open_count 引用计数共享。
+	//     - 上层（dsm_tls->dt_cont_cache）：一个 cache，里面是 cont_child (struct ds_cont_child) 对象；其字段 sc_hdl（VOS container handle）
+	//       引用底层 vtl_cont_hhash 中的同一个 vos_container 实例
+
 	rc = vos_cont_open(iter_param->ip_hdl, entry->ie_couuid, &coh);
 	if (rc == -DER_NONEXIST) {
 		D_DEBUG(DB_REBUILD, DF_UUID" already destroyed\n", DP_UUID(arg->co_uuid));
@@ -852,6 +869,7 @@ rebuild_container_scan_cb(daos_handle_t ih, vos_iter_entry_t *entry,
 
 	cont_child->sc_rebuilding = 1;
 
+	//Yuanguo: 通过 IV 框架向 PS leader 获取 container snapshot 列表
 	rc = ds_cont_fetch_snaps(rpt->rt_pool->sp_iv_ns, entry->ie_couuid, NULL,
 				 &snapshot_cnt);
 	if (rc) {
@@ -860,6 +878,9 @@ rebuild_container_scan_cb(daos_handle_t ih, vos_iter_entry_t *entry,
 		D_GOTO(close, rc);
 	}
 
+	//Yuanguo: 通过 IV 框架向 PS leader 获取 container 的 properties，
+	//  包括 checksum 配置、EC 参数、冗余因子、压缩/加密设置等属性，
+	//  然后转换为struct cont_props (arg->co_props)
 	rc = ds_cont_get_props(&arg->co_props, rpt->rt_pool->sp_uuid, entry->ie_couuid);
 	if (rc) {
 		D_ERROR("Container "DF_UUID", ds_cont_get_props failed: "DF_RC"\n",
@@ -959,6 +980,31 @@ is_rebuild_scanning_tgt(struct rebuild_tgt_pool_tracker *rpt)
 	return false;
 }
 
+//Yuanguo:
+//  rebuild_scanner - 在单个 target main xstream 上执行的 VOS 扫描函数
+//
+//  调用者：rebuild_scan_leader 通过 ds_pool_thread_collective 分发到各 target main xstream 并行执行
+//  执行环境：target main xstream (I/O xstream)
+//
+//  职责：
+//    1. 检查当前 target 是否需要参与扫描（只有 UPIN/DRAIN 状态的 target 才扫描）
+//    2. 创建一棵内存 B-tree（UUID-Value 类型），用于临时存放扫描发现的待迁移对象
+//    3. 启动 rebuild_objects_send_ult（异步发送 ULT），它会消费 B-tree 中的对象列表并发送给目标节点
+//    4. 遍历本 target 上的所有 VOS container，对每个 container 扫描需要迁移的对象
+//    5. 标记扫描完成，等待发送 ULT 结束
+//
+//  关键数据流：
+//    rebuild_scanner (生产者)                                     rebuild_objects_send_ult (消费者)
+//        │                                                           │
+//        ├─ vos_iterate(VOS_ITER_COUUID)                             │
+//        │   └─ rebuild_container_scan_cb                            │
+//        │       └─ 发现对象 → 插入 tls->rebuild_tree_hdl (B-tree) → ├─ dbtree_iterate(rebuild_tree_hdl)
+//        │                                                           │    └─ 取出对象 → RPC 发送到目标节点
+//        │                                                           │
+//        │                                                           │
+//        ├─ scan 完成: tls->rebuild_pool_scan_done=1                 │
+//        │                                                           ├─ 检测到 scan_done + tree empty → 退出
+//        └─ ABT_thread_free(&ult_send)                               └─ 结束
 int
 rebuild_scanner(void *data)
 {
@@ -977,6 +1023,9 @@ rebuild_scanner(void *data)
 	if (tls == NULL)
 		return 0;
 
+	// Yuanguo: 检查当前 target 是否需要扫描
+	//   只有 UPIN 或 DRAIN 状态的 target 才有数据需要扫描
+	//   DOWN/DOWNOUT/UP/NEW 的 target 跳过（它们要么没数据，要么正在加入）
 	if (!is_rebuild_scanning_tgt(rpt)) {
 		D_DEBUG(DB_REBUILD, DF_UUID" skip scan\n", DP_UUID(rpt->rt_pool_uuid));
 		D_GOTO(out, rc = 0);
@@ -995,6 +1044,16 @@ rebuild_scanner(void *data)
 	/* Create object tree root */
 	memset(&uma, 0, sizeof(uma));
 	uma.uma_id = UMEM_CLASS_VMEM;
+	//Yuanguo: 创建内存 B-tree（key=container UUID, value=该container内需要重建的对象列表）
+	//   用于临时存放扫描到的待迁移对象，作为生产者-消费者之间的缓冲区
+	//
+	//Yuanguo: 关于 DBTREE_CLASS_UV，见 register_dbtree_classes 函数中的
+	//   dbtree_class_register(DBTREE_CLASS_UV, 0, &dbtree_uv_ops);
+	//      成员函数表：dbtree_uv_ops
+	//      feats: 0
+	//   UV = UUID-Value，即
+	//      U = UUID（key 类型是 uuid_t）
+	//      V = Value（任意 value）
 	rc = dbtree_create(DBTREE_CLASS_UV, 0, 4, &uma, NULL,
 			   &tls->rebuild_tree_hdl);
 	if (rc != 0) {
@@ -1002,6 +1061,10 @@ rebuild_scanner(void *data)
 		D_GOTO(out, rc);
 	}
 
+	//Yuanguo:
+	//  - 非 RECLAIM 操作：启动异步发送 ULT; rebuild_objects_send_ult 会持续从 B-tree 取出对象
+	//    并通过 RPC 发送给目标节点，即消费者
+	//  - RECLAIM 操作不需要发送（只是本地回收空间）
 	if (rpt->rt_rebuild_op != RB_OP_RECLAIM && rpt->rt_rebuild_op != RB_OP_FAIL_RECLAIM) {
 		rpt_get(rpt);
 		rc = dss_ult_create(rebuild_objects_send_ult, rpt, DSS_XS_SELF,
@@ -1012,6 +1075,17 @@ rebuild_scanner(void *data)
 		}
 	}
 
+	//Yuanguo:
+	//  查找 ds_pool_child:
+	//      - 它代表一个 pool 在当前 target 上的实例 (replica 或 EC shard)
+	//      - 它的 spc_hdl 是 VOS 句柄，即 VOS pool handle（daos_handle_t）
+	//      - 通过它的 spc_hdl 可以访问该 target 上属于这个 pool 的所有本地数据（containers、objects 等）
+	//        ds_pool_child (spc_hdl = VOS pool handle)
+	//            └── container 0 (本地副本)
+	//            └── container 1 (本地副本)
+	//            └── ...
+	//  后续的 vos_iterate(&param, VOS_ITER_COUUID, ...) 就是用 spc_hdl 遍历这个 VOS pool 下的所有 container。
+	//  VOS 就是一个 pool 的一个 shard （在一个 target 上）；
 	child = ds_pool_child_lookup(rpt->rt_pool_uuid);
 	if (child == NULL)
 		D_GOTO(out, rc = -DER_NONEXIST);
@@ -1021,6 +1095,7 @@ rebuild_scanner(void *data)
 	arg.rpt = rpt;
 	arg.yield_freq = SCAN_YIELD_FREQ;
 	arg.obj_yield_cnt = SCAN_OBJ_YIELD_CNT;
+	//Yuanguo: 真正执行scan
 	rc = vos_iterate(&param, VOS_ITER_COUUID, false, &anchor,
 			 rebuild_container_scan_cb, NULL, &arg, NULL);
 	if (rc < 0)
@@ -1045,6 +1120,13 @@ out:
  * Wait for pool map and setup global status, then spawn scanners for all
  * service xsteams
  */
+//Yuanguo:
+//  本函数不执行 VOS 扫描，而是协调 VOS 扫描（target 的 main xstream，即 io xstream，执行扫描）
+//
+//  注意：
+//    1. 本函数运行在 xs_id=0 的 xstream （SYS xstream）上；
+//    2. 本函数在每个 engine 上都执行，不是只在 PS leader 上。
+//       这个名字中的 "leader" 不是指 Pool Service Leader，而是指：本 engine 上扫描工作的协调者/领导者。
 static void
 rebuild_scan_leader(void *data)
 {
@@ -1058,6 +1140,9 @@ rebuild_scan_leader(void *data)
 		rpt->rt_global_dtx_resync_version, rpt->rt_rebuild_ver);
 
 	/* Wait for dtx resync to finish */
+  //Yuanguo:
+  //   等待所有 engine 的 resync version >= rpt->rt_rebuild_ver
+  //   见 dtx_resync_ult 前的注释
 	while (rpt->rt_global_dtx_resync_version < rpt->rt_rebuild_ver) {
 		if (!rpt->rt_abort && !rpt->rt_finishing) {
 			ABT_mutex_lock(rpt->rt_lock);
@@ -1083,6 +1168,19 @@ rebuild_scan_leader(void *data)
 		D_DEBUG(DB_REBUILD, "rebuild scan collective "DF_UUID" begin.\n",
 			DP_UUID(rpt->rt_pool_uuid));
 
+	//Yuanguo:
+	//  在当前 daos_engine 的所有 target 的 main xstream 上执行 collective 操作 rebuild_scanner；
+	//  排除 PO_COMP_ST_NEW | PO_COMP_ST_DOWN | PO_COMP_ST_DOWNOUT 状态的 target，只在正常（UP/UPIN/DRAIN）状态的 target 上执行。
+	//  _thread_ 表示 使用 ABT_thread (ULT, user level thread) 执行；ULT 有自己的栈，可调用阻塞函数、yield/suspend、嵌套创建 ULT；
+	//  rebuild_scanner 会遍历 VOS 容器、可能 yield 很多次，必须用 ULT；
+	//  且 DSS_ULT_DEEP_STACK 表示需要深栈；
+	//
+	//  注意：
+	//    ds_pool_thread_collective 是同步阻塞的，返回的时候，扫描已经完成，所以下面直接调用 rebuild_scan_done 标记完成。
+	//    这和 rebuild_scanner 可以 yield 并不矛盾：
+	//        - ds_pool_thread_collective 内部用 ABT_future_wait 等待所有 xstream 完成，对调用者来说是同步阻塞的
+	//        - 但各 xstream 上的 rebuild_scanner ULT 内部可以自由 yield（VOS 迭代、让出 CPU 给 IO 等）
+	//        - ABT_future_wait 本身也是 yield 式等待（不占 CPU），所以调用者所在的 xstream 也不会被卡死
 	rc = ds_pool_thread_collective(rpt->rt_pool_uuid, PO_COMP_ST_NEW | PO_COMP_ST_DOWN |
 				       PO_COMP_ST_DOWNOUT, rebuild_scanner, rpt,
 				       DSS_ULT_DEEP_STACK);
@@ -1096,6 +1194,12 @@ rebuild_scan_leader(void *data)
 			DP_UUID(rpt->rt_pool_uuid));
 
 	ABT_mutex_lock(rpt->rt_lock);
+
+	//Yuanguo:
+	//  在当前 daos_engine 的所有 target 的 main xstream 上执行 collective 操作 rebuild_scan_done，标记扫描完成。
+	//  排除 PO_COMP_ST_NEW | PO_COMP_ST_DOWN | PO_COMP_ST_DOWNOUT 状态的 target，只在正常（UP/UPIN/DRAIN）状态的 target 上执行。
+	//  _task_ 表示 使用 ABT_task (tasklet) 执行；
+	//  tasklet 没有自己的栈，不能调用会 yield/suspend 的操作（如 ABT_cond_wait、ABT_mutex_lock 等），必须一口气执行完。
 	rc = ds_pool_task_collective(rpt->rt_pool_uuid, PO_COMP_ST_NEW | PO_COMP_ST_DOWN |
 				     PO_COMP_ST_DOWNOUT, rebuild_scan_done, rpt, 0);
 	ABT_mutex_unlock(rpt->rt_lock);
@@ -1118,6 +1222,25 @@ out:
 }
 
 /* Scan the local target and generate rebuild object list */
+//Yuanguo: 本函数是 SCAN RPC (REBUILD_OBJECTS_SCAN) 的 handler;
+//  - 当 PS leader 调用 rebuild_scan_broadcast() 向 pool 的所有 engine 广播
+//    SCAN 请求时，每个 engine 的 system XS (xs_id=0) 上会调用此函数。
+//  - 此函数本身是一个轻量的启动器,不直接执行 VOS 扫描。它的主要职责是:
+//      - 检查并中止旧的 rebuild (如果 version 增加或 leader 切换)
+//      - 处理重复请求 (幂等性)
+//      - 创建 rpt (rebuild_tgt_pool_tracker) 追踪结构
+//      - 启动两个 ULT 在 system XS 上异步执行真正的扫描工作:
+//          A. rebuild_tgt_status_check_ult: 定期检查 rebuild 状态
+//          B. rebuild_scan_leader: 协调实际的 VOS 扫描 (通过 ds_pool_thread_collective 在所有 main XS 上并行执行 rebuild_scanner)
+//
+//  注意:此函数运行在 xs_id=0 的 xstream （SYS xstream）上,但实际的 VOS 容器遍历和对象迁移/删除通过 ds_pool_thread_collective 分发到每个 main I/O xstream 并行执行。
+//
+//  注意有两种跟踪信息：
+//      - rgt (struct rebuild_global_pool_tracker 类型) ：只有 pool service leader 维护，跟踪 rebuild 全局状态，挂在 rebuild_gst.rg_global_tracker_list 链表上
+//      - rpt (struct rebuild_tgt_pool_tracker 类型)    ：每个 rank 都维护，跟踪当前 engine 上的 rebuild 状态，挂在 rebuild_gst.rg_tgt_tracker_list 链表上
+//  此外 leader 还是维护rebuild task (struct rebuild_task)
+//      - 运行中task：挂在 rebuild_gst.rg_running_list 链表上
+//      - 排队中task：挂在 rebuild_gst.rg_queue_list 链表上
 void
 rebuild_tgt_scan_handler(crt_rpc_t *rpc)
 {
@@ -1139,6 +1262,8 @@ rebuild_tgt_scan_handler(crt_rpc_t *rpc)
 	 * due to adding new failure targets for rebuild, let's abort previous
 	 * rebuild.
 	 */
+	//Yuanguo:
+	//  [pool, op] 相同，但 rebuild_ver 是旧的 -> abort
 	d_list_for_each_entry(rpt, &rebuild_gst.rg_tgt_tracker_list, rt_list) {
 		if (uuid_compare(rpt->rt_pool_uuid, rsi->rsi_pool_uuid) == 0 &&
 		    rpt->rt_rebuild_ver < rsi->rsi_rebuild_ver &&
@@ -1147,6 +1272,8 @@ rebuild_tgt_scan_handler(crt_rpc_t *rpc)
 			       DP_UUID(rpt->rt_pool_uuid), rpt, RB_OP_STR(rpt->rt_rebuild_op),
 			       rpt->rt_rebuild_ver, rpt->rt_leader_term, rpt->rt_rebuild_gen,
 			       rsi->rsi_rebuild_ver, rsi->rsi_leader_term, rsi->rsi_rebuild_gen);
+			//Yuanguo: abort;
+			//  此 rpt 不被复用，如何被销毁的？ rebuild_tgt_status_check_ult --> if (rpt->rt_global_done || rpt->rt_abort) break --> rebuild_tgt_fini
 			rpt->rt_abort = 1;
 			if (rpt->rt_leader_rank != rsi->rsi_master_rank) {
 				D_DEBUG(DB_REBUILD, DF_UUID" master rank"
@@ -1157,6 +1284,28 @@ rebuild_tgt_scan_handler(crt_rpc_t *rpc)
 				/* If this is the old leader, then also stop the rebuild
 				 * tracking ULT.
 				 */
+				//Yuanguo: 清理 leader 维护的两个结构
+				//  - rgt: (挂在 rebuild_gst.rg_global_tracker_list 链表上)
+				//  - task：(挂在 rebuild_gst.rg_queue_list 链表上)；为什么不是挂在 rg_running_list 上？见下面分析；
+				//
+				//Yuanguo: 注意：不是清理旧版本的 rgt/task，而是清理旧 leader 上可能为新 rebuild 创建的残留状态。
+				//  为什么旧 leader 会有 V_new 的 task？场景如下：
+				//      step1. 旧 leader L1 (term=T1) 正在运行 V_old 的 rebuild
+				//      step2. 新故障发生 → L1 更新 pool map 到 V_new，排队了 V_new 的 task
+				//      step3. L1 丢失 leadership
+				//      step4. 新 leader L2 发送 V_new 的 SCAN
+				//  此时 L1 上有：排队中的 V_new task（由步骤 step2 创建），rebuild_leader_stop 销毁它。
+				//
+				// 问：而旧版本 V_old 的 rgt 如何清理？
+				// 答：由于 rebuild_ults 中 pool_is_rebuilding() 保证同一个 pool 同时只有一个 task 在 running，
+				//     V_new task 只是排队未运行（故挂在 rg_queue_list 上，而不是 rg_running_list 上），所以
+				//     V_old 的 rgt 仍在运行中。它的清理路径是：
+				//         - 所有 engine：rpt(V_old) 被设置 rt_abort=1 （就是上面 rpt->rt_abort = 1）
+				//         - 旧 leader L1（现在已不是 leader）：rebuild_leader_status_check 监控循环
+				//           检测 pool map 有比 V_old 更新的故障 (co_fseq > rgt_rebuild_ver)，
+				//           设置 rgt_abort=1, rs_errno=-DER_STALE → break → rebuild_task_ult →
+				//           检测到 myrank != iv_master_rank → goto try_reschedule → out_pool →
+				//           signal(rgt_done_cond) + rgt_put 清理 rgt
 				rebuild_leader_stop(rsi->rsi_pool_uuid, rsi->rsi_rebuild_ver,
 						    -1, rpt->rt_leader_term);
 			}
@@ -1164,8 +1313,14 @@ rebuild_tgt_scan_handler(crt_rpc_t *rpc)
 	}
 
 	/* check if the rebuild with different leader is already started */
+	//Yuanguo:
+	//  [pool, op, rebuild_ver] 都相同
+	//      这是 CORPC 的幂等性保证：如果某个 engine 因为网络重传收到两次相同的 SCAN RPC,
+	//      第二次应该被忽略而不是创建第二个 rpt。
 	rpt = rpt_lookup(rsi->rsi_pool_uuid, -1, rsi->rsi_rebuild_ver, -1);
 	if (rpt != NULL && rpt->rt_rebuild_op == rsi->rsi_rebuild_op) {
+		//Yuanguo: 上一轮 rebuild 已完成但 rpt 还没清理掉。此时新请求进来会冲突,
+		//  返回 BUSY 让发送方稍后重试。
 		if (rpt->rt_global_done) {
 			D_WARN("the previous rebuild "DF_UUID"/%d/"DF_U64"/%p is not cleanup yet\n",
 			       DP_UUID(rsi->rsi_pool_uuid), rsi->rsi_rebuild_ver,
@@ -1181,6 +1336,8 @@ rebuild_tgt_scan_handler(crt_rpc_t *rpc)
 		/* The same PS leader request rebuild with higher rsi_rebuild_gen.
 		 * Is the case of massive failure case, see pool_restart_rebuild_if_rank_wip().
 		 */
+		//Yuanguo: rpt->rt_leader_term == rsi->rsi_leader_term 成立，则 rpt->rt_leader_rank == rsi->rsi_master_rank 一定成立，
+		//  所以，可省略 rank 的比较；
 		if (rpt->rt_leader_rank == rsi->rsi_master_rank &&
 		    rpt->rt_leader_term == rsi->rsi_leader_term &&
 		    rpt->rt_rebuild_gen < rsi->rsi_rebuild_gen) {
@@ -1188,6 +1345,17 @@ rebuild_tgt_scan_handler(crt_rpc_t *rpc)
 			 * it will set rpt->rt_global_done to abort rpt.
 			 * set rt_abort here just for safe.
 			 */
+			//Yuanguo: 这里的 abort 为什么没有从 rebuild_gst.rg_queue_list 以及 rebuild_gst.rg_global_tracker_list 删除？
+			//  因为这里是 target 侧 的清理，不是 leader 侧的。
+			//  leader 侧的 abort 已经由其他路径处理了（leader 未切换，故自己处理）
+			//      CRT_EVT_ALIVE (target 重启)
+			//        → pool_restart_rebuild_if_rank_wip()
+			//        → ds_rebuild_restart_if_rank_wip()        ← 已经在 leader 上设置了 rgt_abort=1
+			//        → rebuild_task_ult 检测到 abort
+			//        → rebuild_task_complete_schedule()        ← 调度新 gen 的 rebuild
+			//        → rebuild_leader_start()                  ← 发送新 gen 的 SCAN RPC
+			//
+			//  此 rpt 不被复用，如何被销毁的？ rebuild_tgt_status_check_ult --> if (rpt->rt_global_done || rpt->rt_abort) break --> rebuild_tgt_fini
 			rpt->rt_abort = 1;
 			D_INFO(DF_RBF ", start new rebuild, gen %d -> %d.\n",
 			       DP_RBF_RPT(rpt), rpt->rt_rebuild_gen, rsi->rsi_rebuild_gen);
@@ -1203,9 +1371,15 @@ rebuild_tgt_scan_handler(crt_rpc_t *rpc)
 		/* Ignore the rebuild trigger request if it comes from
 		 * an old or same leader.
 		 */
+		//Yuanguo: 以下两种情况下，忽略 SCAN 请求
+		//  - 小于：旧 leader 发的过时请求（网络延迟迟到）
+		//  - 等于：同一个 leader 的重复请求（CORPC 重传）；这种情况也暗含了(rpt->rt_leader_rank == rsi->rsi_master_rank 成立)
 		if (rsi->rsi_leader_term <= rpt->rt_leader_term)
 			D_GOTO(out, rc = 0);
 
+		//Yuanguo: leader 切换但版本相同(见上面rpt_lookup) → 更新 leader 信息，复用现有 rpt
+		// 新 leader 接管正在进行的 rebuild；新 leader 的 term/rank 比旧的大；
+		// 更新 rpt 中的 leader 信息，并让本地向新 leader 汇报进度 (re-report)。
 		if (rpt->rt_leader_rank != rsi->rsi_master_rank) {
 			D_DEBUG(DB_REBUILD, DF_UUID" master rank"
 				" %d -> %d term "DF_U64" -> "DF_U64"\n",
@@ -1218,6 +1392,7 @@ rebuild_tgt_scan_handler(crt_rpc_t *rpc)
 			rpt->rt_leader_rank = rsi->rsi_master_rank;
 
 			/* If this is the old leader, then also stop the rebuild tracking ULT. */
+			//Yuanguo: leader 已经切换，故删除旧 leader 上残留的rebuild 全局信息（全局信息由新leader维护）
 			rebuild_leader_stop(rsi->rsi_pool_uuid, rsi->rsi_rebuild_ver,
 					    -1, rpt->rt_leader_term);
 		}
@@ -1226,6 +1401,9 @@ rebuild_tgt_scan_handler(crt_rpc_t *rpc)
 
 		D_GOTO(out, rc = 0);
 	} else if (rpt != NULL) {
+		//Yuanguo:
+		//  [pool, rebuild_ver] 相同，op 不相同；
+		//  例如：rpt 是 RB_OP_REBUILD；新请求 rsi 是 RB_OP_RECLAIM
 		rpt_put(rpt);
 		rpt = NULL;
 	}
@@ -1247,6 +1425,8 @@ tls_lookup:
 		D_GOTO(out, rc);
 
 	rpt_get(rpt);
+	//Yuanguo: rebuild_tgt_status_check_ult 定期检查 rpt 状态；
+	//  运行在 xs_id=0 的 xstream （SYS xstream）上；
 	rc = dss_ult_create(rebuild_tgt_status_check_ult, rpt, DSS_XS_SELF,
 			    0, DSS_DEEP_STACK_SZ, NULL);
 	if (rc) {
@@ -1258,6 +1438,9 @@ tls_lookup:
 
 	rpt_get(rpt);
 	/* step-3: start scan leader */
+	//Yuanguo:
+	//  rebuild_scan_leader 也运行在 xs_id=0 的 xstream （SYS xstream）上；
+	//  但它本身不scan，而是协调 VOS 扫描（target 的 main xstream，即 io xstream，执行扫描）
 	rc = dss_ult_create(rebuild_scan_leader, rpt, DSS_XS_SELF, 0, 0, NULL);
 	if (rc != 0) {
 		rpt_put(rpt);

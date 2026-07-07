@@ -217,6 +217,7 @@ struct pool_buf {
 	struct pool_component	pb_comps[0];
 };
 
+//Yuanguo: sizeof(struct pool_buf) + nr * sizeof(struct pool_component)
 static inline long pool_buf_size(unsigned int nr)
 {
 	return offsetof(struct pool_buf, pb_comps[nr]);

@@ -648,6 +648,7 @@ enum {
  * Check rebuild status on the leader. Every other target sends
  * its own rebuild status by IV.
  */
+//Yuanguo: 等待 rebuild 完成，即轮询 IV，收集各 target 的 rebuild 状态，直到所有 target 都完成或者发生错误。
 static void
 rebuild_leader_status_check(struct ds_pool *pool, uint32_t op,
 			    struct rebuild_global_pool_tracker *rgt)
@@ -926,12 +927,30 @@ rebuild_prepare(struct ds_pool *pool, uint32_t rebuild_ver,
 				continue;
 
 			D_ASSERT(target != NULL);
+			//Yuanguo: target 正在被 extended 或 reintegrated
+			// 时间线：
+			//        Map V=40: tgt1=DOWNOUT, tgt2=UPIN, tgt3=UPIN, tgt4=UPIN (tgt1 的数据在 tgt4 上)
+			//            ↓ 管理员 reintegrate/extend tgt1
+			//        Map V=41: tgt1=UP (co_in_ver=41), tgt2=UPIN, tgt3=UPIN, tgt4=UPIN
+			//
+			// tgt1 处于非稳定状态（PO_COMP_ST_UP，它是在 pool map ver 41 的时候被 reintegrate/extend），
+			// 并且 rebuild 目标 pool map 版本 rebuild_ver >= 41 (co_in_ver)
+			// 确定需要 rebuild（rc=1 并 break）
 			if ((target->ta_comp.co_status == PO_COMP_ST_UP) &&
 			     target->ta_comp.co_in_ver <= rebuild_ver) {
 				rc = 1;
 				break;
 			}
 
+			//Yuanguo: target 被 exclude/drain（故障/exclude、drain）
+			// 时间线：
+			//        Map V=40: tgt1=UPIN, tgt2=UPIN, tgt3=UPIN (正常)
+			//            ↓ tgt1 故障
+			//        Map V=41: tgt1=DOWN (co_fseq=41), tgt2=UPIN, tgt3=UPIN
+			//
+			// tgt1 处于非稳定状态（PO_COMP_ST_DOWN | PO_COMP_ST_DRAIN，它是在 pool map ver 41 的时候被 exclude），
+			// 并且 rebuild 目标 pool map 版本 rebuild_ver >= 41 (co_fseq)
+			// 确定需要 rebuild（rc=1 并 break）
 			if ((target->ta_comp.co_status & (PO_COMP_ST_DOWN | PO_COMP_ST_DRAIN)) &&
 			     target->ta_comp.co_fseq <= rebuild_ver) {
 				rc = 1;
@@ -954,12 +973,26 @@ rebuild_prepare(struct ds_pool *pool, uint32_t rebuild_ver,
 		}
 	}
 
+	//Yuanguo: 不需要 rebuild 的典型场景：
+	//  target 已经在之前的 rebuild 轮次中完成了数据迁移，状态已经稳定（比如已经变成 DOWNOUT）
+
 	return rc;
 }
 
 /* Broadcast objects scan requests to all server targets to start
  * rebuild.
  */
+//Yuanguo: 向 pool 的所有 daos_engine 广播 SCAN 请求（Cart RPC）。注：broadcast 不包含那些 co_in_ver > rgt->rgt_rebuild_ver 的 UP rank，
+//  即本次 rebuild 之后才加入的新节点不参与本轮 scan。
+//
+//  每个 daos_engine 的 RPC handler 是 rebuild_tgt_scan_handler 函数。
+//
+//  注意：
+//    - 不止 RB_OP_REBUILD 需要 scan (scan 要迁移的 objects)
+//    - RB_OP_RECLAIM 需要 scan rebuild 成功之后，要删除的 objects (已经迁移到目的地)
+//    - RB_OP_FAIL_RECLAIM 需要 scan rebuild 失败之后，要删除的 objects (删除已经被迁移的object，以便重新发起 rebuild)
+//
+//  本函数一定运行在 xs_id=0 的 xstream （SYS xstream）上
 static int
 rebuild_scan_broadcast(struct ds_pool *pool, struct rebuild_global_pool_tracker *rgt,
 		       struct pool_target_id_list *tgts_failed, uint32_t layout_version,
@@ -983,6 +1016,7 @@ rebuild_scan_broadcast(struct ds_pool *pool, struct rebuild_global_pool_tracker 
 		int		nr = 0;
 
 		ABT_rwlock_rdlock(pool->sp_lock);
+		//Yuanguo: 搜集 co_status 中包含 bit PO_COMP_ST_UP 的 rank;
 		rc = map_ranks_init(pool->sp_map, PO_COMP_ST_UP, &up_ranks);
 		ABT_rwlock_unlock(pool->sp_lock);
 		if (rc != 0) {
@@ -1004,6 +1038,8 @@ rebuild_scan_broadcast(struct ds_pool *pool, struct rebuild_global_pool_tracker 
 		for (i = 0; i < up_ranks.rl_nr; i++) {
 			struct pool_domain *dom;
 
+			//Yuanguo: 跳过那些 co_in_ver > rgt->rgt_rebuild_ver 的 UP rank，
+			//  即本次 rebuild 之后才加入的新节点不参与本轮 scan。
 			dom = pool_map_find_dom_by_rank(pool->sp_map, up_ranks.rl_ranks[i]);
 			D_ASSERT(dom != NULL);
 			D_DEBUG(DB_REBUILD, "rank %u ver %u rebuild %u\n",
@@ -1335,6 +1371,8 @@ rebuild_try_merge_tgts(struct ds_pool *pool, uint32_t map_ver,
  * 1: rebuild job is started successfully.
  * < 0: failed.
  */
+//Yuanguo: 当前 daos_engine 是 pool service leader，正在发起 rebuild
+//  所以，本函数一定运行在 xs_id=0 的 xstream （SYS xstream）上
 static int
 rebuild_leader_start(struct ds_pool *pool, struct rebuild_task *task,
 		     struct rebuild_global_pool_tracker **p_rgt)
@@ -1344,6 +1382,9 @@ rebuild_leader_start(struct ds_pool *pool, struct rebuild_task *task,
 	uint32_t	generation;
 	int		rc;
 
+	//Yuanguo: 读取当前 pool service Leader 的 leader-term ；
+	//  - leader-term 唯一标识一个 leader，因为发生 leader 切换它就会变，即使当前 leader 再次当选为 leader
+	//  - 所以，leader-term 可以作为 rgt 的标识 (struct rebuild_global_pool_tracker 的 rgt_leader_term 字段)
 	rc = ds_pool_svc_term_get(pool->sp_uuid, &leader_term);
 	if (rc) {
 		D_ERROR("Get pool service term failed: "DF_RC"\n",
@@ -1358,6 +1399,10 @@ rebuild_leader_start(struct ds_pool *pool, struct rebuild_task *task,
 	if (version < task->dst_map_ver)
 		generation = ++pool->sp_rebuild_gen;
 
+	//Yuanguo: 确定是否需要 rebuild
+	//  rc < 0: 出错
+	//  rc = 0: 不需要
+	//  rc > 0：需要，这种情况下，分配并初始化 struct rebuild_global_pool_tracker 实例（**p_rgt）
 	rc = rebuild_prepare(pool, task->dst_map_ver, generation,
 			     leader_term, task->dst_reclaim_eph, &task->dst_tgts,
 			     task->dst_rebuild_op, p_rgt);
@@ -1370,6 +1415,8 @@ rebuild_leader_start(struct ds_pool *pool, struct rebuild_task *task,
 	       RB_OP_STR(task->dst_rebuild_op));
 
 	/* broadcast scan RPC to all targets */
+	//Yuanguo: 向 pool 的所有 daos_engine 广播 SCAN 请求（Cart RPC）
+	//  每个 daos_engine 的 handler 是 rebuild_tgt_scan_handler 函数。
 	rc = rebuild_scan_broadcast(pool, *p_rgt, &task->dst_tgts,
 				    task->dst_new_layout_version, task->dst_rebuild_op);
 	if (rc)
@@ -1549,6 +1596,9 @@ complete:
 	return rc;
 }
 
+//Yuanguo: 启动 rebuild 任务
+// pool service leader 运行此 ULT;
+// 本 ULT 运行在 SYS xstream (xs_id=0) 上；详见 ds_rebuild_schedule 中的 D_ASSERT 及 pool_svc_step_up_cb() 前的注释；
 static void
 rebuild_task_ult(void *arg)
 {
@@ -1562,6 +1612,7 @@ rebuild_task_ult(void *arg)
 
 	cur_ts = daos_gettime_coarse();
 	D_ASSERT(task->dst_schedule_time != (uint64_t)-1);
+	//Yuanguo:  验证 task 的开始时间(schedule time)，若还未到达，则等待；
 	if (cur_ts < task->dst_schedule_time) {
 		D_DEBUG(DB_REBUILD, "rebuild task sleep "DF_U64" second\n",
 			task->dst_schedule_time - cur_ts);
@@ -1575,6 +1626,9 @@ rebuild_task_ult(void *arg)
 		D_GOTO(out_task, rc = -DER_NONEXIST);
 	}
 
+	//Yuanguo: 等待 pool map 分发完成
+	// 在启动 rebuild 之前，必须确保 leader 上的 pool map 已经同步到所有 target。
+	// 否则 target 可能还在使用旧版本的 map，导致错误。
 	while (1) {
 		/* Check if the leader pool map has been synced to all other targets
 		 * to avoid -DER_GRP error.
@@ -1598,6 +1652,7 @@ rebuild_task_ult(void *arg)
 		dss_sleep(1000);
 	}
 
+	//Yuanguo: 获取本 daos_engine 的 rank
 	rc = crt_group_rank(pool->sp_group, &myrank);
 	D_ASSERT(rc == 0);
 	rc = rebuild_notify_ras_start(&task->dst_pool_uuid, task->dst_map_ver,
@@ -1606,8 +1661,19 @@ rebuild_task_ult(void *arg)
 		D_ERROR(DF_UUID": failed to send RAS event\n",
 			DP_UUID(task->dst_pool_uuid));
 
+	//Yuanguo: 启动 rebuild leader 逻辑。
+	//  rebuild_leader_start() 会：
+	//    - 获取 pool service 的 leader term
+	//    - 准备 rebuild_global_pool_tracker (rgt)
+	//    - 广播 scan RPC 到所有 target，触发各 target 开始扫描对象
+	//
+	//  返回值：
+	//    - 0: 不需要 rebuild
+	//    - >0: 成功启动，继续执行
+	//    - <0: 启动失败
 	rc = rebuild_leader_start(pool, task, &rgt);
 	if (rc == 0) {
+		//Yuanguo: 不需要 rebuild，ULT 结束，task 被消费掉。
 		D_PRINT("%s [canceled] (pool "DF_UUID" ver=%u/%u)\n",
 			RB_OP_STR(task->dst_rebuild_op), DP_UUID(task->dst_pool_uuid),
 			task->dst_map_ver, task->dst_reclaim_ver);
@@ -1622,6 +1688,9 @@ rebuild_task_ult(void *arg)
 		if (rc == -DER_NOTLEADER &&
 		    pool->sp_iv_ns->iv_master_rank != (d_rank_t)(-1) &&
 		    pool->sp_iv_ns->iv_master_rank != myrank) {
+			//Yuanguo: 启动失败，本 rank 不是 leader；
+			//  新 leader 会重新启动 rebuild，见 pool_svc_step_up_cb -> ds_rebuild_regenerate_task
+			//  ULT 结束，task 被消费掉。
 			/* If it is not leader, the new leader will step up
 			 * restart rebuild anyway, so do not need reschedule
 			 * rebuild on this node anymore.
@@ -1638,6 +1707,7 @@ rebuild_task_ult(void *arg)
 			D_GOTO(output, rc);
 		}
 
+		//Yuanguo: 启动失败，其它错误；
 		D_PRINT("%s [failed] (pool "DF_UUID" ver=%u status="DF_RC")\n",
 			RB_OP_STR(task->dst_rebuild_op),
 			DP_UUID(task->dst_pool_uuid), task->dst_map_ver,
@@ -1646,16 +1716,19 @@ rebuild_task_ult(void *arg)
 		D_DEBUG(DB_REBUILD, ""DF_UUID" (ver=%u) rebuild failed: "DF_RC"\n",
 			DP_UUID(task->dst_pool_uuid), task->dst_map_ver, DP_RC(rc));
 		if (rgt) {
+			//Yuanguo:  ULT 结束（失败），task 被消费掉。
 			rgt->rgt_abort = 1;
 			rgt->rgt_status.rs_errno = rc;
 			D_GOTO(done, rc);
 		} else {
+			//Yuanguo:  ULT 结束（失败），重新生成一个 task。
 			D_GOTO(try_reschedule, rc);
 		}
 	}
 
 	rc = 0;
 	/* Start leader tracking ULT to wait until rebuild finished */
+	//Yuanguo: 等待 rebuild 完成，rebuild_leader_status_check 轮询 IV，收集各 target 的 rebuild 状态，直到所有 target 都完成或者发生错误。
 	rebuild_leader_status_check(pool, task->dst_rebuild_op, rgt);
 done:
 	D_ASSERT(rgt != NULL);
@@ -1742,6 +1815,11 @@ pool_is_rebuilding(uuid_t pool_uuid)
 }
 
 #define REBUILD_MAX_INFLIGHT	10
+//Yuanguo: rebuild_ults 是本 daos_engine (pool service leader) 上的 "rebuild-scheduler-ULT"，它只做三件事的循环：
+//    - 从 rebuild_gst.rg_queue_list 里挑可执行的任务；
+//    - 为每个任务 dss_ult_create(rebuild_task_ult, task, ...) 起 工作 ULT；
+//    - 把任务移到 rg_running_list，并用 rg_inflight 限制并发。
+// 本ULT 以及 rebuild 工作 ULT 都运行在 SYS xstream (xs_id=0) 上；详见 ds_rebuild_schedule 中的 D_ASSERT 及 pool_svc_step_up_cb() 前的注释；
 static void
 rebuild_ults(void *arg)
 {
@@ -1961,6 +2039,16 @@ rebuild_print_list_update(const uuid_t uuid, const uint32_t map_ver,
  * Add rebuild task to the rebuild list and another ULT will rebuild the
  * pool.
  */
+//Yuanguo:
+// - 本函数运行在 SYS xstream (xs_id=0) 上；详见 本函数中的 D_ASSERT 以及 srv_pool.c : pool_svc_step_up_cb() 前的注释；
+// - 参数 map_ver：目标 map 版本，决定数据的"应该在哪里"。
+//                 也就是，rebuild 的目标版本；rebuild 就是让所有 object 在这个版本的 pool map 下，都放置在正确位置上。
+//   这些变量都是这个语义：
+//       struct rebuild_tgt_pool_tracker  的 rt_rebuild_ver
+//       struct rebuild_scan_in 的 rsi_rebuild_ver
+//       struct rebuild_global_pool_tracker 的 rgt_rebuild_ver
+//       struct rebuild_task 的 dst_map_ver
+//       ds_rebuild_schedule 函数的 uint32_t map_ver 参数
 int
 ds_rebuild_schedule(struct ds_pool *pool, uint32_t map_ver,
 		    daos_epoch_t reclaim_eph, uint32_t layout_version,
@@ -2098,11 +2186,38 @@ regenerate_task_internal(struct ds_pool *pool, struct pool_target *tgts,
 		id_list.pti_number = 1;
 
 		if (tgt->ta_comp.co_status & (PO_COMP_ST_DOWN | PO_COMP_ST_DRAIN)) {
+			//Yuanguo: 对于 PO_COMP_ST_DOWN 或 PO_COMP_ST_DRAIN，参数 map_ver (rebuild 目标 map version) 是 target 的 co_fseq (failure sequence) 
+			//    时间线：
+			//        Map V=40: tgt1=UPIN, tgt2=UPIN, tgt3=UPIN (正常)
+			//            ↓ tgt1 故障
+			//        Map V=41: tgt1=DOWN (co_fseq=41), tgt2=UPIN, tgt3=UPIN
+			//
+			//    Rebuild 需要知道：
+			//        数据在 V=41 之前是如何分布的（tgt1 还是有效 target）
+			//        从 V=41 开始，tgt1 的数据需要迁移到 tgt4（spare target）
+			//        co_fseq 告诉 rebuild：这个 target 在哪个版本失效的。
+			//                              rebuild 就是让所有 object 在这个版本的 pool map 下，都放置在正确位置上。
+			//
+			//    即 co_fseq = target 失效时的 map version = 数据分布发生变化的临界点
 			rc = ds_rebuild_schedule(pool, tgt->ta_comp.co_fseq,
 						 current_eph == 0 ? eph : current_eph,
 						 0, &id_list, RB_OP_REBUILD, delay);
 		} else {
 			D_ASSERT(tgt->ta_comp.co_status == PO_COMP_ST_UP);
+			//Yuanguo: 对于 PO_COMP_ST_UP，参数 map_ver (rebuild 目标 map version) 是 target 的 co_in_ver (target 被 extended 或 reintegrated 的版本) 
+			//    时间线：
+			//        Map V=40: tgt1=DOWNOUT, tgt2=UPIN, tgt3=UPIN, tgt4=UPIN (tgt1 的数据在 tgt4 上)
+			//            ↓ 管理员 reintegrate/extend tgt1
+			//        Map V=41: tgt1=UP (co_in_ver=41), tgt2=UPIN, tgt3=UPIN, tgt4=UPIN
+			//
+			//    Rebuild 需要知道：
+			//        tgt1 在 V=41 时重新加入
+			//        需要把 tgt4 上的数据迁移回 tgt1
+			//        数据分布应该恢复到 V=41 之前的状态（tgt1 作为有效 target）
+			//        co_in_ver 告诉 rebuild：这个 target 在哪个版本重新加入的
+			//                                rebuild 就是让所有 object 在这个版本的 pool map 下，都放置在正确位置上。
+			//
+			//    即 co_in_ver = target 重新加入时的 map version = 数据分布恢复的临界点
 			rc = ds_rebuild_schedule(pool, tgt->ta_comp.co_in_ver,
 						 current_eph == 0 ? eph : current_eph,
 						 0, &id_list, RB_OP_REBUILD, delay);
@@ -2141,6 +2256,10 @@ regenerate_task_of_type(struct ds_pool *pool, pool_comp_state_t match_states, ui
 
 
 /* Regenerate the rebuild tasks when changing the leader. */
+//Yuanguo:
+//  PS leader 上任时, 扫描当前 pool map 中所有 不稳定状态（PO_COMP_ST_DOWN | PO_COMP_ST_DRAIN | PO_COMP_ST_UP）的 target；若存在，按现状重新生成 rebuild 任务。
+//  这是 rebuild 跨 leader 切换的关键 —— 即使原 leader 死前 rebuild 队列丢了,新 leader 也会重建。
+//  注意：不包含稳定状态（PO_COMP_ST_UPIN | PO_COMP_ST_DOWNOUT ）的 target
 int
 ds_rebuild_regenerate_task(struct ds_pool *pool, daos_prop_t *prop)
 {

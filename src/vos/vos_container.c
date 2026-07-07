@@ -388,7 +388,7 @@ vos_cont_open(daos_handle_t poh, uuid_t co_uuid, daos_handle_t *coh)
 	 * Check if handle exists
 	 * then return the handle immediately
 	 */
-	//Yuanguo: 只被打开一次，即对一个vos pool，只创建一个struct vos_container，通过引用计数共享；
+	//Yuanguo: 只被打开一次，即对一个vos pool 的 一个 container UUID，只创建一个struct vos_container，通过引用计数共享；
 	rc = cont_lookup(&ukey, &pkey, &cont, pool->vp_sysdb);
 	if (rc == 0) {
 		cont->vc_open_count++;
@@ -399,8 +399,15 @@ vos_cont_open(daos_handle_t poh, uuid_t co_uuid, daos_handle_t *coh)
 		D_GOTO(exit, rc);
 	}
 
-	//Yuanguo: 查找成功之后，回调cont_df_rec_fetch()函数，设置args->ca_cont_df，指向struct vos_cont_df对象，
-	//  就是查找的目标；
+	//Yuanguo: cont_lookup 在 (TLS) struct vos_tls 的 vtl_cont_hhash 中未找到；
+	//下面是创建过程......
+
+	//Yuanguo:
+	//  先看 struct vos_pool 的 vp_cont_th 的注释；注意到 vp_cont_th class 是 VOS_BTR_CONT_TABLE，成员函数表是 vct_ops；
+	//  所以，这里：
+	//  - 在 vpool (即vos, pool replica/shard) 的 container btree (即 vp_cont_th) 中查找 container co_uuid 对应的 btr_record，
+	//    这个 btr_record 指向 SCM 上的 struct vos_cont_df对象；
+	//  - 找到后，回调 vct_ops.to_rec_fetch，即 cont_df_rec_fetch 函数，设置args->ca_cont_df，指向找到的 struct vos_cont_df对象（转成内存指针）；
 	rc = cont_df_lookup(pool, &ukey, &args);
 	if (rc) {
 		D_DEBUG(DB_TRACE, DF_UUID" container does not exist\n",

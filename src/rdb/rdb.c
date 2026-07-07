@@ -599,6 +599,10 @@ err:
  * \param[in]	storage	database storage
  * \param[out]	dbp	database
  */
+//Yuanguo:
+//  - 若当前 daos_engine 是某个/某些 pool 的 pool service 成员时，执行本函数启动 replicated db (raft backed db)
+//  - 本函数的调用路径：ds_rsvc_start() -> start() -> rdb_start()
+//  - rdb_start 一定在 xs_id=0 的 xstream （SYS xstream）上；见 ds_rsvc_start() 内的 assert；
 int
 rdb_start(struct rdb_storage *storage, struct rdb **dbp)
 {

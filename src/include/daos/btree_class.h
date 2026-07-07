@@ -34,6 +34,10 @@ int dbtree_nv_destroy_tree(daos_handle_t tree, const void *key,
 int dbtree_nv_destroy(daos_handle_t tree, const void *key, size_t key_size);
 
 /* uuid_t-value: unordered keys */
+// Yuanguo: UV = UUID-Value，即
+//    U = UUID（key 类型是 uuid_t）
+//    V = Value（任意 value）
+// 这是一个以 UUID 为 key、任意数据为 value 的无序 (unordered) B-tree 类型。对应的 API 也印证了这一点：
 #define DBTREE_CLASS_UV (DBTREE_DSM_BEGIN + 1)
 extern btr_ops_t dbtree_uv_ops;
 int dbtree_uv_update(daos_handle_t tree, const uuid_t uuid, const void *value,

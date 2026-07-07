@@ -359,6 +359,12 @@ ds_rsvc_lookup_leader(enum ds_rsvc_class_id class, d_iov_t *id,
 	rc = ds_rsvc_lookup(class, id, &svc);
 	if (rc != 0)
 		return rc;
+	//Yuanguo:
+	//   只有 raft leader，这里 up(srv) 才为 true. 见
+	//       - rsvc_step_up_cb   ：change_state(svc, DS_RSVC_UP);
+	//       - rsvc_step_down_cb : change_state(svc, DS_RSVC_DOWN);
+	//   也就是说，本函数返回成功 (0)，即告知调用者“当前 daos_engine 是给定 pool 的 service leader”
+	//   否则，返回 -DER_NOTLEADER，且通过 hint 返回当前leader (非this daos_engine)
 	if (!up(svc)) {
 		if (hint != NULL)
 			ds_rsvc_set_hint(svc, hint);
@@ -735,6 +741,8 @@ self_only(d_rank_list_t *replicas)
 		replicas->rl_ranks[0] == dss_self_rank());
 }
 
+//Yuanguo: start 一定在 xs_id=0 的 xstream （SYS xstream）上；
+//  见 ds_rsvc_start() 内的 assert；
 static int
 start(enum ds_rsvc_class_id class, d_iov_t *id, uuid_t db_uuid, uint64_t term,
       enum ds_rsvc_start_mode mode, size_t size, uint32_t vos_df_version, d_rank_list_t *replicas,
@@ -892,6 +900,11 @@ ds_rsvc_stop_nodb(enum ds_rsvc_class_id class, d_iov_t *id)
  * \retval -DER_CANCELED	replicated service stopping
  * \retval -DER_STALE		stale \a caller_term
  */
+//Yuanguo:
+//  - 若当前 daos_engine 是某个/某些 pool 的 pool service 成员时，执行本函数启动 pool service
+//      - pool 新建时（mode=DS_RSVC_CREATE）：见 ds_rsvc_start_handler()
+//      - 当前 daos_engine 重启时（mode=DS_RSVC_START）：ds_pool_start_all → ds_pool_svc_start → ds_rsvc_start()
+//  - 本函数一定在 xs_id=0 的 xstream （SYS xstream）上；见函数中的 D_ASSERT；
 int
 ds_rsvc_start(enum ds_rsvc_class_id class, d_iov_t *id, uuid_t db_uuid, uint64_t caller_term,
 	      enum ds_rsvc_start_mode mode, size_t size, uint32_t vos_df_version,
@@ -1274,6 +1287,14 @@ out:
 	return rc;
 }
 
+//Yuanguo:
+//  - 本函数是 RSVC_START RPC 的 handler；
+//  - 新建 Pool 时，本 daos_engine 被选作 pool service (Raft) 成员，PS Leader 广播 RPC 到本节点，
+//    触发本函数，在本 daos_engine 上创建并启动 pool service 的 Raft 实例。
+//  - 本 engine 重启时，依然是那个 pool 的 pool service 成员，但 pool service 启动不经过本函数，而是通过
+//       ds_pool_start_all → ds_pool_svc_start → ds_rsvc_start() 直接调用。
+//  - 本函数一定在 xs_id=0 的 xstream（SYS xstream）上执行；
+//    见 ds_rsvc_start 中的 D_ASSERT(dss_get_module_info()->dmi_xs_id == 0)；
 static void
 ds_rsvc_start_handler(crt_rpc_t *rpc)
 {

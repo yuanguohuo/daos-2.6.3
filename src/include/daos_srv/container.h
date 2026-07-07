@@ -50,6 +50,17 @@ int ds_cont_tgt_open(uuid_t pool_uuid, uuid_t cont_hdl_uuid,
  * handle. N.B. sc_uuid and sc_pool_uuid must be contiguous in memory,
  * used as a 256 bit key in tls dt_cont_cache.
  */
+//Yuanguo: 这里的 per-thread 同样是 per-target 的意思。
+//  ds_cont_child 缓存在每个 target 的 main xstream 的 TLS (dsm_tls->dt_cont_cache) 中，逻辑与 ds_pool_child 完全一致：
+//      - 每个 target 的 main xstream 有自己独立的 dt_cont_cache
+//      - 同一个 container 在同一个 engine 的 N 个 target 上有 N 个 ds_cont_child 实例
+//      - per-thread = per-target
+//
+//Yuanguo:
+//  ds_cont_child 是一个 container 在单个 target 上的本地实例（即 container 的一个 shard/replica），层级关系：
+//      ds_pool          ← pool 全局元数据（pool map、IV namespace 等）
+//      └── ds_pool_child    ← pool 在当前 target 上的 VOS 实例 (spc_hdl = VOS pool handle)
+//          └── ds_cont_child    ← container 在当前 target 上的 VOS 实例 (sc_hdl = VOS container handle)
 struct ds_cont_child {
 	struct daos_llink	 sc_list;
 	daos_handle_t		 sc_hdl;	/* vos_container handle */

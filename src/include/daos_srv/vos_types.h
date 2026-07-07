@@ -420,6 +420,12 @@ typedef struct {
 	/** pool connection handle or container open handle,
 	 *  for vos_iterate_key(), it's used for passing dkey or akey tree open handle.
 	 */
+	//Yuanguo:
+	//  ip_hdl 是 VOS 句柄，即 VOS pool handle（daos_handle_t）
+	//  通过它可以访问该 target 上属于这个 pool 的所有本地数据（containers、objects 等）
+	//    - container 0 (本地副本)
+	//    - container 1 (本地副本)
+	//    - ...
 	daos_handle_t		ip_hdl;
 	/** standalone prepare:	DAOS_HDL_INVAL
 	 *  nested prepare:	parent iterator handle

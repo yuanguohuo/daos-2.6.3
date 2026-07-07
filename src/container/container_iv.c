@@ -842,6 +842,15 @@ cont_iv_snapshot_invalidate(void *ns, uuid_t cont_uuid, unsigned int shortcut,
 	return rc;
 }
 
+//Yuanguo: 获取 container snapshots 列表；
+//  - 分配 cont_iv_entry 缓冲区（初始大小容纳 INIT_SNAP_CNT 个 snapshot）
+//  - 调用 cont_iv_fetch(ns, IV_CONT_SNAP, cont_uuid, ...), 通过 IV 框架向 PS leader 获取 snapshot 列表
+//  - 如果返回 snap_cnt == (uint64_t)(-1)：说明 buffer 太小，server 返回了实际需要的大小，retry 用更大 buffer
+//  - 成功后：将 snapshot 数组拷贝到 *snapshots，设置 *snap_count
+//注意：
+//  - SYS xstream：直接调用本函数；
+//  - 其它 xstream：调用 cont_iv_snapshot_fetch_non_sys，委托 SYS xstream 获取，因为 IV 操作必须在 SYS xstream 上执行；
+//见 ds_cont_fetch_snaps 函数，区分这两者；
 int
 cont_iv_snapshots_fetch(void *ns, uuid_t cont_uuid, uint64_t **snapshots,
 			int *snap_count)
@@ -1581,6 +1590,10 @@ cont_iv_snapshot_fetch_ult(void *data)
 	ABT_eventual_set(arg->eventual, (void *)&rc, sizeof(rc));
 }
 
+//Yuanguo: 获取 container snapshots 列表
+//  - SYS xstream：不调用本函数，而是调用 cont_iv_snapshots_fetch，直接通过 IV 框架向 PS leader 获取；
+//  - 其它 xstream：调用本函数，委托 SYS xstream 获取，因为 IV 操作必须在 SYS xstream 上执行；
+//见 ds_cont_fetch_snaps 函数，区分这两者；
 int
 cont_iv_snapshot_fetch_non_sys(struct ds_iv_ns *ns, uuid_t cont_uuid,
 			       uint64_t **snapshots, int *snapshot_cnt)
@@ -1624,6 +1637,7 @@ out:
 /*
  * exported APIs
  */
+//Yuanguo: 通过 IV 框架向 PS leader 获取 container snapshot 列表
 int
 ds_cont_fetch_snaps(struct ds_iv_ns *ns, uuid_t cont_uuid,
 		    uint64_t **snapshots, int *snapshot_count)
