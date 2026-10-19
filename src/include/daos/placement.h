@@ -87,7 +87,7 @@ struct pl_obj_shard {
 //   ol_grp_nr (nr_grps) = 22   因为 72/3 = 24，预留2个group，所以是22；
 //   ol_grp_size         = 3    因为3副本；
 //   ol_nr      = 3 * 22 = 66   表示object最多占用66个target (预留的2个group有6个target)
-//   ol_shards 存储66个target信息 (这里target也叫shard)
+//   ol_shards 动态数组，元素个数是 ol_nr；存储66个target信息 (这里target也叫shard)
 //
 //   注：1个dkey占用3个target；但1个object有多个dkey，所以会占用很多target;
 //

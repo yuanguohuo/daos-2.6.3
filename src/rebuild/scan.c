@@ -669,6 +669,7 @@ rebuild_obj_scan_cb(daos_handle_t ch, vos_iter_entry_t *ent,
 	unsigned int			*tgts = NULL;
 	unsigned int			*shards = NULL;
 	struct daos_oclass_attr		*oc_attr;
+	//Yuanguo: 每个冗余组的 shard 数（如 3 副本=3）
 	uint32_t			grp_size;
 	int				rebuild_nr = 0;
 	d_rank_t			myrank;
@@ -709,6 +710,9 @@ rebuild_obj_scan_cb(daos_handle_t ch, vos_iter_entry_t *ent,
 	shards = shard_array;
 	switch (rpt->rt_rebuild_op) {
 	case RB_OP_REBUILD:
+		//Yuanguo: out-param shards 和 tgts 是：当前 obj 的需要 remap 的 shards，在 rebuild 完成之后，对应的 targets (即迁移目的targets)
+		//  返回的 rc 是这两个数组的size；
+		//  见 jump_map_obj_find_diff 函数中的注释；
 		rc = find_rebuild_shards(map, arg->co_props.dcp_obj_version, &md,
 					 rpt->rt_tgts_num, rpt->rt_rebuild_op,
 					 rpt->rt_rebuild_ver, myrank,
@@ -754,6 +758,36 @@ rebuild_obj_scan_cb(daos_handle_t ch, vos_iter_entry_t *ent,
 			ent->ie_vis_flags & VOS_VIS_FLAG_COVERED ? "no" : "yes");
 
 		/* Ignore the shard if it is not in the same group of failure shard */
+		//Yuanguo: oid.id_shard 是 obj 在 当前 target 上的 shard idx (layout 中的全局逻辑索引)；
+		//
+		// 假设 grp_size = 3，且obj 的 layout 如下：
+		//          shard idx   tgt id
+		//           [0]          18  (Group 0, Replica 0)
+		//           [1]          25  (Group 0, Replica 1)
+		//           [2]          70  (Group 0, Replica 2)
+		//
+		//           [3]          22  (Group 1, Replica 0)
+		//           [4]          43  (Group 1, Replica 1)  <--- this target is 43
+		//           [5]          33  (Group 1, Replica 2)
+		//
+		//           ...
+		//
+		//           [63]         12  (Group 21, Replica 0)
+		//           [64]         41  (Group 21, Replica 1)
+		//           [65]         38  (Group 21, Replica 2)
+		//
+		// 当前 target = 43，oid.id_shard = 4，4 / 3 = 1，即当前 target 属于 Group 1 (对于我们讨论的 obj 而言)。
+		//
+		// shards[i] 与 tgts[i] 是一对：shard-shards[i] 需要被重建到 target-tgts[i]
+		//   - shards[i]：需要重建的 shard 的全局逻辑索引，上表中的 shard idx
+		//   - tgts[i]  ：该 shard 重建后要落到的目标 target (即拉取数据来重建的一方)，上表中的 tgt id
+		//
+		// 同组判定：当前 target 持有 obj 的 Group 1 的一个副本(shard 4)
+		//   - 若 shards[i] = 63：63 / 3 = 21，属于 Group 21，与当前 Group 1 无关 → continue 跳过
+		//   - 若 shards[i] = 5 ：5  / 3 = 1， 属于 Group 1， 与当前同组 → 不跳过，当前 target(持 shard 4) 为 shard 5 的重建提供数据源
+		//
+		// 对于一个 obj，同组的 shard 是同一份数据的不同副本，所以只有当 shards[i] 也属于 Group 1 时，本地才有可用作数据源的副本；
+		// 否则与己无关，跳过。
 		if ((int)tgts[i] == -1 || oid.id_shard / grp_size != shards[i] / grp_size) {
 			D_DEBUG(DB_REBUILD, "i %d stale object "DF_UOID" shards %u grp_size %u tgt %d\n",
 				i, DP_UOID(oid), shards[i], grp_size, (int)tgts[i]);
@@ -869,7 +903,7 @@ rebuild_container_scan_cb(daos_handle_t ih, vos_iter_entry_t *entry,
 
 	cont_child->sc_rebuilding = 1;
 
-	//Yuanguo: 通过 IV 框架向 PS leader 获取 container snapshot 列表
+	//Yuanguo: 通过 IV 框架向 PS leader 获取 container snapshot 数量 (不需要 snapshot 列表)
 	rc = ds_cont_fetch_snaps(rpt->rt_pool->sp_iv_ns, entry->ie_couuid, NULL,
 				 &snapshot_cnt);
 	if (rc) {
@@ -908,6 +942,10 @@ rebuild_container_scan_cb(daos_handle_t ih, vos_iter_entry_t *entry,
 		}
 	}
 
+	//Yuanguo: epoch 这里的赋值，一点用的没有！见 dtx_begin() -> dtx_handle_init()
+	//		if (daos_is_zero_dti(dti))
+	//			return 0;
+	//  其它地方，也没使用 epoch （除了打印日志）
 	epoch.oe_value = rpt->rt_stable_epoch;
 	rc = dtx_begin(coh, &dti, &epoch, 0, rpt->rt_rebuild_ver,
 		       &oid, NULL, 0, DTX_IGNORE_UNCOMMITTED, NULL, &dth);
@@ -1223,8 +1261,8 @@ out:
 
 /* Scan the local target and generate rebuild object list */
 //Yuanguo: 本函数是 SCAN RPC (REBUILD_OBJECTS_SCAN) 的 handler;
-//  - 当 PS leader 调用 rebuild_scan_broadcast() 向 pool 的所有 engine 广播
-//    SCAN 请求时，每个 engine 的 system XS (xs_id=0) 上会调用此函数。
+//  - 当 PS leader 调用 rebuild_scan_broadcast() 向 pool 的所有 engine 广播 SCAN 请求时，
+//    每个成员 engine 的 system XS (xs_id=0) 收到请求，调用此函数(rebuild_tgt_scan_handler)来处理；
 //  - 此函数本身是一个轻量的启动器,不直接执行 VOS 扫描。它的主要职责是:
 //      - 检查并中止旧的 rebuild (如果 version 增加或 leader 切换)
 //      - 处理重复请求 (幂等性)

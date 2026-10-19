@@ -1099,6 +1099,9 @@ obj_shard_tgts_query(struct dc_object *obj, uint32_t map_ver, uint32_t shard,
 	shard_tgt->st_shard	= shard;
 	shard_tgt->st_shard_id	= obj_shard->do_id.id_shard;
 	shard_tgt->st_tgt_idx	= obj_shard->do_target_idx;
+	//Yuanguo: 启用 delay 机制:
+	//      有条件操作 且 target 正在 rebuild/reintegrate
+	//  关于 delay：见 dtx_leader_exec_ops() 函数中的注释。
 	if (obj_auxi->cond_modify && (obj_shard->do_rebuilding || obj_shard->do_reintegrating))
 		shard_tgt->st_flags |= DTF_DELAY_FORWARD;
 	if (obj_shard->do_reintegrating)

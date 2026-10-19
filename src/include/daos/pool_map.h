@@ -68,6 +68,9 @@ enum pool_component_flags {
 	 * If the target status is UP, then it indicates the UP status is
 	 * from DOWN directly, instead of NEW and DOWNOUT.
 	 */
+	//Yuanguo:
+	//  状态链: PO_COMP_ST_UPIN --> PO_COMP_ST_DOWN(不稳定) ----跳过DOWNOUT----> PO_COMP_ST_UP(不稳定) --> PO_COMP_ST_UPIN(稳定状态)
+	//  见 jump_map_obj_find_diff 函数中的注释；
 	PO_COMPF_DOWN2UP	= (1 << 1),
 	/**
 	 * The component has been processed by DAOS check, only in DRAM.

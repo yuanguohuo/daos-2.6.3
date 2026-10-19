@@ -82,8 +82,7 @@ struct vos_io_context {
 	//  含多个record extents;
 	//  每个record extents是一个action;
 	//  假设总共有total_acts个record extents(即total_acts个action)，下面：
-	//      - ic_rsrvd_scm (从PMEM/BMEM分配) : struct umem_rsrvd_act结构体后面跟total_acts个struct pobj_action
-	//                                         或struct dav_action对象；
+	//      - ic_rsrvd_scm (从PMEM/BMEM分配) : struct umem_rsrvd_act结构体后面跟total_acts个struct pobj_action/dav_action对象；
 	//      - ic_umoffs    (从DRAM中分配)    : total_acts个元素的数组；
 	//  见vos_io.c : vos_ioc_create() --> vos_ioc_reserve_init()函数；
 

@@ -1348,6 +1348,12 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 		      struct dcs_iod_csums *iod_csums, uint64_t *offs, uint8_t *skips,
 		      uint32_t iods_nr, struct dtx_handle *dth)
 {
+	//Yuanguo:
+	//  - orw/orwo: 分别是 RPC 的输入与输出
+	//  - tag: 当前 target 的 id；Cart 中的 tag 字段，对应 daos target id
+	//  - ioh: 本地 vos 的 IO-handle，将在 vos_update_begin() 时生成
+	//  - biod: BIO(NVMe) I/O 描述符
+	//  - rma: true - 走 bulk RMA（若客户端带了 bulk handle 描述符）；false - 内嵌 sgl 直接拷贝；
 	struct obj_rw_in		*orw = crt_req_get(rpc);
 	struct obj_rw_out		*orwo = crt_reply_get(rpc);
 	uint32_t			tag = dss_get_module_info()->dmi_tgt_id;
@@ -1362,6 +1368,7 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 	bool				iod_converted = false;
 	struct daos_recx_ep_list	*recov_lists = NULL;
 	uint64_t			 cond_flags;
+	//Yuanguo: sched_seq 是调度序号，检测中途是否发生过 yield
 	uint64_t			 sched_seq = sched_cur_seq();
 	daos_iod_t			*iods_dup = NULL; /* for EC deg fetch */
 	bool				 get_parity_list = false;
@@ -1379,6 +1386,9 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 		D_GOTO(out, rc = 0);
 	}
 
+	//Yuanguo:
+	//  校验 dkey/akey 的 checksum（防网络篡改）
+	//  失败直接 return（不进 out 清理路径，因为此时 ioh/biod 都还没创建，无需清理）
 	rc = csum_verify_keys(ioc->ioc_coc->sc_csummer, &orw->orw_dkey,
 			      orw->orw_dkey_csum, &orw->orw_iod_array,
 			      &orw->orw_oid);
@@ -1397,6 +1407,7 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 		opc_get(rpc->cr_opc), DP_UOID(orw->orw_oid), DP_KEY(dkey),
 		tag, orw->orw_epoch, orw->orw_flags);
 
+	//Yuanguo: 判断是否 RMA 模式：客户端带了 bulk handle 描述符
 	rma = (orw->orw_bulks.ca_arrays != NULL ||
 	       orw->orw_bulks.ca_count != 0);
 	cond_flags = orw->orw_api_flags;
@@ -1417,6 +1428,7 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 				    orw->orw_sgls.ca_count);
 		}
 
+		//Yuanguo: 若容器开了 dedup，则加 VOS_OF_DEDUP(_VERIFY) 标志
 		if (rma && ioc->ioc_coc->sc_props.dcp_dedup_enabled) {
 			cond_flags |= VOS_OF_DEDUP;
 			if (ioc->ioc_coc->sc_props.dcp_dedup_verify)
@@ -1426,6 +1438,7 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 		if (orw->orw_flags & ORF_EC)
 			cond_flags |= VOS_OF_EC;
 
+		//Yuanguo: obj/dkey/akey B-tree 查找或创建、MVCC 冲突检查、DTX 登记、分配 NVMe 地址。
 		rc = vos_update_begin(ioc->ioc_vos_coh, orw->orw_oid,
 			      orw->orw_epoch, cond_flags, dkey,
 			      iods_nr, iods, iod_csums,
@@ -1446,6 +1459,7 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 		bulk_op = CRT_BULK_PUT;
 		if (orw->orw_flags & ORF_CHECK_EXISTENCE)
 			fetch_flags = VOS_OF_FETCH_CHECK_EXISTENCE;
+		//Yuanguo: 既非 RMA 也没带 sgl --> 先只拿 size（客户端之后再正式读）
 		if (!rma && orw->orw_sgls.ca_arrays == NULL) {
 			spec_fetch = true;
 			if (!(orw->orw_flags & ORF_CHECK_EXISTENCE))
@@ -1460,6 +1474,7 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 		if (ec_recov) {
 			D_ASSERT(obj_ec_tgt_nr(&ioc->ioc_oca) > 0);
 			is_parity_shard = is_ec_parity_shard_by_tgt_off(tgt_off, &ioc->ioc_oca);
+			//Yuanguo: EC 恢复读且本 shard 是校验块：需要返回 parity 区间列表
 			get_parity_list = ec_recov && is_parity_shard &&
 					  ((orw->orw_flags & ORF_EC_RECOV_SNAP) == 0);
 		}
@@ -1610,7 +1625,7 @@ obj_local_rw_internal(crt_rpc_t *rpc, struct obj_io_context *ioc, daos_iod_t *io
 	biod = vos_ioh2desc(ioh);
 	//Yuanguo:
 	//  - 对于update : 准备DMA buffer
-	//  - 对于fetch  : 准备DMA buffer,发起DMA请求, 并等待完成
+	//  - 对于fetch  : 准备DMA buffer, 发起DMA请求, 并等待完成
 	rc   = bio_iod_prep(biod, BIO_CHK_TYPE_IO, rma ? rpc->cr_ctx : NULL, CRT_BULK_RW);
 	if (rc) {
 		D_ERROR(DF_UOID " bio_iod_prep failed: " DF_RC "\n", DP_UOID(orw->orw_oid),
@@ -1748,6 +1763,9 @@ out:
 	/* There is CPU yield after DTX start, and the resent RPC may be handled during that.
 	 * Let's check resent again before further process.
 	 */
+	//Yuanguo:
+	//  DTX start 后发生过 CPU yield，期间重发的 RPC 可能已被处理。
+	//  进一步处理前再查一次重发/冲突
 	if (rc == 0 && obj_rpc_is_update(rpc) && sched_cur_seq() != sched_seq) {
 		if (dth->dth_need_validation) {
 			daos_epoch_t	epoch = 0;
@@ -1797,6 +1815,9 @@ out:
 	if (skips != NULL && orwo->orw_rels.ca_arrays != NULL && orw->orw_nr != iods_nr)
 		rc = obj_rw_recx_list_post(orw, orwo, skips, rc);
 
+	//Yuanguo: 收尾核心
+	//  - 对于update : dtx_sub_init + vos_update_end （MVCC 提交、extent/EV-tree 更新、WAL 落盘）
+	//  - 对于fetch  : vos_fetch_end
 	rc = obj_rw_complete(rpc, ioc, ioh, rc, dth);
 	if (rc == 0) {
 		/* Update latency after getting fetch/update IO size by obj_rw_complete */
@@ -2678,6 +2699,9 @@ out:
 	obj_ioc_end(&ioc, rc);
 }
 
+//Yuanguo:
+//  - update 过程中，DTX coordinator/leader 给 participant 发 RPC (CaRT) 请求 DAOS_OBJ_RPC_TGT_UPDATE;
+//  - ds_obj_tgt_update_handler 就是其处理函数；
 void
 ds_obj_tgt_update_handler(crt_rpc_t *rpc)
 {

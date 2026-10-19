@@ -26,27 +26,15 @@ extern "C" {
  * Define the object data redundancy method. Encoded over 8 bits in the object ID.
  * The number of redundancy groups is encoded separately in the object metadata.
  */
-
-//Yuanguo:
-//  daos_obj_id_t::hi
-//     1B        1B           2B                         4B
-//  +--------+--------+-----------------+-----------------------------------+
-//  |  type  | redun  |     nr_grps     | ############ user filled #########|
-//  +--------+--------+-----------------+-----------------------------------+
-//  high-addr                                                        low-addr
-//
 //Yuanguo: object class (class、OC)，类型daos_oclass_id_t，包含2部分：redun和nr_grps，结构是
 //            1B        1B       2B
 //         +-------+-------+---------------+
 //         | redun |   0   |    nr_grps    |
 //         +-------+-------+---------------+
-//
-//  注意：redun只是一个ID，不是"冗余数(redundancy)或者副本数"
-//        例如OC_RP_3GX的redun是OR_RP_3(等于9而不是3)，代表3副本；
-//
 // enum daos_obj_redun比较混乱：
 //   - 开头部分，OR_RP_1 到 OR_RS_16P3，是redun;
-//   - 结尾部分，OC_S1 到 OC_EC_16P3GX，通过宏OBJ_CLASS_DEF定义，是object class (OC)，包含redun和nr_grps；
+//   - 结尾部分，OC_S1 到 OC_EC_16P3GX，通过宏OBJ_CLASS_DEF定义，是object class (OC), 即 daos_oclass_id_t 类型，
+//     包含redun和nr_grps，布局如上面的图所示。
 //   - 中间部分，OC_BACK_COMPAT 到 OC_EC_MAX，没有通过宏OBJ_CLASS_DEF定义，看名字也是object class，但不包含redun和nr_grps；
 enum daos_obj_redun {
 	OC_UNKNOWN = 0,

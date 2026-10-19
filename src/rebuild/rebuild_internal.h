@@ -197,11 +197,9 @@ struct rebuild_global_pool_tracker {
 	//    误解：各 target 只扫描 stable_epoch 之前写入的数据，然后告诉 pull data 方 (即需要重建数据的 target) 列表，
 	//          这样 pull data 方就只能 pull 到 stable_epoch 之前的数据；
 	//    实际：
-	//        - 各 target 的 scan 阶段不依赖 stable_epoch（待确认，涉及到 分布式mvcc epoch/epoch_bound）：
-	//          见 rebuild_container_scan_cb -> dtx_begin；虽然 epoch 使用了 rpt->rt_stable_epoch，但
-	//              - 此时可能还未设置（并发、未执行到 Step-6）
-	//              - 即使已经设置，scan 也未使用；遍历范围由 param.ip_epr = [0, DAOS_EPOCH_MAX] 控制，不受 dtx_begin 的 epoch 影响；
-	//          应该这么理解：epoch.oe_value = rpt->rt_stable_epoch 是给这个扫描 DTX 打上时间戳标记，不控制数据遍历范围
+	//        - 各 target 的 scan 阶段不依赖 stable_epoch；见 rebuild_container_scan_cb 函数中的注释，这个语句完全无用：
+	//            "epoch.oe_value = rpt->rt_stable_epoch"
+	//          何况，即使真访问它，此时可能还未设置（并发、未执行到 Step-6）
 	//
 	//        - 各 target 发给 pull data 方 object 列表时，使用 rpt->rt_stable_epoch；见
 	//              rebuild_obj_send_cb

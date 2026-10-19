@@ -63,6 +63,60 @@ extern "C" {
 #define OID_FMT_META_MASK	(OID_FMT_META_MAX << OID_FMT_META_SHIFT)
 
 /** DAOS object type */
+//Yuanguo:
+//  daos_otype_t，对象类型，被编码进 daos_obj_id_t 的一个字节中；
+//  由两个维度组合而成：KV 层级结构 × key 编码方式。
+//
+//    [多级KV]
+//    DAOS_OT_MULTI_HASHED: 默认类型，多级 KV（dkey+akey），hashed [ad]keys
+//
+//    [特殊用途]
+//    DAOS_OT_OIT: 快照时创建的 Object ID Table，即快照对象 ID 索引表
+//
+//    [多级KV]
+//    DAOS_OT_DKEY_UINT64: dkey 为 uint64_t 类型，akey 为默认类型（hashed）
+//    DAOS_OT_AKEY_UINT64: akey 为 uint64_t 类型，dkey 为默认类型（hashed）
+//    DAOS_OT_MULTI_UINT64: dkey 和 akey 都为 uint64_t 类型；
+//
+//    DAOS_OT_DKEY_LEXICAL: dkey 为 lexical 类型，akey 为默认类型（hashed）
+//    DAOS_OT_AKEY_LEXICAL: akey 为 lexical 类型，dkey 为默认类型（hashed）
+//    DAOS_OT_MULTI_LEXICAL: dkey 和 akey 都为 lexical 类型；
+//
+//    [扁平KV]
+//    DAOS_OT_KV_HASHED: dkey 为 hashed 类型，无 akey (固定为字节'0'，即char 48；见 dc_kv.c: dc_kv_put 函数)
+//    DAOS_OT_KV_UINT64: dkey 为 uint64_t 类型，无 akey (同上)
+//    DAOS_OT_KV_LEXICAL: dkey 为 lexical 类型，无 akey (同上)
+//
+//    [数组语义]
+//    DAOS_OT_ARRAY: 数组对象，属性存在 DAOS 对象内
+//    DAOS_OT_ARRAY_ATTR: 数组对象，属性由用户提供
+//    DAOS_OT_ARRAY_BYTE: 字节数组，无元数据（DFS/POSIX 用）   <-- 云盘使用此类型
+//
+//    注意：这 3 个数组语义类型，虽然在 enum daos_otype_t 中是独立类型，但它们是构建在多级 KV 之上的一层封装；
+//          换言之，它们不是新的布局方式，仍然是 “KV 层级结构 + key 编码方式”:
+//            - dkey: uint64_t，见 daos_is_dkey_uint64_type() 函数，对这3个类型都返回 true；
+//            - akey: 无 akey (固定为字节'0'，即char 48)；证据：
+//                    1. daos_is_akey_uint64_type() 对这3个类型返回 false;
+//                    2. 见 dc_array.c，akey_val 全都被设置为 '0'; 设计者最初意图应该是让akey为NULL，因为 dc_array.c 中有TODO注释:
+//                       "Set character akey descriptor - TODO: should be NULL"
+//            - 地址映射：见 compute_dkey() 函数
+//            - 所以，这 3 个类型非常类似于 DAOS_OT_KV_UINT64，虽然 daos_is_kv_type() 对它们返回 false；
+//                    |------------|-------------------------------|-----------------------------------------------|
+//                    | 维度       | DAOS_OT_KV_UINT64             | DAOS_OT_ARRAY_BYTE（例如云盘）                |
+//                    |------------|-------------------------------|-----------------------------------------------|
+//                    | dkey       | uint64（用户给的 key）        | uint64（array_idx/chunk_size + 1，客户端算的）|
+//                    |------------|-------------------------------|-----------------------------------------------|
+//                    | akey       | 字符 '0'                      | 字符 '0'                                      |
+//                    |------------|-------------------------------|-----------------------------------------------|
+//                    | value 类型 | DAOS_IOD_SINGLE（整块 value） | DAOS_IOD_ARRAY（可按 record 寻址的一维数组）  |
+//                    |------------|-------------------------------|-----------------------------------------------|
+//                    | dkey=0     | 无特殊含义                    | 保留给元数据（cell_size/chunk_size）          |
+//                    |------------|-------------------------------|-----------------------------------------------|
+//                    | 语义       | key→value 映射                | 线性字节/record 地址空间                      |
+//
+//                    |------------|-------------------------------|-----------------------------------------------|
+//    [特殊用途]
+//    DAOS_OT_OIT_V2: Object ID Table 第二版
 enum daos_otype_t {
 	/** default object type, multi-level KV with hashed [ad]keys */
 	DAOS_OT_MULTI_HASHED	= 0,

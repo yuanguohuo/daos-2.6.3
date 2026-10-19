@@ -126,6 +126,26 @@ daos_data_thresh_valid(uint32_t size)
  * 192-bit object ID, it can identify a unique bottom level object.
  * (a shard of upper level object).
  */
+//Yuanguo: 一个 obj 在 一个 target 上的 unit oid：
+//  - 不止包含 obj 的外部 id (daos_obj_id_t 类型)
+//  - 还包含 obj 在 这个 target 上的 shard idx (layout 中的全局逻辑索引)，例如 obj 的 layout 如下：
+//          shard idx   tgt id
+//           [0]          18  (Group 0, Replica 0)
+//           [1]          25  (Group 0, Replica 1)
+//           [2]          70  (Group 0, Replica 2)
+//
+//           [3]          22  (Group 1, Replica 0)
+//           [4]          43  (Group 1, Replica 1)  <--- this target is 43
+//           [5]          33  (Group 1, Replica 2)
+//
+//           ...
+//
+//           [63]         12  (Group 21, Replica 0)
+//           [64]         41  (Group 21, Replica 1)
+//           [65]         38  (Group 21, Replica 2)
+//
+//    则 id_shard = 4，即落在 target 43 上的是 layout 中第 4 号 shard
+//    (id_shard 是 shard 在 object layout 中的全局逻辑索引，范围 0 ~ ol_nr-1)
 typedef struct {
 	/** Public section, high level object ID */
 	daos_obj_id_t		id_pub;

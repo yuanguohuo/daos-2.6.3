@@ -195,6 +195,12 @@ layout_find_diff(struct pl_jump_map *jmap, struct pl_obj_layout *original,
 		/* Note: the delay rebuild targets(DOWN2UP target) should be
 		 * chosen to be rebuilt as well.
 		 */
+		//Yuanguo:
+		//  - 故障、扩容(extend), reint => reint_tgt != original_target 成立
+		//  - DOWN2UP-reintegration ———— 曾故障、上次 rebuild 未完成就回归，状态链:
+		//    PO_COMP_ST_UPIN --> PO_COMP_ST_DOWN(不稳定) ----跳过DOWNOUT----> PO_COMP_ST_UP(不稳定) --> PO_COMP_ST_UPIN(稳定状态)
+		//        => for_reint && original->ol_shards[index].po_rebuilding 成立
+		//        => (co_flags & PO_COMPF_DOWN2UP) && (co_status == PO_COMP_ST_UP) 应该也成立
 		if (reint_tgt != original_target ||
 		    (for_reint && original->ol_shards[index].po_rebuilding) ||
 		    (temp_tgt->ta_comp.co_flags & PO_COMPF_DOWN2UP &&
@@ -1160,6 +1166,82 @@ jump_map_obj_find_diff(struct pl_map *map, uint32_t layout_ver, struct daos_obj_
 		return rc;
 	}
 
+	//Yuanguo:
+	//  这里调用 obj_layout_alloc_and_get 两次，是为了分别计算 object 在 rebuild 之前和 rebuild 之后的 layout；
+	//    diff（POST 与 PRE 的差异）就是本次需要迁移的 shard：
+	//
+	//      故障场景：          同组其他存活副本  -------> spare target
+	//      扩容场景：          现有 UPIN target  -------> 新 target
+	//      reint场景：         spare target      -------> 原 target
+	//      DOWN2UP-reint场景： 同组其他存活副本  -------> 原 target
+	//
+	//  问：这不是需要 2 个版本的 pool map 吗？为什么输入的 struct pl_map *map 和 reint_ver 都相同呢？
+	//  答：
+	//    - pool map 中带有版本变迁信息；
+	//        例1：本次 rebuild 是由 3 个target 发生故障引起的；
+	//            - 这 3 个 target 的变化过程是: PO_COMP_ST_UPIN(稳定状态) --> PO_COMP_ST_DOWN(不稳定状态) --> PO_COMP_ST_DOWNOUT(稳定状态)
+	//            - 这 3 个 target 现在处于 PO_COMP_ST_DOWN 状态（不稳定，所以需要rebuild）
+	//            - 这 3 个 target 的 co_fseq 分别是 101, 102, 103 （假如）
+	//        例2：本次 rebuild 是由 3 个target 扩容（extend） 引起的；
+	//            - 这 3 个 target 的变化过程是: PO_COMP_ST_NEW(稳定状态) --> PO_COMP_ST_UP(不稳定状态) --> PO_COMP_ST_UPIN(稳定状态)
+	//            - 这 3 个 target 现在处于 PO_COMP_ST_UP 状态（不稳定，所以需要rebuild）
+	//            - 这 3 个 target 的 co_in_ver 分别是 101, 102, 103 （假如）
+	//        例3：本次 rebuild 是由 3 个target reint 引起的；
+	//            - 这 3 个 target 的变化过程是: PO_COMP_ST_DOWNOUT(稳定状态) --> PO_COMP_ST_UP(不稳定状态) --> PO_COMP_ST_UPIN(稳定状态)
+	//            - 这 3 个 target 现在处于 PO_COMP_ST_UP 状态（不稳定，所以需要rebuild）
+	//            - 这 3 个 target 的 co_in_ver 分别是 101, 102, 103 （假如）
+	//        例4：DOWN2UP-reintegration ———— 曾故障。一个 target 故障后（UPIN → DOWN），它的 rebuild 还没跑完（还没到 DOWNOUT），管理员/系统就把它重新加入（reintegrate）。
+	//             因为它是从 DOWN 状态直接转到 UP（而不是正常从 DOWNOUT 转 UP），所以打上 PO_COMPF_DOWN2UP 标记，标识"我是从 DOWN 直接跳上来的"。
+	//             对比：
+	//
+	//             A. 标准 reint
+	//                     故障        rebuild完成            管理员reint(MAP_REINT)          rebuild完成
+	//             UPIN ──────> DOWN ──────────> DOWNOUT ──────────────────────────────> UP ──────────> UPIN
+	//                           │           (需先重启进程:                              │
+	//                      [rebuilding:     仍处于DOWNOUT)                         [rebuilding:
+	//                     数据迁到 spare]                                         从 spare 全量搬回]
+	//
+	//             B. DOWN2UP-reint
+	//                     故障   rebuild未完成  重启进程(仍处于DOWN)  管理员reint(打DOWN2UP,跳过DOWNOUT)       rebuild完成
+	//             UPIN ──────> DOWN ────────────────────────────────────────────────────────────────────> UP ──────────> UPIN
+	//                           │                                                                         │
+	//                      [rebuilding:                                                              [rebuilding:
+	//                     数据迁到spare(未完成)]                                                    从其他副本补增量,迁移量小]
+	//
+	//
+	//            - DOWN2UP-reint 状态链: PO_COMP_ST_UPIN --> PO_COMP_ST_DOWN(不稳定) ----跳过DOWNOUT----> PO_COMP_ST_UP(不稳定) --> PO_COMP_ST_UPIN(稳定状态)
+	//            - 带 PO_COMPF_DOWN2UP 标记；原 target 上数据陈旧/不完整
+	//            - PRE/POST 落点都是原 target，靠 po_rebuilding 标记区分
+	//            - 数据回填到原 target
+	//            - 假如 3 个 target 都经历这个过程，它们的 co_fseq 分别是 101, 102, 103；都有 PO_COMPF_DOWN2UP 标记
+	//
+	//        注：扩容(例2)、reint(例3)和 DOWN2UP-reint(例4)，当前都是 UP 状态，靠 co_fseq 和 PO_COMPF_DOWN2UP 区分：
+	//            co_fseq <= 1                    → 扩容(从未故障)
+	//            co_fseq > 1 无 PO_COMPF_DOWN2UP → reint；
+	//            co_fseq > 1 有 PO_COMPF_DOWN2UP → DOWN2UP-reint；
+	//
+	//            例1/2/3 是"位置差"驱动的 diff（可用版本对比理解），例4 是"标记"驱动的 diff（版本对比失效）
+	//
+	//    - reint_ver 就是 rebuild version；本次 rebuild 就是让所有 object 在这个版本的 pool map 下，都放置在正确位置上；
+	//      假如 reint_ver = 108 ，对于 pool map 中 co_fseq/co_in_ver <= 108 targets (忽略大于108的)：
+	//          obj_layout_alloc_and_get(..., PRE_REBUILD, ...)  ：把所有不稳定状态的 targets 回退到前一个稳定状态，计算 layout
+	//          obj_layout_alloc_and_get(..., POST_REBUILD, ...) ：把所有不稳定状态的 targets 推进到后一个稳定状态，计算 reint_layout
+	//
+	//          |-------------------|------------------------------------|----------------------------|
+	//          | 例                | PRE_REBUILD（前一稳定态）          | POST_REBUILD（后一稳定态） |
+	//          |-------------------|------------------------------------|----------------------------|
+	//          | 例1 故障          | UPIN（数据还在原 target）          | DOWNOUT（数据已迁到 spare）|
+	//          | 例2 扩容          | NEW（新 target 上还没数据）        | UPIN（数据已迁入新 target）|
+	//          | 例3 reint         | DOWNOUT（数据在 spare 上）         | UPIN（数据迁回本 target）  |
+	//          | 例4 DOWN2UP-reint | UPIN（数据在本target上）           | UPIN（数据回填到本 target）|
+	//          |-------------------|------------------------------------|----------------------------|
+	//                                   相当于版本 100                        相当于版本 108
+	//
+	//  注意：一次 rebuild 会把之前所有“不稳定状态的target" 都算进来。例如：
+	//    event1 (time1): target1 down, fseq = 88, 未rebuild （target1处于 DOWN 状态，而不是DOWNOUT状态）
+	//    event2 (time2): target2, target3, target4 down, fseq 分别是 152, 153, 154
+	//  无法只针对 event2 的pool map 变更 rebuild；要rebuild，就会把 event1 的 pool map 变更一起考虑进去了。
+
 	D_INIT_LIST_HEAD(&reint_list);
 	rc = obj_layout_alloc_and_get(jmap, layout_ver, &jop, md, reint_ver,
 				      PRE_REBUILD, &layout, NULL, NULL);
@@ -1173,8 +1255,27 @@ jump_map_obj_find_diff(struct pl_map *map, uint32_t layout_ver, struct daos_obj_
 		D_GOTO(out, rc);
 
 	obj_layout_dump(md->omd_id, reint_layout);
+	//Yuanguo: reint_list 是 out 参数；是一个 struct failed_shard 对象的list；
+	//  见 struct failed_shard 的注释；
 	layout_find_diff(jmap, layout, reint_layout, &reint_list, true);
 
+	//Yuanguo:
+	//  - reint_list 是 struct failed_shard 对象的list，存储的是：
+	//    当前 obj 的需要 remap 的 shards，在 rebuild 完成之后，对应的 targets (即迁移目的targets)
+	//    见 struct failed_shard 的注释；
+	//
+	//  - remap_list_fill 把 这些shards 和 targets 一一对应地填到 shard_id 和 tgt_rank 数组中，例如：
+	//       shard_id:   0,   8,  9,   15
+	//       tgt_rank:   36,  4,  12,  9
+	//    即rebuild完成之后(POST_REBUILD 的 layout 上)，
+	//       shard-0  => tgt-36
+	//       shard-8  => tgt-4
+	//       shard-9  => tgt-12
+	//       shard-15 => tgt-9
+	//    事件(故障、扩容、reint, DOWN2UP-reint)发生之前(PRE_REBUILD 的 layout 上)，这些 shards 落在哪些 targets 上，
+	//    这里没有涉及，需要查 PRE_REBUILD layout；
+	//
+	//  - 注意：tgt_rank 虽然叫 rank，其实是 target id 的数组；
 	rc = remap_list_fill(map, md, shard_md, reint_ver, tgt_rank, shard_id,
 			     array_size, &idx, reint_layout, &reint_list, false);
 out:

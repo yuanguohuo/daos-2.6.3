@@ -1317,7 +1317,7 @@ dma_rw(struct bio_desc *biod)
 		D_ASSERT(rg->brr_end > rg->brr_off);
 
 		//Yuanguo:
-		//  - 对于SCM: 
+		//  - 对于SCM:
 		//    bio_iod_copy -> iterate_biov -> copy_one()中不是已经把数据拷贝
 		//    到SCM (biod->bd_sgls中的的struct bio_io的bi_buf) 了吗？这里拷贝
 		//    什么呢？ 答：这里是RDMA IO；普通的SCM IO应该是已经完成了；
@@ -1333,8 +1333,8 @@ dma_rw(struct bio_desc *biod)
 
 	//Yuanguo: block等待完成；
 	//   - BIO_IOD_TYPE_FETCH : bd_async_post一定为false;
-	//   - BIO_IOD_TYPE_UPDATE: bd_async_post可能为true;
-	//见bio_iod_post_async()函数；
+	//   - BIO_IOD_TYPE_UPDATE: MD-on-SSD 且 bd_nvme_bytes <= bio_max_async_sz (32K) 时 bd_async_post 为true; 否则为false;
+	//见bio_iod_post_async()函数的注释。
 	if (!biod->bd_async_post) {
 		iod_dma_wait(biod);
 		D_DEBUG(DB_IO, "Wait DMA done, type:%d\n", biod->bd_type);
@@ -1577,12 +1577,16 @@ iod_prep_internal(struct bio_desc *biod, unsigned int type, void *bulk_ctxt,
 
 	//Yuanguo:
 	//                   读(BIO_IOD_TYPE_FETCH)                 写(BIO_IOD_TYPE_UPDATE)
-	//  -------------------------------------------------------------------------------------------
+	//  ----------------------------------------------------------------------------------------------------------------------------
 	//  bio_iod_prep     准备DMA buffer,发起DMA, 并等待完成     准备DMA buffer
-	//  -------------------------------------------------------------------------------------------
+	//  ----------------------------------------------------------------------------------------------------------------------------
 	//  bio_iod_copy     把数据从DMA buffer拷贝到用户内存       把数据从用户内存拷贝到DMA buffer
-	//  -------------------------------------------------------------------------------------------
-	//  bio_iod_post     释放DMA buffer                         发起DMA，等待完成，并释放DMA buffer
+	//  ----------------------------------------------------------------------------------------------------------------------------
+	//  bio_iod_post     释放DMA buffer                         发起DMA
+	//                                                          sync : dma_rw 内 iod_dma_wait 等完成 → post 内释放 buffer
+	//                                                          async: 提交后不等；buffer 推迟到最后一个 NVMe 完成回调
+	//                                                                 (rw_completion, inflights==0) 里释放；
+	//                                                                 bio_iod_free 等完成事件后才释放 bio_desc
 
 	//Yuanguo:
 	//  对于读操作(BIO_IOD_TYPE_FETCH)
@@ -1649,8 +1653,10 @@ bio_iod_post(struct bio_desc *biod, int err)
 	//  对于写操作(BIO_IOD_TYPE_UPDATE)
 	//    - 这里发起 DMA 操作；即下面注释 "Land data from buffer to media on write"
 	//
-	//Yuanguo: 这里 biod->bd_async_post 应该是0;
-	//因为函数 bio_iod_post_async 中为了发起asyc操作，显示地设置其为1；
+	//Yuanguo:
+	//   - BIO_IOD_TYPE_FETCH : bd_async_post一定为false;
+	//   - BIO_IOD_TYPE_UPDATE: MD-on-SSD 且 bd_nvme_bytes <= bio_max_async_sz (32K) 时 bd_async_post 为true; 否则为false;
+	//见bio_iod_post_async()函数的注释。
 
 	/* Land data from buffer to media on write */
 	if (err == 0 && biod->bd_type == BIO_IOD_TYPE_UPDATE)
@@ -1668,6 +1674,14 @@ out:
 	return biod->bd_result;
 }
 
+//Yuanguo:
+//  BIO_IOD_TYPE_UPDATE 且 MD-on-SSD 且 bd_nvme_bytes <= bio_max_async_sz (默认32K) ==>  bd_async_post=1，为异步IO:
+//          - NVMe 写提交后立即返回，不等写完成;
+//          - iod_dma_wait 推迟到 bio_iod_free;
+//          - 好处：让数据写与 WAL 写并行;
+//  否则，bd_async_post=0，为同步IO：
+//          - bio_iod_post 内 iod_dma_wait 当场等数据写完成后才返回
+//          - WAL 提交在其后，串行
 int
 bio_iod_post_async(struct bio_desc *biod, int err)
 {
@@ -1676,7 +1690,11 @@ bio_iod_post_async(struct bio_desc *biod, int err)
 	if (biod->bd_type != BIO_IOD_TYPE_UPDATE)
 		goto out;
 
+	//Yuanguo: 若 nvme 配置了 meta，说明是 MD-on-SSD；
+	//    - 非 MD-on-SSD  ==> 直接 bio_iod_post(biod, err)，即同步IO;
+	//    - MD-on-SSD     ==> 判断 bd_nvme_bytes 大小；
 	//Yuanguo: 为什么 PMEM 不 async? 写 NVME 和内存的类型有什么关系？
+	//    见函数前注释：MD-on-SSD 场景下，可以让数据写与 WAL 写并行;
 	/* Async post is only for MD on SSD */
 	if (!bio_nvme_configured(SMD_DEV_TYPE_META))
 		goto out;
@@ -1691,6 +1709,9 @@ bio_iod_post_async(struct bio_desc *biod, int err)
 	 * that will mitigate the side effect of I/O reordering, at the same time, avoid the
 	 * unnecessary checksum calculation overhead.
 	 */
+	//Yuanguo:
+	//  >  32K: 直接 bio_iod_post(biod, err)，即同步IO;
+	//  <= 32K: 设置 bd_async_post，异步IO;
 	if (biod->bd_nvme_bytes > bio_max_async_sz)
 		goto out;
 
@@ -1800,12 +1821,16 @@ bio_rwv(struct bio_io_context *ioctxt, struct bio_sglist *bsgl_in,
 
 	//Yuanguo:
 	//                   读(BIO_IOD_TYPE_FETCH)                 写(BIO_IOD_TYPE_UPDATE)
-	//  -------------------------------------------------------------------------------------------
+	//  ----------------------------------------------------------------------------------------------------------------------------
 	//  bio_iod_prep     准备DMA buffer,发起DMA, 并等待完成     准备DMA buffer
-	//  -------------------------------------------------------------------------------------------
+	//  ----------------------------------------------------------------------------------------------------------------------------
 	//  bio_iod_copy     把数据从DMA buffer拷贝到用户内存       把数据从用户内存拷贝到DMA buffer
-	//  -------------------------------------------------------------------------------------------
-	//  bio_iod_post     释放DMA buffer                         发起DMA，等待完成，并释放DMA buffer
+	//  ----------------------------------------------------------------------------------------------------------------------------
+	//  bio_iod_post     释放DMA buffer                         发起DMA
+	//                                                          sync : dma_rw 内 iod_dma_wait 等完成 → post 内释放 buffer
+	//                                                          async: 提交后不等；buffer 推迟到最后一个 NVMe 完成回调
+	//                                                                 (rw_completion, inflights==0) 里释放；
+	//                                                                 bio_iod_free 等完成事件后才释放 bio_desc
 
 	/* map the biov to DMA safe buffer, fill DMA buffer if read operation */
 	rc = bio_iod_prep(biod, BIO_CHK_TYPE_LOCAL, NULL, 0);

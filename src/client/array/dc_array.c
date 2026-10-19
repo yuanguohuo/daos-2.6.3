@@ -24,6 +24,9 @@
 #define CELL_SIZE	"daos_array_cell_size"
 #define CHUNK_SIZE	"daos_array_chunk_size"
 
+//Yuanguo:
+//  cell_size  : 数组元素的size，对于云盘是1，即云盘的一个元素是1字节；
+//  chunk_size : 1 个dkey 存的元素个数 (无akey)，默认 DFS_DEFAULT_CHUNK_SIZE = 1MiB，对于云盘，1个dkey对应1MiB数据；
 struct dc_array {
 	/** link chain in the global handle hash table */
 	struct d_hlink		hlink;
@@ -1030,6 +1033,16 @@ io_extent_same(daos_array_iod_t *iod, d_sg_list_t *sgl, daos_size_t cell_size,
  * number of records that the dkey can hold starting at the index where we start
  * writing. - the record index relative to the dkey.
  */
+//Yuanguo:
+//输入参数：
+//  array：cell_size，数组元素的size，对于云盘是1，即云盘的一个元素是1字节；
+//         chunk_size，1 个dkey 存的元素个数 (无akey)，默认 DFS_DEFAULT_CHUNK_SIZE = 1MiB，对于云盘，1个dkey对应1MiB数据；
+//  array_idx: 把整个object (很多dkey) 看作一个数组，array_idx 是元素在数组中的 index；
+//         对于云盘，就是字节在整个 block 设备内的字节偏移(byte offset)；
+//输出参数：
+//  record_i:    array_idx 在所属 dkey(chunk) 内的偏移 = array_idx % chunk_size；用于 recx.rx_idx
+//  num_records: 本 chunk 从 record_i 起的剩余容量 = chunk_size - record_i；用于判断 IO 是否跨 dkey
+//  dkey:        = array_idx / chunk_size + 1（+1 因 dkey=0 留给元数据）
 static int
 compute_dkey(struct dc_array *array, daos_off_t array_idx,
 	     daos_size_t *num_records, daos_off_t *record_i, uint64_t *dkey)

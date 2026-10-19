@@ -2191,6 +2191,34 @@ dtx_leader_exec_ops_chore(struct dss_chore *chore, bool is_reentrance)
 /**
  * Execute the operations on all targets.
  */
+//Yuanguo:
+//  本函数 dtx_leader_exec_ops 是 DTX leader 端的核心调度函数，负责将分布式事务的子请求分发到所有参与者（远程 target）并在本地执行操作。整体执行流程分为三个阶段：
+//      - 阶段1: 分批派发所有 "normal"（非延迟）子请求到远程 target，同时在本地执行操作。如果 target 数量超过 DTX_REG_RPC_STEP_LENGTH(512)，则分多轮派发。
+//      - 阶段2: 所有 normal 子请求完成后，执行聚合回调（agg_cb）汇总结果。
+//      - 阶段3: 如果存在 delay 子请求，再单独用高优先级派发它们。
+//
+//      问：本函数中使用 sub_cnt 和 dlh_forward_cnt 控制分批，没有考虑 normal / delay 标记；阶段1如何实现只派发 normal 子请求?
+//      答：不在本函数中，而在 dtx_leader_exec_ops_chore 中：
+//
+//            		if (dlh->dlh_normal_sub_done == 0) {
+//            			sub->dss_result = 0;
+//            			sub->dss_comp = 0;
+//
+//                 // 对于 delay 子请求，直接以 rc=0 触发回调函数 dtx_sub_comp_cb，即立即标记完成，跳过 RPC 发送；
+//            			if (unlikely(tgt->st_flags & DTF_DELAY_FORWARD)) {
+//            				dtx_sub_comp_cb(dlh, dtx_chore->i, 0);
+//            				continue;
+//            			}
+//
+//            			......
+//            		}
+//
+//      问：什么情况下 dlh_delay_sub_cnt 大于 0 ?
+//      答：
+//          - 在 dtx_leader_begin() 中初始化时，遍历所有 target，如果某个 target 的 st_flags 带有 DTF_DELAY_FORWARD 标志，则 dlh_delay_sub_cnt++;
+//          - DTF_DELAY_FORWARD 表示该 target 需要延迟转发：leader 先将 IO 请求发给其他非延迟的 target，等它们全部完成后，再把请求转发给带此标志的 target;
+//          - 典型场景：当某个 target 所在的 shard 是数据重建的目标（rebuild target），需要等其他副本先完成写入并确认成功后，才能把数据转发过去。
+//          - 对于 collective DTX（DTX_TGT_COLL），不支持延迟转发，dlh_delay_sub_cnt 固定为 0;
 int
 dtx_leader_exec_ops(struct dtx_leader_handle *dlh, dtx_sub_func_t func,
 		    dtx_agg_cb_t agg_cb, int allow_failure, void *func_arg)
@@ -2222,6 +2250,10 @@ dtx_leader_exec_ops(struct dtx_leader_handle *dlh, dtx_sub_func_t func,
 	dlh->dlh_need_agg = 0;
 	dlh->dlh_agg_done = 0;
 
+	//Yuanguo: 确定本轮要派发的子请求数量:
+	//  - 如果总数超过 DTX_REG_RPC_STEP_LENGTH(512)， 则分批处理，每批最多 512 个，避免同时发出过多 in-flight RPC 导致内存不足。
+	//    注意：此时把 delay 子请求也算进去，dtx_leader_exec_ops_chore 函数会直接标记完成，并不发RPC
+	//  - 如果一次就能派发完所有请求，且没有 delay 子请求，则标记 dlh_need_agg 让 dtx_comp_cb 在 future 完成时顺便做聚合。
 	if (sub_cnt > DTX_REG_RPC_STEP_LENGTH) {
 		dlh->dlh_forward_cnt = DTX_REG_RPC_STEP_LENGTH;
 	} else {
@@ -2230,9 +2262,35 @@ dtx_leader_exec_ops(struct dtx_leader_handle *dlh, dtx_sub_func_t func,
 			dlh->dlh_need_agg = 1;
 	}
 
+	//Yuanguo: 如果没有 normal 子请求（所有 target 都是 delay 或纯本地操作），直接跳到 exec 处：本地执行，然后处理 delay;
 	if (dlh->dlh_normal_sub_cnt == 0)
 		goto exec;
 
+	//Yuanguo: goto again1 重建 future 和 goto again2 不重建future，本质区别是什么？
+	//  本质区别就一个：dlh_forward_cnt 是否发生了变化。
+	//    - ABT_future 在创建时就固定了 contributor 数量（dlh_forward_cnt + 1），之后不可修改。
+	//    - 每个 contributor 必须恰好调用一次 ABT_future_set，future 才会触发完成回调 dtx_comp_cb：
+	//        - 少了 → future 永远不会完成，dtx_leader_wait 死等
+	//        - 多了 → 多余的 ABT_future_set 触发断言失败
+	//  所以：需要缩减 dlh_forward_cnt，就必须重建 future，即必须 goto again1;
+
+	//Yuanguo: again1 - 创建新的 ABT_future 并尝试注册 chore
+	//  需要 goto again1 的场景：
+	//    - 正常:
+	//        - Case-A: 当前一批子请求完成后仍有剩余（sub_cnt > 0），需要派发下一批。
+	//                  此时 old future 已在 dtx_leader_wait 中被释放，必须重建。
+	//
+	//    - 出错：dss_chore_register() 返回 -DER_AGAIN (credit 不足)
+	//        - Case-B: 系统提供的可用 credit 数量 (即cho_credits，此时已经被dss_chore_register更新) 大于 normal_sub_cnt/8：
+	//                  说明 credit 不够派发 dlh_forward_cnt 个请求，但还有一定数量可用。
+	//                  此时缩减 dlh_forward_cnt 为系统实际能给的 credit 数，重建 future。
+	//        - Case-C: 可用 credit 太少（≤ normal_sub_cnt/8，不值得直接缩减），但已经完成了超过一半的子请求(dlh_forward_idx > sub_cnt / 2)，
+	//                  需要升级为高优先级加速完成(cho_priority = 1)；
+	//                  但升级高优先级有一个问题要处理：高优先级 chore 可以突破常规 credit 限制，但为了减少对其他 IO 的影响，step length 上限从
+	//                  DTX_REG_RPC_STEP_LENGTH (512) 缩小到 DTX_PRI_RPC_STEP_LENGTH(64)
+	//                  当前 dlh_forward_cnt 是否超过 64 ？
+	//                      - Case-C1: 是（比如还是 512）：必须缩减到 64 → dlh_forward_cnt 变了 → 重建 future → goto again1
+	//                      - Case-C2: 否（已经 ≤ 64）   ：不用缩减      → dlh_forward_cnt 没变 → 直接重试    → goto again2
 again1:
 	D_ASSERT(dlh->dlh_future == ABT_FUTURE_NULL);
 
@@ -2247,6 +2305,12 @@ again1:
 		D_GOTO(out, rc = dss_abterr2der(rc));
 	}
 
+	//Yuanguo: 用当前 future 重试注册 chore，dlh_forward_cnt 没变，不重建 future
+	//  需要 goto again2 的场景：
+	//    - Case-C2: 如上
+	//    - Case-D: 可用 credit 太少（≤ normal_sub_cnt/8），且还没完成一半。
+	//      不缩减（避免碎片化），不升优先级，
+	//      而是: yield 让出 CPU 等其他 chore 释放 credit 后重试。
 again2:
 	dtx_chore.chore.cho_credits = dlh->dlh_forward_cnt;
 	dtx_chore.chore.cho_hint    = NULL;
@@ -2260,6 +2324,8 @@ again2:
 			goto out;
 		}
 
+		//Yuanguo: rc 等于 -DER_AGAIN，即 credit 不足
+
 		d_tm_inc_counter(dtx_tls_get()->dt_chore_retry, 1);
 
 		/*
@@ -2269,8 +2335,10 @@ again2:
 		if (dtx_chore.chore.cho_credits > dlh->dlh_normal_sub_cnt / 8) {
 			D_DEBUG(DB_TRACE, "Retry IO forward with credits from %d to %d\n",
 				dlh->dlh_forward_cnt, dtx_chore.chore.cho_credits);
+			//Yuanguo: goto again1 前必须销毁 future
 			ABT_future_free(&dlh->dlh_future);
 			dlh->dlh_forward_cnt = dtx_chore.chore.cho_credits;
+			//Yuanguo: Case-B
 			goto again1;
 		}
 
@@ -2285,16 +2353,20 @@ again2:
 			if (dlh->dlh_forward_cnt > DTX_PRI_RPC_STEP_LENGTH) {
 				D_DEBUG(DB_TRACE, "Retry (prio) IO forward with credits %d => %d\n",
 					dlh->dlh_forward_cnt, DTX_PRI_RPC_STEP_LENGTH);
+				//Yuanguo: goto again1 前必须销毁 future
 				ABT_future_free(&dlh->dlh_future);
 				dlh->dlh_forward_cnt = DTX_PRI_RPC_STEP_LENGTH;
+				//Yuanguo: Case-C1
 				goto again1;
 			}
 
 			D_DEBUG(DB_TRACE, "Retry (prio) IO forward with credits %d\n",
 				dlh->dlh_forward_cnt);
+			//Yuanguo: Case-C2
 			goto again2;
 		}
 
+		//Yuanguo: Case-D
 		D_DEBUG(DB_TRACE, "Not enough credits (%d vs %d) for IO forward, wait and retry\n",
 			dlh->dlh_forward_cnt, dtx_chore.chore.cho_credits);
 		ABT_thread_yield();
@@ -2321,7 +2393,8 @@ exec:
 	if (remote_rc != 0 && remote_rc != allow_failure)
 		D_GOTO(out, rc = remote_rc);
 
-	//Yuanguo: 当 participant 太多(sub_cnt个)，分批发送 RPC (CaRT) 请求，每一批 dlh->dlh_forward_cnt 个；
+	//Yuanguo: Case-A
+	//  当 participant 太多(sub_cnt个)，分批发送 RPC (CaRT) 请求，每一批 dlh->dlh_forward_cnt 个；
 	//  goto again1 发下一批；
 	//  一般情况下，不会分批，故这里 sub_cnt -= dlh->dlh_forward_cnt 之后，等于0；
 	sub_cnt -= dlh->dlh_forward_cnt;
@@ -2357,8 +2430,51 @@ exec:
 		}
 	}
 
+	//Yuanguo: 正常情况，dlh_delay_sub_cnt 为0；到此结束；
 	if (likely(dlh->dlh_delay_sub_cnt == 0))
 		goto out;
+
+	//Yuanguo: 非正常情况，处理 delayed targets (例如 rebuild target，即正在 rebuild/reintegrate 的 targets，条件是 do_rebuilding || do_reintegrating)；
+	//
+	//Yuanguo:
+	// 问：为什么发给 rebuilding targets 的子请求要 delay ？
+	// 答：delay 不是因为 rebuild target "忙"，而是因为它数据不完整，无法正确执行条件检查。具体地说：
+	//     - DAOS 支持条件写操作，例如：
+	//         - DAOS_COND_DKEY_UPDATE ：dkey 存在才更新，否则报错
+	//         - DAOS_COND_DKEY_INSERT ：dkey 不存在才插入，否则报错
+	//         - DAOS_COND_PUNCH       ：key 存在才 punch，否则报错
+	//     - 每个 target 在本地 VOS 中独立评估条件；
+	//     - 但 rebuilding targets 的数据是不完整的，它正在从其他健康副本拉取数据，尚未追平。所以：
+	//
+	//       |----------------------------|--------------------------|---------------------------------|
+	//       | 操作                       |  健康 targets（数据完整）| rebuilding targets（数据不完整）|
+	//       |----------------------------|--------------------------|---------------------------------|
+	//       | COND_UPDATE（存在才更新）  | dkey 存在 → 成功         | dkey 还没重建过来 → 错误地失败  |
+	//       | COND_INSERT（不存在才插入）| dkey 存在 → 正确拒绝     | dkey 还没重建过来 → 错误地成功  |
+	//       |----------------------------|--------------------------|---------------------------------|
+	//
+	//     - 解法：两阶段派发 + 条件剥离
+	//         - 先发给健康 targets：它们数据完整，条件检查结果权威
+	//         - 健康 targets 全部完成后：
+	//           A. agg_cb 为 NULL:
+	//              dlh_drop_cond = 1: 转发给 rebuilding targets 时剥离条件标志，让它无条件执行写入
+	//           B. agg_cb 不为 NULL: 根据 agg_cb 的结果决定:
+	//              B1. 条件检查通过(agg_cb 返回 0) → dlh_drop_cond = 1，转发给 rebuilding targets 时剥离条件标志，让它无条件执行写入（信任健康 target 的判决）；
+	//              B2. 条件检查失败（agg_cb 返回 allow_failure）→ dlh_drop_cond = 0，保留条件标志，让 rebuilding targets 也进行检查；
+	//
+	//           疑问：既然 健康 targets 检查失败，不应该直接失败吗？为什么还发给 rebuilding targets 呢？
+	//           猜测：有两个地方，可以容忍特定错误
+	//              1. ds_obj_punch_handler() 函数: 可以忽略 -DER_NONEXIST
+	//                 健康 targets 返回 -DER_NONEXIST，忽略，继续发给 rebuilding targets，保留条件标志
+	//              2. ds_obj_coll_query_handler() 函数：也可以忽略 -DER_NONEXIST
+	//     - 注意: delay 机制的启用条件，见 obj_shard_tgts_query() 函数设置 DTF_DELAY_FORWARD:
+	//          有条件操作 且 target 正在 rebuild/reintegrate
+	//
+	//  说明：对于 update 操作
+	//      - 非 “条件更新”，根本不会设置 DTF_DELAY_FORWARD，所以根本没有 delay targets；
+	//        如何“条件更新”? daos_obj_update(..., DAOS_COND_DKEY_UPDATE, ...);
+	//      - 若“条件更新”，这里会有 delay targets；因为 DTX Leader 处理函数 ds_obj_rw_handler 传来 agg_cb = NULL，allow_failure = 0，
+	//        所以，任何失败，都直接失败，不会发给 delay targets;
 
 	/* Need more aggregation for delayed sub-requests. */
 	dlh->dlh_agg_done = 0;

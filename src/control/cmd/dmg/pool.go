@@ -602,6 +602,20 @@ type PoolReintegrateCmd struct {
 	Targetidx string `long:"target-idx" description:"Comma-separated list of target idx(s) to be reintegrated into the rank"`
 }
 
+// Yuanguo:
+// - dmg PoolReintegrateCmd 调用 lib/control/pool.go:PoolReintegrate 函数                                     --> 通过 gRPC 调用 MS Leader;
+//
+// - MS Leader (server/mgmt_pool.go:PoolReintegrate)，带锁调用(makeLockedPoolServiceCall) CallDrpc 函数       --> 通过 dRPC 调用 MS Leader 本地的 daos engine mgmt 模块（C 语言）
+//
+// - daos engine mgmt 模块 (src/mgmt/srv.c: DRPC_METHOD_MGMT_REINTEGRATE/ds_mgmt_drpc_pool_reintegrate) 
+//		调用pool_change_target_state(PO_COMP_ST_UP)
+//			调用ds_mgmt_pool_target_update_state()
+//				1. 调用 ds_mgmt_tgt_pool_create_ranks 在目标 rank 上创建/启动 pool shards 
+//				2. 调用 dsc_pool_svc_update_target_state
+//						调用 dsc_pool_svc_call （ 按 svc_ranks 找 PS leader，"not leader" 回复带 hint 重定向）--> 通过 CaRT 调用 PS Leader;
+//
+// - PS Leader (src/pool/srv_pool.c:pool_update_handler)
+
 // Execute is run when PoolReintegrateCmd subcommand is activated
 func (cmd *PoolReintegrateCmd) Execute(args []string) error {
 	msg := "succeeded"

@@ -7192,8 +7192,7 @@ pool_svc_update_map_internal(struct pool_svc *svc, unsigned int opc,
 	//Yuanguo: 更新发生变化的 target 的 co_in_ver/co_out_ver/co_fseq，每个 target 不同 (见 ++(*version))；(co_ver 是 target 被加到map中的版本号，一批加入的 target 都相同)
 	//  对于 extend：
 	//      - 假如进入本函数时 map->po_version = 5
-	//      - 上面 pool_map_extend 之后，map->po_version = 6
-	//      - 下面 map_version_before = 6
+	//      - 上面 pool_map_extend 之后，map->po_version = 6，即下面 map_version_before = 6
 	//      - ds_pool_map_tgts_update
 	//        for each target:
 	//          -> update_one_tgt:   target->ta_comp.co_in_ver = ++(*version); 假设扩容 108 个target，循环108次，version = 6+108 = 114
@@ -7202,8 +7201,7 @@ pool_svc_update_map_internal(struct pool_svc *svc, unsigned int opc,
 	//          -> pool_map_set_version(map, version):  map->po_version = 118
 	//      - 下面 map_version = 118，和map_version_before不相等，不会goto out_map
 	//  对于 exclude：
-	//      - 假如进入本函数时 map->po_version = 5
-	//      - 下面 map_version_before = 5
+	//      - 假如进入本函数时 map->po_version = 5，即下面 map_version_before = 5
 	//      - ds_pool_map_tgts_update:
 	//        for each target:
 	//          -> update_one_tgt: target->ta_comp.co_fseq = ++(*version);   若 exlude 了 36 个 target 循环36次，version = 5 + 36 = 41

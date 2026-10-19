@@ -164,6 +164,10 @@ pl_obj_find_rebuild(struct pl_map *map, uint32_t layout_gl_version, struct daos_
 	if (!map->pl_ops->o_obj_find_rebuild)
 		return -DER_NOSYS;
 
+	//Yuanguo:
+	//  - Ring Placement Map不可用
+	//  - 所以只剩Jump Placement Map;
+	//故 map->pl_ops->o_obj_find_rebuild 函数指针指向 jump_map_obj_find_diff() 函数；
 	return map->pl_ops->o_obj_find_rebuild(map, layout_gl_version, md, shard_md, rebuild_ver,
 					       tgt_rank, shard_id, array_size);
 }

@@ -235,21 +235,74 @@ enum {
 //  oid->hi的低32bit以及oid->lo(64bit)共96bit是用户设置的；
 //  DAOS使用oid->hi的高32bit来记录object的一些特性；
 //
-//  daos_obj_id_t::hi
 //     1B        1B           2B                         4B
 //  +--------+--------+-----------------+-----------------------------------+
-//  |  type  | redun  |     nr_grps     | ############ user filled #########|
+//  |  type  | redun  |     nr_grps     | ############ user filled #########|         daos_obj_id_t::hi
 //  +--------+--------+-----------------+-----------------------------------+
 //  high-addr                                                        low-addr
 //
-//  daos_obj_id_t::lo
 //                                     8B
 //  +-----------------------------------------------------------------------+
-//  |############################# user filled #############################|
+//  |############################# user filled #############################|         daos_obj_id_t::lo
 //  +-----------------------------------------------------------------------+
 //  high-addr                                                        low-addr
 //
-//  见daos_obj_set_oid()函数；
+//  设置，见daos_obj_set_oid()函数；
+//
+//  - type: 见 enum daos_otype_t 前的注释；
+//
+//  - redun:
+//        - 它只是一个ID，不是"冗余数(redundancy)或者副本数"，例如 OR_RP_3 代表3副本，但它的值是 9 而不是 3；
+//        - 取值 OR_RP_1 ~ OR_RS_16P3；
+//
+//  - nr_grps: 以 OC_RP_3GX 为例。GX 代表: 使用集群中 max groups (扣除预留)；也可以显示指定 group 数，例如 OC_RP_3G8)
+//
+//    A. when create obj (见 get_target 函数)
+//        - 将集群内的所有 target，按 3 个为一组分组，得到所有分组 (groups)，每个 group 内的 3 个target 必须
+//          跨 3 个failure domain.（若 5 副本，或者EC 3+2，则以 5 个为一组分组）
+//
+//          注意："分组"是按 object 动态哈希的，不是全局静态划分。换言之，每个 group 具体落在哪 3 个 target，是针对
+//                每个 object、用 jump consistent hash 动态计算的，不同 object 的 group → target 映射不同；
+//
+//        - 所有分组，扣除一些预留(见reserve_grp_by_rf函数)，剩下的数量就是 nr_grps (number of groups)；被编码进 obj id
+//          中，持久化，不可能发生变化。
+//
+//            例如，nr_grps = 36, grp_size = 3 (3副本)
+//            struct dc_object { struct dc_obj_layout { struct dc_obj_shard do_shards } }
+//            ┌─────────────────────────────────────────────────────────┐
+//            │  struct dc_obj_shard do_shards[108]  (客户端内存)       │
+//            │                                                         │
+//            │  [0]  do_target_id = target_78  (Group 0, Replica 0)    │
+//            │  [1]  do_target_id = target_25  (Group 0, Replica 1)    │
+//            │  [2]  do_target_id = target_165 (Group 0, Replica 2)    │
+//            │                                                         │
+//            │  [3]  do_target_id = target_92  (Group 1, Replica 0)    │
+//            │  [4]  do_target_id = target_41  (Group 1, Replica 1)    │
+//            │  [5]  do_target_id = target_133 (Group 1, Replica 2)    │
+//            │                                                         │
+//            │  ...                                                    │
+//            │                                                         │
+//            │  [105] do_target_id = target_56 (Group 35, Replica 0)   │
+//            │  [106] do_target_id = target_88 (Group 35, Replica 1)   │
+//            │  [107] do_target_id = target_12 (Group 35, Replica 2)   │
+//            └─────────────────────────────────────────────────────────┘
+//
+//        - obj 的 单个 dkey：通过 dkey hash 映射到 1 个 group；该 dkey 的数据在这个 group 的 3 个 target 上互为副本
+//         （跨 3 failure domain）；
+//        - 整个 object 的所有 dkey：通过各自的 hash 分散到全部 nr_grps 个 group 上，实现负载均衡；
+//
+//    B. when open obj
+//        - 只要 pool_map 没变，对于当前 obj (固定的obj id)，总能算出同样的 nr_grps 个 group
+//        - open obj 时（未读写）就生成，存放在 struct dc_object { struct dc_obj_layout { struct dc_obj_shard do_shards } } 中，
+//          如上图；
+//        - 这个布局驻留在客户端内存中；若服务端 pool_map 发生变化，obj_layout_refresh 会重建布局；
+//
+//    C. when cluster extended
+//        - 扩容后，集群 target 数增多，pool_map 变化；
+//        - 但扩容前创建的 obj 的 nr_grps 不变；
+//        - 用 固定的 obj id + 固定的 nr_grps + 新 pool_map 重算 placement，仍是 nr_grps 个 group、每组仍 3 target；
+//          jump consistent hash 只让"部分" shard 迁移到新增 target（最小化数据搬迁），这些发生变化的 shard 触发
+//          rebuild（数据迁移到新 target）；
 typedef struct {
 	/** least significant (low) bits of object ID */
 	uint64_t	lo;
